@@ -122,3 +122,15 @@ read the GPT of LUN 2: 77 partitions, matching Android (`boot_a` at 4K block
 170752, `super` at 419840 / 8704 MiB, `userdata` at 3373056 / 230871 MiB),
 then `probe done, 77 partitions, nothing written` and PID 1 as before. The
 UFS read path works on MT6893 without any change to the ruby driver.
+
+## Result: iOS 16.7.16 lock screen on the Xiaomi 11T (2026-11-19)
+
+Kernel with 0090-0092, ADT with the iPhone X `/product` node (from the
+IPSW's `DeviceTree.d22ap.im4p`), root in the free tail of `super`
+(`ufsroot=super ufsoffset=944128 ufsblocks=1280000`, HFS-compressed, LZVN/
+LZBITMAP rewritten as zlib by `tools/hfs_zlib.py`), ruby's ICL NOP in
+`dyld_shared_cache_arm64.15`, `sweetfb_noconsole=1`: Apple logo, then the
+lock screen with the clock (date "31 December": no RTC). 4 A55 cores; no
+touch yet (ST FTS on SPI6 needs its own driver). Android, its data and slot b
+are untouched; the Android part of `super` hashes the same before and after
+each root write.
