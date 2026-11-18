@@ -12,6 +12,9 @@ on:
       runner:
         description: hosted macOS image (macos-15-intel usually has shorter queues than macos-15 arm64)
         default: "macos-15-intel"
+      kernel_run:
+        description: reuse agate-kernel from this run id (skips the kernel build)
+        default: ""
   push:
     branches: [main]
     paths:
@@ -27,6 +30,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
@@ -46,6 +50,7 @@ env:
 
 jobs:
   kernel:
+    if: ${{ !inputs.kernel_run }}
     runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 240
     steps:
@@ -141,6 +146,7 @@ jobs:
 
   payload:
     needs: kernel
+    if: ${{ always() && (needs.kernel.result == 'success' || needs.kernel.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -165,6 +171,8 @@ jobs:
         with:
           name: agate-kernel
           path: kernel
+          run-id: ${{ inputs.kernel_run || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: ADT and payload
         run: |

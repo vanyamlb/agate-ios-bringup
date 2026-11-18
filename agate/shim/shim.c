@@ -55,8 +55,9 @@ typedef uint64_t u64;
 #define COL_OK 0xff00ff00u
 #define COL_ERR 0xffff0000u
 
-extern char _start[];
-extern char kicker_entry[];
+/* hidden: PC-relative (adrp/add), never through a GOT */
+extern char _start[] __attribute__((visibility("hidden")));
+extern char kicker_entry[] __attribute__((visibility("hidden")));
 
 static inline u32 rd32(u64 a) { return *(volatile u32 *)a; }
 static inline void wr32(u64 a, u32 v) { *(volatile u32 *)a = v; }
