@@ -47,3 +47,22 @@ fastboot reboot
 fastboot --set-active=b
 fastboot reboot
 ```
+
+### Probe 1 result (2026-11-18)
+
+The panel showed the probe output; phase 2 completed (pipe-1 reads are safe).
+
+| Item | Value |
+|---|---|
+| Visible buffer | **`0x7ba16000`, pitch 4320**, 1080×2400: OVL0 (`0x14000000`) layer L1, `L1_CON=0x000021ff` |
+| Layer below | OVL0_2L (`0x14001000`) L0, `0x7b020000`, pitch 4352 |
+| DSI0 | `MODE_CTRL=0` (command mode); frames reach the panel after mutex0 `EN=1` + `DSI_START` 0→1 |
+| Mutex 0 | `MOD=0x22000bf7`, `MOD2=0x1`, `SOF=0` |
+| CPU at entry | EL1, MIDR `0x412fd050` (A55 r2p0), MPIDR `0x81000000`, MMU off (`SCTLR_EL1=0x30d00800`) |
+| DTB / timer | `0x47c80000`, 13 MHz |
+| RDMA0, pipe 1 | idle |
+
+For XNU: patches 0010/0012 need `0x7ba16000` / stride 4320; the buffer
+crosses the `0x7c000000` 32 MiB boundary, so the early V=P mapping needs two
+L2 blocks; the framebuffer flush must re-trigger mutex0 and DSI0 after each
+frame (command-mode panel).
