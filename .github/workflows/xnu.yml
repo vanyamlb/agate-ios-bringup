@@ -91,18 +91,12 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Fetch private baseline
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ secrets.BASELINE_REPO }}
-          ref: ${{ secrets.BASELINE_REF }}
-          ssh-key: ${{ secrets.BASELINE_SSH_KEY }}
-          path: baseline-src
-          persist-credentials: false
-
-      - name: Prepare pinned baseline
+      - name: Prepare pinned baseline (public upstream)
+        # The fork has no access to the private mirror; the public fallback
+        # (MakrSas/ios-topaz @ 5095ac1 minus the topaz patches) yields the same
+        # manifest root and patchset hash.
         env:
-          BASELINE_DIR: baseline-src
+          ALLOW_PUBLIC_UPSTREAM: "1"
         run: |
           sh ci/prepare-baseline.sh base
 
