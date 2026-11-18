@@ -79,3 +79,15 @@ frame (command-mode panel).
 
 Expected first result: shim log, then XNU's early console and stage marks,
 ending at the root-device wait (there is no root filesystem yet).
+
+### XNU result 1 (2026-11-18)
+
+First boot of this pipeline (kernel run 44399552896, payload run 44404841296):
+the shim log, the frame kicker heartbeat and then XNU's console on the panel.
+XNU takes the agate-shim boot_args and ADT, brings up the platform expert,
+AMFI/Sandbox stand-ins, AppleKeyStore, IOWatchdog, AppleCLCD
+(`1080x2400 stride 4352 at 0x7cdfc000`), CPU 0 with SGI, the VM, BSD, HFS,
+mbufs and `lo0`/`gif0`/`stf0`, then stops with the expected
+`IOFindBSDRoot: specified root memory device, md0, has not been configured`
+(no root filesystem yet). The heartbeat keeps running after the panic.
+Returning to Android: fastboot `--set-active=b`.
