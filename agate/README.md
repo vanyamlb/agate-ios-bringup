@@ -114,3 +114,11 @@ python3 agate/tools/pack_xnu.py --base boot_a.img --shim shim.bin --payload payl
 `AGATE init: alive, tick 01..13` every 5 s, no panic. Mach-O exec, ad-hoc
 code signature, syscalls, devfs and the scheduler work on MT6893. Next: a real
 iOS 16 root filesystem.
+
+### UFS probe result (2026-11-19)
+
+With `agateufsprobe=1` (0090) XNU took over the UFS host LK left running and
+read the GPT of LUN 2: 77 partitions, matching Android (`boot_a` at 4K block
+170752, `super` at 419840 / 8704 MiB, `userdata` at 3373056 / 230871 MiB),
+then `probe done, 77 partitions, nothing written` and PID 1 as before. The
+UFS read path works on MT6893 without any change to the ruby driver.
