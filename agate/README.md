@@ -106,3 +106,11 @@ python3 <ios-topaz>/tools/mkpayload.py kernel.development.sweet agate.adt payloa
     --ramdisk agate-init --cmdline "$(cat agate/config/xnu1.cmdline)"
 python3 agate/tools/pack_xnu.py --base boot_a.img --shim shim.bin --payload payload.bin --out boot.img
 ```
+
+### PID 1 result (2026-11-19)
+
+`BSD root: md0` -> `load_init_program: attempting to load /sbin/launchd` ->
+`*** AGATE: iOS userspace on Xiaomi 11T, init running as PID 1 ***` ->
+`AGATE init: alive, tick 01..13` every 5 s, no panic. Mach-O exec, ad-hoc
+code signature, syscalls, devfs and the scheduler work on MT6893. Next: a real
+iOS 16 root filesystem.
