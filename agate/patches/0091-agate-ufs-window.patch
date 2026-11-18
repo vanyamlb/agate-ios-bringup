@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b8fc476..abed8ae 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -613,6 +613,55 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++/*
++ * agate: root in a window of a partition (boot-args ufsoffset=, ufsblocks=, in
++ * 4 KiB device blocks). The Xiaomi 11T keeps its iOS root in the unused tail
++ * of `super`, after Android's dynamic partitions. The window must start with
++ * an HFS+/HFSX volume header of 4 KiB blocks no larger than the window;
++ * otherwise (e.g. an Android update reused that space) the root is refused
++ * and nothing is ever written. With a window, su.first_block/su.nblocks
++ * describe the window, so ufs_write_blocks() cannot leave it, and the
++ * persistent console log (which writes the last 4 MiB) stays off.
++ */
++static bool agate_window;
++
++static int
++agate_ufs_window(void)
++{
++	uint64_t off = 0, blocks = 0;
++	bool have_off = PE_parse_boot_argn("ufsoffset", &off, sizeof(off));
++	bool have_blocks = PE_parse_boot_argn("ufsblocks", &blocks, sizeof(blocks));
++
++	if (!have_off && !have_blocks) {
++		return 0;
++	}
++	if (!have_off || !have_blocks || blocks == 0 || off >= su.nblocks ||
++	    blocks > su.nblocks - off) {
++		printf("AGATE UFS: bad window off %llu blocks %llu (partition %llu blocks)\n",
++		    off, blocks, su.nblocks);
++		return EINVAL;
++	}
++	int error = ufs_read_blocks(su.first_block + off, 1);
++	if (error) {
++		return error;
++	}
++	const uint8_t *h = (const uint8_t *)(su.dma + DMA_BOUNCE) + 1024;
++	uint16_t sig = (uint16_t)(h[0] << 8 | h[1]);
++	uint32_t bsize = (uint32_t)h[40] << 24 | (uint32_t)h[41] << 16 | (uint32_t)h[42] << 8 | h[43];
++	uint32_t total = (uint32_t)h[44] << 24 | (uint32_t)h[45] << 16 | (uint32_t)h[46] << 8 | h[47];
++	if ((sig != 0x482b && sig != 0x4858) || bsize != UFS_BLOCK || total == 0 || total > blocks) {
++		printf("AGATE UFS: no HFS+ volume at window block %llu (sig 0x%04x bsize %u total %u): refusing\n",
++		    off, sig, bsize, total);
++		return ENXIO;
++	}
++	su.first_block += off;
++	su.nblocks = blocks;
++	agate_window = true;
++	printf("AGATE UFS: root window at partition block %llu, %llu blocks, HFS %c volume of %u blocks\n",
++	    off, blocks, sig == 0x4858 ? 'X' : '+', total);
++	return 0;
++}
++
+ static int
+ sweet_ufs_init(void)
+ {
+@@ -665,6 +714,9 @@ sweet_ufs_init(void)
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++	if (!error) {
++		error = agate_ufs_window();
++	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;
+@@ -832,7 +884,7 @@ sweet_log_start(void)
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
+-	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++	if (!on || !su.writable || agate_window || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
