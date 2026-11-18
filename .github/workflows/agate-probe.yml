@@ -1,0 +1,42 @@
+name: agate-probe
+
+# Builds the agate (Xiaomi 11T, MT6893) display probe: a flat AArch64
+# payload that src/../agate/tools/pack_probe.py puts into a boot image.
+# No boot image, IPSW or device data is used or stored here.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "agate/probe/**"
+      - ".github/workflows/agate-probe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Build
+        run: sh agate/probe/build.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agate-probe
+          path: |
+            agate/probe/out/probe.bin
+            agate/probe/out/probe.elf
+            agate/probe/out/probe.dis
+            agate/probe/out/SHA256SUMS
+          if-no-files-found: error

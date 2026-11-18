@@ -1,0 +1,49 @@
+# agate: Xiaomi 11T (MT6893) bring-up
+
+Work in progress: porting this project's XNU/iOS 16 bring-up from `ruby`
+(MT6877) to the Xiaomi 11T (`agate`, MediaTek Dimensity 1200 / MT6893).
+
+## Differences from ruby (live FDT)
+
+| Block | agate | ruby |
+|---|---|---|
+| CPUs | 4× Cortex-A55 (`0xd05`) + 4× Cortex-A78 (`0xd41`), no PAC | 6× A55 + 2× A78 |
+| Boot image | v2, page 2048, kernel `0x40080000`, 128 MiB, slots a/b both usable | same, slot b broken |
+| `fastboot boot` | not supported by LK (image is accepted, then ignored) | same |
+| GIC / timer / PSCI | GICv3 `0x0c000000`/`0x0c040000`, 13 MHz, PSCI 1.0 | same |
+| UFS | `0x11270000`, IRQ SPI 105 | IRQ SPI 137 |
+| Framebuffer mblock | `0x7b020000` + `0x27e0000` (ends `0x7d800000`) | `0x7ba10000` + `0x1df0000` (same end) |
+| Panel | `k11t_42_02_0a_dsc_cmd`: DSI **command mode** + DSC | refreshed without triggers |
+| Display blocks | DSI0 `0x1400e000`, mutex `0x14117000`, OVL `0x14000000`/`0x14001000`/`0x14002000`, pipe 1 at `0x141xxxxx` | — |
+| Touch | ST FTS on SPI6 `0x1101d000`, IRQ SPI 165 | Goodix on SPI3 |
+
+`atag,videolfb-fb_base_l` (`0x7e020000`) points into TEE/GZ reserved memory
+and must not be written. The probe only writes inside the framebuffer mblock.
+
+## Stage 1: display probe (`probe/`)
+
+A ~6 KiB payload that LK runs from `boot_a` instead of Linux. It turns off
+the watchdog, paints the framebuffer mblock, reads DSI0/mutex/OVL/RDMA state,
+labels every candidate scan-out buffer with its own address, re-triggers
+frames if the panel is in command mode, and reboots after 60 s. It never
+touches storage, PMIC, GPIO or clocks.
+
+```sh
+sh agate/probe/build.sh                       # needs aarch64-linux-gnu-gcc
+python3 agate/tools/pack_probe.py --base boot_a.img \
+    --payload agate/probe/out/probe.bin --out probe-boot.img
+```
+
+The `agate-probe` workflow builds `probe.bin` on GitHub Actions.
+
+Flash only to the slot that does not hold Android, and keep the original
+image for that slot:
+
+```sh
+fastboot flash boot_a probe-boot.img
+fastboot --set-active=a
+fastboot reboot
+# back to Android: hold Power + Volume down for fastboot, then
+fastboot --set-active=b
+fastboot reboot
+```
