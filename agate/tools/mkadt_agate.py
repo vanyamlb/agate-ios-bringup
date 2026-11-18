@@ -42,6 +42,8 @@ def main():
     ap.add_argument('out')
     ap.add_argument('--dump', action='store_true')
     ap.add_argument('--ufs', action='store_true', help='add /sweet-ufs (UFS host)')
+    ap.add_argument('--d22ap', help='iPhone X device tree (DeviceTree.d22ap.im4p payload, '
+                    'decompressed): its /product node feeds MobileGestalt')
     a = ap.parse_args()
     sys.path.insert(0, os.path.join(a.topaz, 'tools'))
     import adt  # noqa: E402
@@ -141,6 +143,17 @@ def main():
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
+    product = []
+    if a.d22ap:
+        d22, _ = adt.parse(open(a.d22ap, 'rb').read())
+        for c in d22.children:
+            if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+                # as ios-topaz: drop syscfg placeholders (flag set) and node bookkeeping
+                props = [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+                product = [node('product', [ph()] + props)]
+        if not product:
+            sys.exit(f'{a.d22ap}: no /product node')
+
     root = node('device-tree', [
         ph(),
         ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,agate')
@@ -151,7 +164,7 @@ def main():
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + ([node('sweet-ufs', [
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([node('sweet-ufs', [
         ph(),
         ('compatible', cstr('mediatek,ufshci')),
         ('reg', u64(UFS, UFS_SIZE)),
