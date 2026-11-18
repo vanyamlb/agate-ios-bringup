@@ -66,3 +66,16 @@ For XNU: patches 0010/0012 need `0x7ba16000` / stride 4320; the buffer
 crosses the `0x7c000000` 32 MiB boundary, so the early V=P mapping needs two
 L2 blocks; the framebuffer flush must re-trigger mutex0 and DSI0 after each
 frame (command-mode panel).
+
+## Stage 2: XNU (`shim/`, `tools/`, `ci/`, workflow `agate-xnu`)
+
+| Piece | What it does |
+|---|---|
+| `ci/prepare-agate.sh` | sweet baseline 0001-0079 (+ `ci/baseline-changes.patch`) + ruby 0080-0083; every later ruby patch drives MT6877 hardware and is dropped |
+| `shim/` | iBoot stand-in at Image+0x1000: watchdog off, moves OVL0 L1 to ruby's buffer layout (`0x7cdfc000`, pitch 4352) so the early-console patches apply unchanged, starts a frame kicker on an A78 core (PSCI `CPU_ON`, mutex0 + DSI_START at ~30 Hz, heartbeat square), copies the payload into `0x140000000`+2 GiB and jumps to XNU |
+| `tools/mkadt_agate.py` | minimal ADT: 4× A55, GICv3, 13 MHz timer, framebuffer; **no `/sweet-ufs`**, so the kernel cannot reach storage |
+| `config/xnu1.cmdline` | `cpus=1`, `rd=md0` (no root yet), all sweet hardware drivers off |
+| `tools/pack_xnu.py` | packs shim + payload into the boot image's kernel slot, keeping everything else byte-identical |
+
+Expected first result: shim log, then XNU's early console and stage marks,
+ending at the root-device wait (there is no root filesystem yet).
