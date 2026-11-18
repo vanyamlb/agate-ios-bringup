@@ -91,3 +91,18 @@ mbufs and `lo0`/`gif0`/`stf0`, then stops with the expected
 `IOFindBSDRoot: specified root memory device, md0, has not been configured`
 (no root filesystem yet). The heartbeat keeps running after the panic.
 Returning to Android: fastboot `--set-active=b`.
+
+## Stage 3: first userspace process (`init/`)
+
+`init/agate-init.S` is a tiny PID 1: the mockfs RAM disk *is* this
+executable (served as `/sbin/launchd`). It prints a banner with its PID to
+`/dev/console` and a tick every 5 s. Build on macOS with the Command Line
+Tools only (no Xcode):
+
+```sh
+clang -target arm64-apple-ios16.0 -c agate/init/agate-init.S -o agate-init.o
+python3 <ios-topaz>/tools/mkinit.py agate-init.o agate-init      # static, ad-hoc signed
+python3 <ios-topaz>/tools/mkpayload.py kernel.development.sweet agate.adt payload.bin \
+    --ramdisk agate-init --cmdline "$(cat agate/config/xnu1.cmdline)"
+python3 agate/tools/pack_xnu.py --base boot_a.img --shim shim.bin --payload payload.bin --out boot.img
+```
