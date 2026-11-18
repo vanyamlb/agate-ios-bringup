@@ -4,6 +4,7 @@ kernel, and verify it.
 
   sudo hfs_zlib.py recompress ROOT     # macOS, ROOT mounted read-write, owners on
   hfs_zlib.py verify ROOT              # read-only check
+  sudo hfs_zlib.py patch ROOT RELPATH OFFSET OLDHEX NEWHEX
 
 The agate kernel (patch 0092) decodes decmpfs types 3 and 4 (zlib) and 9
 (raw after a 0xCC byte). `ditto --hfsCompression` keeps the source's own
@@ -124,12 +125,13 @@ def zlib_chunks(data):
     return out
 
 
-def recompress_one(path):
+def recompress_one(path, data=None):
     st = os.lstat(path)
-    with open(path, 'rb') as f:
-        data = f.read()
-    if len(data) != st.st_size:
-        raise OSError(f'short read {len(data)} != {st.st_size}', path)
+    if data is None:
+        with open(path, 'rb') as f:
+            data = f.read()
+        if len(data) != st.st_size:
+            raise OSError(f'short read {len(data)} != {st.st_size}', path)
     others = {}
     for b in listx(path):
         if b not in (DECMPFS, RSRC):
@@ -198,7 +200,32 @@ def compressed_files(root):
             yield p
 
 
+def patch(root, rel, off, old, new):
+    """Replace bytes old with new at off in a (compressed) file, in place."""
+    path = os.path.join(root, rel)
+    with open(path, 'rb') as f:
+        data = bytearray(f.read())
+    cur = bytes(data[off:off + len(old)])
+    if cur == new:
+        print('already patched', rel)
+        return
+    if cur != old:
+        sys.exit(f'{rel}+{off:#x}: found {cur.hex()}, expected {old.hex()}')
+    data[off:off + len(new)] = new
+    recompress_one(path, bytes(data))
+    with open(path, 'rb') as f:
+        f.seek(off)
+        got = f.read(len(new))
+    print(f'patched {rel}+{off:#x}: {old.hex()} -> {got.hex()}')
+    if got != new:
+        sys.exit('read-back mismatch')
+
+
 def main():
+    if len(sys.argv) == 7 and sys.argv[1] == 'patch':
+        patch(sys.argv[2], sys.argv[3], int(sys.argv[4], 0), bytes.fromhex(sys.argv[5]),
+              bytes.fromhex(sys.argv[6]))
+        return
     if len(sys.argv) != 3 or sys.argv[1] not in ('recompress', 'verify'):
         sys.exit(__doc__)
     mode, root = sys.argv[1], sys.argv[2]

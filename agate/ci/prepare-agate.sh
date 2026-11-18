@@ -4,8 +4,8 @@
 # Starts from the full, hash-verified ruby set (ci/prepare-baseline.sh with the
 # public upstream), then keeps only the sweet baseline (0001-0079, including
 # ci/baseline-changes.patch: early console at 0x7cdfc000 / stride 4352) plus
-# ruby 0080-0083 - the set ruby's first MTK boots used (config/0084.env minus
-# the autoswipe and Goodix touch patches). Every later ruby patch drives
+# ruby 0080-0084 - the set ruby's first MTK boots used (config/0084.env minus
+# the Goodix touch patch; 0084 is the synthetic unlock swipe). Every later ruby patch drives
 # MT6877 hardware (USB, PMIC wrapper, EINT, keys, battery) and is dropped.
 #
 # Then adds agate/patches/*.patch (e.g. 0090: read-only UFS probe).
@@ -21,6 +21,8 @@ PATCHSET_SHA256=d87e666ff903ad8dc214773495feac827558ab53bf5b8fd3edfc30734c19ff71
 
 for f in "$DEST"/xnu/patches/*.patch; do
 	n=$(basename "$f" | cut -c1-4)
+	# 0084: ruby's synthetic bottom-edge swipe (software only, boot-arg gated)
+	[ "$n" = 0084 ] && continue
 	if [ "$n" -ge 84 ] 2>/dev/null || [ "$(expr "$n" \> 0083)" = 1 ]; then
 		rm -f "$f"
 	fi
@@ -37,6 +39,6 @@ done
 count=$(ls "$DEST"/xnu/patches | wc -l | tr -d ' ')
 echo "agate patchset files: $count"
 ls "$DEST"/xnu/patches | tail -6
-expected=$((86 + $(ls "$ROOT"/agate/patches/*.patch | wc -l)))
-[ "$count" = "$expected" ] || { echo "expected $expected files (82 baseline + 0080-0083 + agate)" >&2; exit 1; }
+expected=$((87 + $(ls "$ROOT"/agate/patches/*.patch | wc -l)))
+[ "$count" = "$expected" ] || { echo "expected $expected files (82 baseline + 0080-0084 + agate)" >&2; exit 1; }
 python3 "$ROOT/ci/patchset_hash.py" "$DEST/xnu/patches"

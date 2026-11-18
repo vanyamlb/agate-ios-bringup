@@ -135,7 +135,7 @@ jobs:
           cp dxb/fakeroot/System/Library/Kernels/kernel.development.sweet out/
           # dxb skips patches that fail to apply with only a warning: make
           # sure every agate patch really is in the kernel.
-          for marker in "AGATE UFS: read-only probe" "AGATE UFS: root window" "AGATE decmpfs: types 3, 4"; do
+          for marker in "AGATE UFS: read-only probe" "AGATE UFS: root window" "AGATE decmpfs: types 3, 4" "SWEET HID: autoswipe armed"; do
             strings out/kernel.development.sweet | grep -q "$marker" ||
               { echo "agate patch missing from the kernel: $marker" >&2; exit 1; }
           done
