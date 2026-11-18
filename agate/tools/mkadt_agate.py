@@ -3,9 +3,9 @@
 
 Derived from MakrSas/ios-topaz tools/mkadt.py (fetched at the pinned
 baseline commit; its adt.py does the serialisation). Every address comes from
-the agate live FDT (agate/README.md). Deliberately absent:
-  - /sweet-ufs: without it the UFS root driver cannot attach, so this kernel
-    never touches storage,
+the agate live FDT (agate/README.md). UFS: /sweet-ufs is only added with --ufs. The driver then reaches storage only
+through rd=ufsroot0 or agateufsprobe=1, and writes only with ufsrw=1.
+Deliberately absent:
   - /product (needs the D22AP tree from an IPSW; not needed for kernel boot).
 
 Usage: mkadt_agate.py --topaz DIR OUT.adt [--dump]
@@ -29,6 +29,8 @@ TIMEBASE = 13000000
 FB, FB_SIZE = 0x7cdfc000, 0x7d800000 - 0x7cdfc000
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 4352
 
+UFS, UFS_SIZE = 0x11270000, 0x4000   # ufshci@11270000, reg 0x2300 rounded to a 16K page
+
 A55_MPIDRS = (0x000, 0x100, 0x200, 0x300)
 SWEET_ECID = 0x4147415445000001  # 'AGATE' + 1, synthetic
 BOOT_MANIFEST_HASH = hashlib.sha384(b'agate boot manifest').digest()
@@ -39,6 +41,7 @@ def main():
     ap.add_argument('--topaz', required=True, help='ios-topaz checkout (tools/adt.py)')
     ap.add_argument('out')
     ap.add_argument('--dump', action='store_true')
+    ap.add_argument('--ufs', action='store_true', help='add /sweet-ufs (UFS host)')
     a = ap.parse_args()
     sys.path.insert(0, os.path.join(a.topaz, 'tools'))
     import adt  # noqa: E402
@@ -148,7 +151,11 @@ def main():
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons])
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + ([node('sweet-ufs', [
+        ph(),
+        ('compatible', cstr('mediatek,ufshci')),
+        ('reg', u64(UFS, UFS_SIZE)),
+    ])] if a.ufs else []))
 
     blob = adt.serialize(root)
     open(a.out, 'wb').write(blob)

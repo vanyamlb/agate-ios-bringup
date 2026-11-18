@@ -8,6 +8,8 @@
 # the autoswipe and Goodix touch patches). Every later ruby patch drives
 # MT6877 hardware (USB, PMIC wrapper, EINT, keys, battery) and is dropped.
 #
+# Then adds agate/patches/*.patch (e.g. 0090: read-only UFS probe).
+#
 # Usage: sh agate/ci/prepare-agate.sh DEST
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -24,8 +26,17 @@ for f in "$DEST"/xnu/patches/*.patch; do
 	fi
 done
 
+# agate's own patches (0090+) go after ruby 0080-0083.
+cp "$ROOT"/agate/patches/*.patch "$DEST/xnu/patches/"
+python3 "$ROOT/ci/normalize_lf.py" "$DEST/xnu/patches"
+for p in "$ROOT"/agate/patches/*.patch; do
+	git -C "$DEST" apply --stat "xnu/patches/$(basename "$p")" >/dev/null ||
+		{ echo "malformed agate patch: $p" >&2; exit 6; }
+done
+
 count=$(ls "$DEST"/xnu/patches | wc -l | tr -d ' ')
 echo "agate patchset files: $count"
 ls "$DEST"/xnu/patches | tail -6
-[ "$count" = 86 ] || { echo "expected 86 files (82 baseline + 0080-0083)" >&2; exit 1; }
+expected=$((86 + $(ls "$ROOT"/agate/patches/*.patch | wc -l)))
+[ "$count" = "$expected" ] || { echo "expected $expected files (82 baseline + 0080-0083 + agate)" >&2; exit 1; }
 python3 "$ROOT/ci/patchset_hash.py" "$DEST/xnu/patches"

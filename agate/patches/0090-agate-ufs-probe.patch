@@ -1,0 +1,158 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index a76b05e..b8fc476 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -859,4 +859,138 @@ sweet_ufs_rootdev(dev_t *dev)
+ 	*dev = su.bdev;
+ 	return 0;
+ }
++
++/*
++ * agate (Xiaomi 11T, MT6893): read-only UFS probe, boot-arg agateufsprobe=1.
++ *
++ * Takes over the host the bootloader left running (as sweet_ufs_init does),
++ * then issues only TEST UNIT READY and READ(10): it reads the GPT of LUN
++ * ufslun (default 2) and prints every partition. su.writable stays false,
++ * so ufs_write_blocks() refuses any write; no device node is created and
++ * the root device is not changed.
++ */
++void agate_ufs_probe(void);
++
++void
++agate_ufs_probe(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	uint32_t on = 0, lun = 2;
++	int error;
++
++	if (!PE_parse_boot_argn("agateufsprobe", &on, sizeof(on)) || on != 1 || su.ready || su.regs) {
++		return;
++	}
++	printf("AGATE UFS: read-only probe, writes disabled\n");
++	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("AGATE UFS: no /sweet-ufs node\n");
++		return;
++	}
++	su.writable = false;
++	su.regs = ml_io_map(reg[0], reg[1]);
++	printf("AGATE UFS: host 0x%lx CAP 0x%x VER 0x%x HCE 0x%x HCS 0x%x DBR 0x%x\n",
++	    (unsigned long)reg[0], ufs_rd(REG_CAP), ufs_rd(0x08), ufs_rd(REG_HCE),
++	    ufs_rd(REG_HCS), ufs_rd(REG_UTRLDBR));
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("AGATE UFS: no contiguous DMA memory\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
++	if (!pn) {
++		return;
++	}
++	su.dma_pa = ptoa_64(pn);
++	PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
++	su.lun = (uint8_t)lun;
++	su.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_take_over_host();
++	if (!error) {
++		static const uint8_t tur[6] = { 0x00 };
++		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		}
++	}
++	if (error) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		printf("AGATE UFS: host/unit not usable (%d)\n", error);
++		return;
++	}
++	printf("AGATE UFS: host taken over, LUN %u ready, DMA at 0x%llx\n", su.lun, su.dma_pa);
++
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	const uint8_t *gpt = NULL;
++	uint32_t entry_off = 0;
++	error = ufs_read_blocks(0, 1);
++	if (!error && memcmp(b + 512, "EFI PART", 8) == 0) {
++		gpt = b + 512;
++		entry_off = 1024;
++	} else if (!error && memcmp(b, "EFI PART", 8) == 0) {
++		gpt = b;
++	} else if (!error && !(error = ufs_read_blocks(1, 1)) && memcmp(b, "EFI PART", 8) == 0) {
++		gpt = b;                        /* 4 KiB-LBA GPT: header in block 1 */
++	}
++	if (!gpt) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		printf("AGATE UFS: no GPT header in block 0 of LUN %u (%d)\n", su.lun, error);
++		return;
++	}
++	uint64_t entry_lba, last_lba;
++	uint32_t nent, esz;
++	memcpy(&last_lba, gpt + 48, 8);
++	memcpy(&entry_lba, gpt + 72, 8);
++	memcpy(&nent, gpt + 80, 4);
++	memcpy(&esz, gpt + 84, 4);
++	printf("AGATE UFS: GPT %u entries x %u, entries at LBA %llu, last usable %llu\n",
++	    nent, esz, entry_lba, last_lba);
++	if (esz != 128 || nent == 0 || entry_off + (uint64_t)nent * esz > BOUNCE_SIZE ||
++	    (entry_off == 0 && entry_lba > UINT32_MAX)) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		printf("AGATE UFS: GPT layout not handled by the probe\n");
++		return;
++	}
++	if (entry_off != 0) {
++		error = ufs_read_blocks(0, (entry_off + nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	} else {
++		error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		printf("AGATE UFS: reading the GPT entries failed (%d)\n", error);
++		return;
++	}
++	unsigned shown = 0;
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + entry_off + i * esz;
++		uint64_t first, last;
++		char name[37];
++		unsigned c;
++		bool used = false;
++		for (c = 0; c < 16; c++) {
++			used |= e[c] != 0;
++		}
++		if (!used) {
++			continue;
++		}
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		printf("AGATE UFS: %2u %-16s first %-9llu %llu MiB\n", i + 1, name, first,
++		    last >= first ? (last - first + 1) * UFS_BLOCK >> 20 : 0);
++		shown++;
++	}
++	printf("AGATE UFS: probe done, %u partitions, nothing written\n", shown);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -770,6 +770,11 @@
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+ //
++	{
++		/* agate: optional read-only UFS probe (boot-arg agateufsprobe=1) */
++		extern void agate_ufs_probe(void);
++		agate_ufs_probe();
++	}
+ 	if (strcmp(rdBootVar, "ufsroot0") == 0) {
+ 		extern int sweet_ufs_rootdev(dev_t *dev);
+ 		OSSafeReleaseNULL(matching);
