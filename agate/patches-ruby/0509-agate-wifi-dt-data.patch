@@ -1,0 +1,19 @@
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+index 32ee483..56fdd59 100644
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -334,7 +334,13 @@ agate_wlan_dt_node(const uint8_t *mac)
+ 			node->setProperty("local-mac-address", d);
+ 			d->release();
+ 		}
+-		node->setProperty("device_type", "wlan");
++		/* every device tree property is data: backboardd reads /arm-io's children as NSData and
++		 * aborted on an OSString here (-[NSTaggedPointerString getBytes:range:]) */
++		d = OSData::withBytes(name, sizeof(name));
++		if (d != NULL) {
++			node->setProperty("device_type", d);
++			d->release();
++		}
+ 		if (node->attachToParent(parent, gIODTPlane)) {
+ 			IOLog("AGATE WLAN: device tree node /arm-io/wlan made (launchd starts wifid for it)\n");
+ 		}
