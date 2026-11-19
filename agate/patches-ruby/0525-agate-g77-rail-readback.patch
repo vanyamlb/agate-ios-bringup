@@ -1,0 +1,164 @@
+diff --git a/bsd/dev/agate_gpu.c b/bsd/dev/agate_gpu.c
+--- a/bsd/dev/agate_gpu.c
++++ b/bsd/dev/agate_gpu.c
+@@ -1,6 +1,6 @@
+ /*
+  * Xiaomi 11T (agate, MT6893): snapshot of the Mali-G77 dependencies.
+- * Boot-arg agategpu=1 reads the always-on controllers without changing them.
++ * agategpu=1 reads the always-on controllers. agategpu=2 also reads rail state.
+  * Register layout cross-checked with the agate FDT and the MT6893 X6739
+  * reference (hakios_mali_mt6893.h, commit 9eeec2d2e12f).
+  */
+@@ -28,6 +28,122 @@
+ 	return *(volatile uint32_t *)(base + offset);
+ }
+ 
++
++/* agate: its Android FDT selects MT6885 SPMI PMIF, AP SWINF_2, and MT6315 SID 7. */
++#define AGATE_PMIC_CLK_STA        0x0090
++#define AGATE_PMIC_CLK_GATES      0x0003u  /* AP and timer gates */
++#define AGATE_PMIF_PA             0x10027000UL
++#define AGATE_PMIF_INIT           0x0000
++#define AGATE_PMIF_INF_EN         0x0024
++#define AGATE_PMIF_ARB_EN         0x0150
++#define AGATE_PMIF_ISSUE_EN       0x03b4
++#define AGATE_PMIF_AP_CHANNEL     (1u << (4 + 2))
++#define AGATE_PMIF_ACC            0x0c80
++#define AGATE_PMIF_RDATA          0x0c94
++#define AGATE_PMIF_VLD_CLR        0x0ca4
++#define AGATE_PMIF_STA            0x0ca8
++#define AGATE_PMIF_FSM_IDLE       0u
++#define AGATE_PMIF_FSM_VALID      6u
++#define AGATE_PMIF_READ_LONG      (3u << 30)
++#define AGATE_PMIF_MT6315_SID     (7u << 24)
++#define AGATE_MT6315_SWCID        0x000a
++#define AGATE_MT6315_BUCK_EN      0x1440
++#define AGATE_MT6315_BUCK1_VOSEL  0x1449
++#define AGATE_MT6315_BUCK1_DBG    0x1499
++#define AGATE_VSRAM_OTHERS_EN     0x1f08   /* common to MT6359 and MT6359P */
++
++extern void delay(int usec);
++
++static void
++agate_pmif_write(vm_offset_t base, uint32_t offset, uint32_t value)
++{
++	*(volatile uint32_t *)(base + offset) = value;
++	__asm__ __volatile__("dsb sy" ::: "memory");
++}
++
++static bool
++agate_pmif_wait(vm_offset_t base, uint32_t wanted)
++{
++	for (unsigned i = 0; i < 200; i++) {
++		if (((agate_gpu_read(base, AGATE_PMIF_STA) >> 1) & 7u) == wanted) {
++			return true;
++		}
++		delay(50);
++	}
++	return false;
++}
++
++/* Each caller requests one or two bytes on the AP channel. Only a completed
++ * read initiated here is acknowledged; do not clear another owner's reply. */
++static bool
++agate_mt6315_read(vm_offset_t base, uint16_t address, bool wide, uint16_t *value)
++{
++	uint32_t command = AGATE_PMIF_READ_LONG | AGATE_PMIF_MT6315_SID |
++	    ((uint32_t)wide << 16) | address;
++
++	if (!agate_pmif_wait(base, AGATE_PMIF_FSM_IDLE)) {
++		return false;
++	}
++	agate_pmif_write(base, AGATE_PMIF_ACC, command);
++	if (!agate_pmif_wait(base, AGATE_PMIF_FSM_VALID)) {
++		return false;
++	}
++	*value = (uint16_t)(agate_gpu_read(base, AGATE_PMIF_RDATA) & (wide ? 0xffffu : 0xffu));
++	agate_pmif_write(base, AGATE_PMIF_VLD_CLR, 1);
++	return true;
++}
++
++static void
++agate_gpu_vgpu_probe(vm_offset_t infra)
++{
++	vm_offset_t pmif;
++	uint16_t id, enabled, selector, readback;
++	uint32_t clocks = agate_gpu_read(infra, AGATE_PMIC_CLK_STA);
++
++	if (clocks & AGATE_PMIC_CLK_GATES) {
++		printf("AGATE GPU: PMIF clocks gated, CG0=%#x\n", clocks);
++		return;
++	}
++	pmif = ml_io_map(AGATE_PMIF_PA, 0x1000);
++	if (pmif == 0) {
++		printf("AGATE GPU: PMIF map failed\n");
++		return;
++	}
++	uint32_t init = agate_gpu_read(pmif, AGATE_PMIF_INIT);
++	uint32_t inf = agate_gpu_read(pmif, AGATE_PMIF_INF_EN);
++	uint32_t arb = agate_gpu_read(pmif, AGATE_PMIF_ARB_EN);
++	uint32_t issue = agate_gpu_read(pmif, AGATE_PMIF_ISSUE_EN);
++	if (!(init & 1u) || !(inf & arb & AGATE_PMIF_AP_CHANNEL) || !(issue & 1u)) {
++		printf("AGATE GPU: PMIF not ready (init %#x inf %#x arb %#x issue %#x)\n", init, inf, arb, issue);
++		return;
++	}
++	if (!agate_mt6315_read(pmif, AGATE_MT6315_SWCID, true, &id) || id == 0 || id == 0xffff ||
++	    !agate_mt6315_read(pmif, AGATE_MT6315_BUCK_EN, false, &enabled) ||
++	    !agate_mt6315_read(pmif, AGATE_MT6315_BUCK1_VOSEL, false, &selector) ||
++	    !agate_mt6315_read(pmif, AGATE_MT6315_BUCK1_DBG, false, &readback)) {
++		printf("AGATE GPU: MT6315 SID 7 read failed, PMIF status %#x\n", agate_gpu_read(pmif, AGATE_PMIF_STA));
++		return;
++	}
++	printf("AGATE GPU: MT6315 SID 7 id %#x VGPU enable request %u selector %#x readback %#x\n",
++	    (unsigned)id, enabled & 1u, (unsigned)selector, (unsigned)readback);
++}
++
++/* The Wi-Fi conninfra bring-up owns pwrap at this point and passes its existing reader. */
++void
++agate_gpu_vsram_probe(int (*read_reg)(uint16_t, uint16_t *))
++{
++	int step = 0;
++	uint16_t ctrl;
++
++	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || step != 2) {
++		return;
++	}
++	if (read_reg(AGATE_VSRAM_OTHERS_EN, &ctrl) != 0) {
++		printf("AGATE GPU: VSRAM_GPU control read failed\n");
++		return;
++	}
++	printf("AGATE GPU: MT6359 VSRAM_GPU enable request %u (CON0 %#x)\n", ctrl & 1u, (unsigned)ctrl);
++}
+ void
+ agate_gpu_probe(void)
+ {
+@@ -36,7 +152,7 @@
+ 	uint32_t clock, status, status2;
+ 	uint32_t prot0, prot1, prot2, prot3;
+ 
+-	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || step != 1) {
++	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || (step != 1 && step != 2)) {
+ 		return;
+ 	}
+ 
+@@ -61,5 +177,8 @@
+ 	    (unsigned)((clock & AGATE_GPU_MFG_SEL_GATE) != 0), status, status2,
+ 	    status & status2 & AGATE_GPU_MFG_DOMAINS, AGATE_GPU_MFG_DOMAINS);
+ 	printf("AGATE GPU: bus protection ACKs %#x %#x %#x %#x\n", prot0, prot1, prot2, prot3);
++	if (step == 2) {
++		agate_gpu_vgpu_probe(infra);
++	}
+ }
+ #endif
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+--- a/bsd/dev/agate_conninfra/agate_conninfra.c
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -1119,6 +1119,8 @@
+ 	if (!ac_pw) {
+ 		return -1;
+ 	}
++	extern void agate_gpu_vsram_probe(int (*read_reg)(uint16_t, uint16_t *));
++	agate_gpu_vsram_probe(pw_read);
+ 	/* POS part 1: PMIC (the clock buffer is HW-controlled on this SoC) */
+ 	ac_ldo("VCN18", VCN18_CON0);
+ 	{
