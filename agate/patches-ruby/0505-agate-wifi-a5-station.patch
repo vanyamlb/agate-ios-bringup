@@ -27,7 +27,7 @@ index 4b10ba7..c190d32 100644
  bsd/dev/ruby_raw.c			standard
  bsd/dev/ruby_probe.c			standard
 diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
-index 8c791ea..17bf981 100644
+index 8c791ea..2715a51 100644
 --- a/bsd/dev/agate_conninfra/agate_conninfra.c
 +++ b/bsd/dev/agate_conninfra/agate_conninfra.c
 @@ -517,6 +517,49 @@ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
@@ -90,7 +90,7 @@ index 8c791ea..17bf981 100644
  	for (i = 0; i < 64; i += 4) {
  		writel(0, buf + i);
  	}
-@@ -679,6 +725,79 @@ ac_pump(uint8_t want_seq, uint8_t want_eid)
+@@ -679,6 +725,91 @@ ac_pump(uint8_t want_seq, uint8_t want_eid)
  	return hit;
  }
  
@@ -109,6 +109,18 @@ index 8c791ea..17bf981 100644
 +		ac_rxcopy[i + 2] = (w >> 16) & 0xff;
 +		ac_rxcopy[i + 3] = (w >> 24) & 0xff;
 +	}
++}
++
++void
++agate_wf_dump(const char *why)
++{
++	if (!pool) {
++		return;
++	}
++	ac_wfdma_dump(why);
++	pr_info("WFDMA0 %s: G0=%08x R0 b=%08x n=%u c=%u d=%u ext=%08x; R0 desc[0] %08x %08x, ours at %u\n", why,
++	    readl(wd0 + 0x208), readl(wd0 + 0x500), readl(wd0 + 0x504), readl(wd0 + 0x508), readl(wd0 + 0x50c),
++	    readl(wd0 + 0x680), readl(pool + RX0R_OFF), readl(pool + RX0R_OFF + 4), ac_rx0idx);
 +}
 +
 +uint8_t
@@ -170,10 +182,16 @@ index 8c791ea..17bf981 100644
  static int
  ac_wait(uint8_t seq, uint8_t eid, uint32_t ms)
  {
-@@ -744,6 +863,12 @@ ac_scan(vm_offset_t blob, const volatile struct agfw_ent *e, uint32_t n)
+@@ -744,6 +875,18 @@ ac_scan(vm_offset_t blob, const volatile struct agfw_ent *e, uint32_t n)
  	}
  	pr_info("A4a: NVRAM %u fragments sent\n", nfrag);
  
++	{
++		/* CMD_BASIC_CONFIG (wlanUpdateBasicConfig): 802.3 to the host, no checksum offload */
++		uint8_t basic[12] = { 0 };
++		seq = ac_cmd(0x02, 1, basic, sizeof(basic));
++		pr_info("A5: BASIC_CONFIG seq %u -> %s\n", seq, ac_wait(seq, 0, 300) ? "no answer" : "answered");
++	}
 +	if (ac_step >= 8) {
 +		extern void agate_mtkwifi_attach(void);
 +		pr_info("A5: firmware configured, handing the radio to the station\n");
@@ -219,10 +237,10 @@ index 751b562..9455586 100644
  		printf("AGATE WIFI: step %d armed\n", aw_step);
 diff --git a/bsd/dev/agate_wlan/agate_mtkwifi.c b/bsd/dev/agate_wlan/agate_mtkwifi.c
 new file mode 100644
-index 0000000..648374c
+index 0000000..9a0a696
 --- /dev/null
 +++ b/bsd/dev/agate_wlan/agate_mtkwifi.c
-@@ -0,0 +1,1103 @@
+@@ -0,0 +1,1118 @@
 +/*
 + * agate (Xiaomi 11T, MT6893): the station -- scan, join (open or WPA2 with a passphrase), frames --
 + * on the running N9 firmware (bsd/dev/agate_conninfra/agate_conninfra.c, agatewifi >= 8), behind the
@@ -264,6 +282,7 @@ index 0000000..648374c
 +extern uint8_t agate_wf_cmd(uint8_t cid, int set, const void *body, uint32_t length);
 +extern int agate_wf_tx(const uint8_t *packet, uint32_t length);
 +extern void agate_wf_pump(agate_wf_event_fn event, agate_wf_frame_fn frame);
++extern void agate_wf_dump(const char *why);
 +/* AgateWLAN.cpp */
 +extern int agate_wlan_create(const uint8_t *mac);
 +
@@ -346,6 +365,11 @@ index 0000000..648374c
 +{
 +	struct wf_mail *m = &wf_mail[wf_mail_next++ % WF_MAIL];
 +
++	if (wf_st.events < 40) {
++		printf("agate wifi: event %#x seq %u, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n", eid, seq, length,
++		    length > 0 ? body[0] : 0, length > 1 ? body[1] : 0, length > 2 ? body[2] : 0, length > 3 ? body[3] : 0,
++		    length > 4 ? body[4] : 0, length > 5 ? body[5] : 0, length > 6 ? body[6] : 0, length > 7 ? body[7] : 0);
++	}
 +	wf_st.events++;
 +	m->eid = eid;
 +	m->seq = seq;
@@ -476,6 +500,11 @@ index 0000000..648374c
 +	bool errors;
 +
 +	wf_frames++;
++	if (wf_frames <= 6 && got >= 32) {
++		printf("agate wifi: frame %u, %u bytes: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | %02x%02x%02x%02x\n",
++		    wf_frames, got, f[3], f[2], f[1], f[0], f[7], f[6], f[5], f[4], f[11], f[10], f[9], f[8], f[15], f[14], f[13], f[12],
++		    f[24], f[25], f[26], f[27]);
++	}
 +	if (got < 24) {
 +		return;
 +	}
@@ -722,8 +751,12 @@ index 0000000..648374c
 +	if (!wf_net.joined) {
 +		wf_bss_active(false);
 +	}
-+	printf("agate wifi: scan %u %s in %u ms: %u networks heard, %u frames\n", scan_seq, got >= 0 ? "done" : "NOT DONE",
-+	    wf_ms() - began, wf_heard_count, wf_frames);
++	printf("agate wifi: scan %u %s in %u ms: %u networks heard, %u frames (done: %02x %02x %02x %02x %02x %02x %02x %02x)\n",
++	    scan_seq, got >= 0 ? "done" : "NOT DONE", wf_ms() - began, wf_heard_count, wf_frames, done[0], done[1], done[2],
++	    done[3], done[4], done[5], done[6], done[7]);
++	if (scan_seq <= 2) {
++		agate_wf_dump("after scan");
++	}
 +	return got >= 0;
 +}
 +
