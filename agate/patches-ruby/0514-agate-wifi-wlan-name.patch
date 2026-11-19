@@ -1,0 +1,39 @@
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+index 4a47a3a..65b50bc 100644
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -50,9 +50,17 @@ public:
+ 	bool init(IONetworkController *controller) APPLE_KEXT_OVERRIDE;
+ 	SInt32 performCommand(IONetworkController *ctr, unsigned long cmd, void *arg0, void *arg1) APPLE_KEXT_OVERRIDE;
+ 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	bool isPrimaryInterface(void) const APPLE_KEXT_OVERRIDE;
+ };
+ OSDefineMetaClassAndStructors(AgateWLANInterface, IOEthernetInterface);
+ 
++/* the phone's one Wi-Fi interface is its primary one (IOPrimaryInterface, as HakiOS's RedwoodWLAN) */
++bool
++AgateWLANInterface::isPrimaryInterface(void) const
++{
++	return true;
++}
++
+ /* IONetworkUserClient for its own type (configd's); what IO80211.framework asks for fails, and it
+  * then falls back to the ioctls (HakiOS's RedwoodWLAN): said, so the log shows wifid found us */
+ IOReturn
+@@ -420,6 +428,16 @@ agate_wlan_create(const uint8_t *mac)
+ 		w->setProperty("local-mac-address", d);
+ 		d->release();
+ 	}
++	/* wifid looks for the Wi-Fi device by name (IONameMatch "wlan", as the iPhone's /arm-io/.../wlan nub) */
++	w->setName("wlan");
++	{
++		static const char nm[] = "wlan";
++		OSData *nd = OSData::withBytes(nm, sizeof(nm));
++		if (nd != NULL) {
++			w->setProperty("name", nd);
++			nd->release();
++		}
++	}
+ 	if (!w->attach(prov)) {
+ 		w->release();
+ 		return -1;

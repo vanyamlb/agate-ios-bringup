@@ -1,0 +1,52 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 0780e93..6af66c0 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -3675,6 +3675,17 @@ is_io_registry_entry_get_property_bytes(
+ 	IOReturn            ret = kIOReturnSuccess;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		char sname[32];
++		if (sweet_iolog(sname, sizeof(sname))) {
++			OSObject * have = entry->copyProperty(property_name);
++			IOLog("IOK %s: bytes %.48s of %s %s -> %s\n", sname, property_name, entry->getMetaClass()->getClassName(),
++			    entry->getName(), have ? have->getMetaClass()->getClassName() : "none");
++			OSSafeReleaseNULL(have);
++		}
++	}
++#endif
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3883,6 +3894,14 @@ is_io_registry_entry_get_properties_bin_buf(
+ 	void                 * editRef = NULL;
+ 
+ 	CHECK(IORegistryEntry, registry_entry, entry);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		char sname[32];
++		if (sweet_iolog(sname, sizeof(sname))) {
++			IOLog("IOK %s: all properties of %s %s\n", sname, entry->getMetaClass()->getClassName(), entry->getName());
++		}
++	}
++#endif
+ 
+ #if CONFIG_MACF
+ 	GetPropertiesEditorRef ref;
+@@ -4236,6 +4255,14 @@ is_io_registry_entry_get_parent_iterator(
+ 	io_object_t *iterator)
+ {
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		char sname[32];
++		if (sweet_iolog(sname, sizeof(sname))) {
++			IOLog("IOK %s: parents of %s %s in %.32s\n", sname, entry->getMetaClass()->getClassName(), entry->getName(), plane);
++		}
++	}
++#endif
+ 
+ 	*iterator = IOUserIterator::withIterator(entry->getParentIterator(
+ 		    IORegistryEntry::getPlane( plane )));
