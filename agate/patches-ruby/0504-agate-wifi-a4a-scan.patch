@@ -1,0 +1,373 @@
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+index d927a42..8c791ea 100644
+--- a/bsd/dev/agate_conninfra/agate_conninfra.c
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -313,14 +313,19 @@ ac_wm_start(void)
+ #define DMA_POOL_SIZE  0x40000
+ #define RING_N         16
+ #define TXR_OFF        0x0000      /* TX ring 17 descriptors */
+-#define RXR_OFF        0x1000      /* RX ring 0 (DMA1) descriptors */
+-#define TXB_OFF        0x2000      /* TX buffers, 0x200 each */
+-#define RXB_OFF        0x8000      /* RX buffers, 0x800 each */
++#define RXR_OFF        0x1000      /* RX ring 0 (DMA1, events) descriptors */
++#define RX0R_OFF       0x1800      /* RX ring 0 (DMA0, data) descriptors */
++#define TXB_OFF        0x2000      /* TX buffers */
++#define TXB_SIZE       0x800
++#define RXB_OFF        0xa000      /* event buffers */
+ #define RXB_SIZE       0x800
++#define RX0_N          32
++#define RX0B_OFF       0x12000     /* data buffers */
+ 
+ struct agfw_ent { uint32_t kind, dest, len, off; char name[16]; };
+ 
+ static vm_offset_t wd0, wd1, wwrap, pool;
++static int ac_step;
+ static uint32_t ac_txidx, ac_rxidx;
+ static uint8_t ac_seq;
+ 
+@@ -404,6 +409,13 @@ ac_wfdma_init(void)
+ 	writel((uint32_t)(DMA_POOL_PA + RXR_OFF), wd1 + 0x500);   /* RX ring 0 */
+ 	writel(RING_N, wd1 + 0x504);
+ 	writel(RING_N - 1, wd1 + 0x508);
++	for (i = 0; i < RX0_N; i++) {               /* DMA0 RX ring 0: band 0 data */
++		writel((uint32_t)(DMA_POOL_PA + RX0B_OFF + i * RXB_SIZE), pool + RX0R_OFF + i * 16);
++		writel((uint32_t)RXB_SIZE << 16, pool + RX0R_OFF + i * 16 + 4);
++	}
++	writel((uint32_t)(DMA_POOL_PA + RX0R_OFF), wd0 + 0x500);
++	writel(RX0_N, wd0 + 0x504);
++	writel(RX0_N - 1, wd0 + 0x508);
+ 	ac_txidx = 0;
+ 	ac_rxidx = 0;
+ 
+@@ -434,9 +446,9 @@ ac_wfdma_init(void)
+ 
+ 	ac_wfdma_ctl(wd0, 0, 1);
+ 	ac_wfdma_ctl(wd1, 1, 1);
+-	/* TX/RX DMA enable on WFDMA1 only (cmd + event); WFDMA0 carries data
+-	 * rings this step does not set up */
++	/* WFDMA1: TX (cmd) + RX (event); WFDMA0: RX only (data ring 0) */
+ 	writel(readl(wd1 + 0x208) | 0x5, wd1 + 0x208);
++	writel(readl(wd0 + 0x208) | 0x4, wd0 + 0x208);
+ 	ac_wfdma_dump("ready");
+ 	return 0;
+ }
+@@ -446,12 +458,12 @@ static int
+ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
+ {
+ 	uint32_t len = 64 + plen, i, w;
+-	vm_offset_t buf = pool + TXB_OFF + ac_txidx * 0x200;
++	vm_offset_t buf = pool + TXB_OFF + ac_txidx * TXB_SIZE;
+ 	vm_offset_t td = pool + TXR_OFF + ac_txidx * 16;
+ 	uint8_t seq = ++ac_seq;
+ 	const uint8_t *p = payload;
+ 
+-	for (i = 0; i < 0x200; i += 4) {
++	for (i = 0; i < 64; i += 4) {
+ 		writel(0, buf + i);
+ 	}
+ 	writel(len | (2u << 23), buf + 0);           /* TX bytes, PKT_FT = CMD */
+@@ -465,7 +477,7 @@ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
+ 		}
+ 		writel(w, buf + 64 + i);
+ 	}
+-	writel((uint32_t)(DMA_POOL_PA + TXB_OFF + ac_txidx * 0x200), td + 0);
++	writel((uint32_t)(DMA_POOL_PA + TXB_OFF + ac_txidx * TXB_SIZE), td + 0);
+ 	writel(0, td + 8);
+ 	writel(0, td + 12);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+@@ -502,6 +514,272 @@ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
+ 	return -1;
+ }
+ 
++/* ---- A4a: firmware commands, NVRAM, BSS activate, scan ---- */
++static uint8_t ac_mac[6];
++
++/* CONNAC2X_WIFI_CMD: TXD + {len, pq, CID, 0xA0, set/query, seq, ...}; returns seq */
++static uint8_t
++ac_cmd(uint8_t cid, int set, const void *payload, uint32_t plen)
++{
++	uint32_t len = 64 + plen, i, w;
++	vm_offset_t buf = pool + TXB_OFF + ac_txidx * TXB_SIZE;
++	vm_offset_t td = pool + TXR_OFF + ac_txidx * 16;
++	uint8_t seq = ++ac_seq;
++	const uint8_t *p = payload;
++
++	if (seq == 0) {
++		seq = ++ac_seq;
++	}
++	for (i = 0; i < 64; i += 4) {
++		writel(0, buf + i);
++	}
++	writel(len | (2u << 23), buf + 0);
++	writel(1u << 16, buf + 4);
++	writel((len - 32) | (0x8000u << 16), buf + 32);
++	writel(cid | (0xa0u << 8) | ((set ? 1u : 0u) << 16) | ((uint32_t)seq << 24), buf + 36);
++	for (i = 0; i < plen; i += 4) {
++		w = 0;
++		for (uint32_t k = 0; k < 4 && i + k < plen; k++) {
++			w |= (uint32_t)p[i + k] << (8 * k);
++		}
++		writel(w, buf + 64 + i);
++	}
++	writel((uint32_t)(DMA_POOL_PA + TXB_OFF + ac_txidx * TXB_SIZE), td + 0);
++	writel(0, td + 8);
++	writel(0, td + 12);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	writel((len << 16) | (1u << 30), td + 4);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ac_txidx = (ac_txidx + 1) % RING_N;
++	writel(ac_txidx, wd1 + 0x418);
++	return seq;
++}
++
++#define SCAN_MAX 48
++struct ac_bss_ent { uint8_t bssid[6]; uint8_t ch; int8_t rssi; uint8_t len; char ssid[33]; };
++static struct ac_bss_ent ac_bss[SCAN_MAX];
++static int ac_nbss, ac_scan_done, ac_nframes;
++static uint8_t ac_rx0idx;
++
++static void
++ac_beacon(vm_offset_t rb, uint32_t rlen)
++{
++	uint32_t d1 = readl(rb + 4), d2 = readl(rb + 8), d3 = readl(rb + 12);
++	uint32_t grp = (d1 >> 11) & 0x1f, off = 24, rcpi = 0;
++	uint8_t f[256];
++	uint32_t n, i;
++
++	if (grp & 8) {
++		off += 16;              /* group 4 */
++	}
++	if (grp & 1) {
++		off += 16;              /* group 1 */
++	}
++	if (grp & 2) {
++		off += 8;               /* group 2 */
++	}
++	if (grp & 4) {              /* group 3: P-RXV, RCPI0 in DW1 [7:0] */
++		rcpi = readl(rb + off + 4) & 0xff;
++		off += 8;
++	}
++	if (grp & 16) {
++		off += 72;              /* group 5 */
++	}
++	off += 2 * ((d2 >> 14) & 3);
++	if (off >= rlen) {
++		return;
++	}
++	n = rlen - off;
++	if (n > sizeof(f)) {
++		n = sizeof(f);
++	}
++	for (i = 0; i < n; i++) {
++		uint32_t a = off + i;
++		f[i] = (readl(rb + (a & ~3u)) >> (8 * (a & 3))) & 0xff;
++	}
++	ac_nframes++;
++	if (n < 36 || !(f[0] == 0x80 || f[0] == 0x50)) {
++		if (ac_nframes <= 3) {
++			pr_info("A4a: RX frame grp %x off %u fc %02x%02x len %u\n", grp, off, f[0], f[1], rlen);
++		}
++		return;
++	}
++	const uint8_t *bssid = f + 16;
++	for (i = 0; i < (uint32_t)ac_nbss; i++) {
++		if (!memcmp(ac_bss[i].bssid, bssid, 6)) {
++			return;
++		}
++	}
++	if (ac_nbss >= SCAN_MAX) {
++		return;
++	}
++	struct ac_bss_ent *b = &ac_bss[ac_nbss++];
++	memcpy(b->bssid, bssid, 6);
++	b->ch = (d3 >> 8) & 0xff;
++	b->rssi = rcpi ? (int8_t)(((int)rcpi - 220) / 2) : 0;
++	b->len = 0;
++	b->ssid[0] = 0;
++	for (i = 36; i + 2 <= n; i += 2 + f[i + 1]) {
++		if (f[i] == 0 && f[i + 1] <= 32 && i + 2 + f[i + 1] <= n) {
++			b->len = f[i + 1];
++			memcpy(b->ssid, f + i + 2, b->len);
++			b->ssid[b->len] = 0;
++		}
++		if (f[i] == 3 && f[i + 1] == 1 && i + 3 <= n) {
++			b->ch = f[i + 2];               /* DS parameter set */
++		}
++	}
++}
++
++/* drain both RX rings; returns 1 when an event with seq "want" (or EID want_eid) arrived */
++static int
++ac_pump(uint8_t want_seq, uint8_t want_eid)
++{
++	int hit = 0;
++
++	for (;;) {
++		vm_offset_t rd = pool + RXR_OFF + ac_rxidx * 16;
++		uint32_t d1 = readl(rd + 4);
++		if (!(d1 & (1u << 31))) {
++			break;
++		}
++		vm_offset_t rb = pool + RXB_OFF + ac_rxidx * RXB_SIZE;
++		uint32_t rlen = (d1 >> 16) & 0x3fff;
++		uint32_t e1 = readl(rb + 28);
++		uint8_t eid = e1 & 0xff, eseq = (e1 >> 8) & 0xff;
++		if (eid == 0x0d) {
++			ac_scan_done = 1;
++		}
++		pr_info("A4a: EVENT EID 0x%02x seq %u len %u: %08x %08x %08x %08x\n", eid, eseq, rlen,
++		    readl(rb + 36), readl(rb + 40), readl(rb + 44), readl(rb + 48));
++		if ((want_seq && eseq == want_seq) || (want_eid && eid == want_eid)) {
++			hit = 1;
++		}
++		writel((uint32_t)RXB_SIZE << 16, rd + 4);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		writel(ac_rxidx, wd1 + 0x508);
++		ac_rxidx = (ac_rxidx + 1) % RING_N;
++	}
++	for (;;) {
++		vm_offset_t rd = pool + RX0R_OFF + ac_rx0idx * 16;
++		uint32_t d1 = readl(rd + 4);
++		if (!(d1 & (1u << 31))) {
++			break;
++		}
++		vm_offset_t rb = pool + RX0B_OFF + ac_rx0idx * RXB_SIZE;
++		uint32_t rlen = (d1 >> 16) & 0x3fff;
++		if (((readl(rb) >> 27) & 0x1f) == 2) {
++			ac_beacon(rb, rlen);
++		}
++		writel((uint32_t)RXB_SIZE << 16, rd + 4);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		writel(ac_rx0idx, wd0 + 0x508);
++		ac_rx0idx = (ac_rx0idx + 1) % RX0_N;
++	}
++	return hit;
++}
++
++static int
++ac_wait(uint8_t seq, uint8_t eid, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms; i++) {
++		if (ac_pump(seq, eid)) {
++			return 0;
++		}
++		delay(1000);
++	}
++	return -1;
++}
++
++static int
++ac_scan(vm_offset_t blob, const volatile struct agfw_ent *e, uint32_t n)
++{
++	static uint8_t frag[1500];
++	static uint8_t req[1188];
++	uint32_t i, k;
++	uint8_t seq;
++	vm_offset_t nv = 0;
++	uint32_t nvlen = 0;
++
++	for (i = 0; i < n; i++) {
++		if (e[i].kind == 3 && e[i].name[0] == 'n') {
++			nv = blob + e[i].off;
++			nvlen = e[i].len;
++		}
++	}
++	if (!nv || nvlen < 260) {
++		pr_err("A4a: no NVRAM in the blob\n");
++		return -1;
++	}
++#define NVB(o) ((uint8_t)((readl(nv + ((o) & ~3u)) >> (8 * ((o) & 3))) & 0xff))
++	for (k = 0; k < 6; k++) {
++		ac_mac[k] = NVB(4 + k);
++	}
++	pr_info("A4a: MAC %02x:%02x:%02x:%02x:%02x:%02x country %c%c\n", ac_mac[0], ac_mac[1],
++	    ac_mac[2], ac_mac[3], ac_mac[4], ac_mac[5], NVB(10), NVB(11));
++
++	/* 1. firmware capability (proves normal commands work) */
++	seq = ac_cmd(0x8a, 0, NULL, 0);
++	pr_info("A4a: NIC_CAPABILITY_V2 seq %u -> %s\n", seq, ac_wait(seq, 0, 500) ? "no answer" : "answered");
++
++	/* 2. NVRAM (wlanLoadManufactureData, fragment mode: TLVs from offset 256) */
++	uint32_t start = 0, off = 256, nfrag = 0;
++	while (off + 3 <= nvlen) {
++		uint32_t t = NVB(off), l = NVB(off + 1) | (NVB(off + 2) << 8);
++		if (t == 0 && l == 0 && off > 256) {
++			break;
++		}
++		off += 3 + l;
++		if (off - start > sizeof(frag) || off > nvlen) {
++			break;
++		}
++		memset(frag, 0, sizeof(frag));
++		for (k = 0; k < off - start; k++) {
++			frag[k] = NVB(start + k);
++		}
++		seq = ac_cmd(0x48, 1, frag, sizeof(frag));
++		ac_wait(seq, 0, 50);
++		start = off;
++		nfrag++;
++	}
++	pr_info("A4a: NVRAM %u fragments sent\n", nfrag);
++
++	/* 3. activate the AIS BSS (nicActivateNetworkEx) */
++	uint8_t act[12] = { 0, 1, 0 /* AIS */, 0, 0, 0, 0, 0, 0, 0, 4 /* BMC WTBL */, 0 };
++	memcpy(act + 4, ac_mac, 6);
++	seq = ac_cmd(0x11, 1, act, sizeof(act));
++	pr_info("A4a: BSS_ACTIVATE seq %u -> %s\n", seq, ac_wait(seq, 0, 300) ? "no answer" : "answered");
++
++	/* 4. CMD_SCAN_REQ_V2: active, wildcard SSID, all channels */
++	memset(req, 0, sizeof(req));
++	req[0] = 1;             /* ucSeqNum */
++	req[1] = 0;             /* ucBssIndex */
++	req[2] = 1;             /* SCAN_TYPE_ACTIVE_SCAN */
++	req[3] = 1;             /* SCAN_REQ_SSID_WILDCARD */
++	req[7] = 1;             /* auVersion */
++	req[158] = 0;           /* SCAN_CHANNEL_FULL */
++	ac_nbss = 0;
++	ac_scan_done = 0;
++	ac_nframes = 0;
++	seq = ac_cmd(0x03, 1, req, sizeof(req));
++	pr_info("A4a: SCAN_REQ_V2 seq %u sent\n", seq);
++	for (i = 0; i < 15000 && !ac_scan_done; i++) {
++		ac_pump(0, 0);
++		delay(1000);
++	}
++	pr_info("A4a: scan %s after %u ms, %d frames, %d networks:\n",
++	    ac_scan_done ? "DONE" : "timed out", i, ac_nframes, ac_nbss);
++	for (k = 0; k < (uint32_t)ac_nbss; k++) {
++		pr_info("WIFI  ch %3u  %4d dBm  %02x:%02x:%02x:%02x:%02x:%02x  \"%s\"\n",
++		    ac_bss[k].ch, ac_bss[k].rssi, ac_bss[k].bssid[0], ac_bss[k].bssid[1],
++		    ac_bss[k].bssid[2], ac_bss[k].bssid[3], ac_bss[k].bssid[4], ac_bss[k].bssid[5],
++		    ac_bss[k].len ? ac_bss[k].ssid : "<hidden>");
++	}
++	ac_wfdma_dump("after scan");
++	return ac_nbss > 0 ? 0 : -1;
++#undef NVB
++}
++
+ static void
+ ac_dynmem_write(uint32_t wfaddr, vm_offset_t src, uint32_t len)
+ {
+@@ -576,7 +854,13 @@ ac_fw_download(void)
+ 	pr_info("A3b: CONN_ON_MISC=%08x after %u ms -> %s\n", ready, i * 10,
+ 	    (ready & 3) == 3 ? "N9 Wi-Fi FIRMWARE IS RUNNING" : "firmware not ready");
+ 	ac_wfdma_dump("after");
+-	return (ready & 3) == 3 ? 0 : -1;
++	if ((ready & 3) != 3) {
++		return -1;
++	}
++	if (ac_step >= 7) {
++		return ac_scan(blob, e, n);
++	}
++	return 0;
+ }
+ 
+ int
+@@ -627,6 +911,7 @@ agate_conninfra_a2a(int step)
+ 	if (step >= 5) {
+ 		STEP("wm_start", ac_wm_start());
+ 	}
++	ac_step = step;
+ 	if (step >= 6) {
+ 		STEP("fw_download", ac_fw_download());
+ 	}

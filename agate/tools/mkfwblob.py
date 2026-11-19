@@ -12,6 +12,9 @@ Entries (all little endian):
           kind 2: left in the Image; the kernel writes it to WF MCU address
                   dest through the AP2WF dynamic memory map window, in order
                   (first "patch", then the "ram*" regions)
+          kind 3: left in the Image for the kernel as data ("nvram": the
+                  phone's nvram-WIFI.bin, sent as CMD_ID_SET_NVRAM_SETTINGS
+                  fragments)
 As gen4m's soc3_0 download (CFG_DOWNLOAD_DYN_MEMORY_MAP=1, ROM_PATCH_NO_SEM_CTRL):
 - the MCU and Wi-Fi "ROM EMI" images go to (u4PatchAddr & 0xFFFFFF) without
   their 48-byte ROM_EMI_HEADER, their 16-byte build dates to
@@ -85,6 +88,10 @@ def main():
             print(f"ram region {i}: {ln:#x} B to WF {addr:#x} (dyn mem map)")
     if off > base:
         raise SystemExit("ram code: regions overlap the tailer")
+
+    nv = (d / "nvram-WIFI.bin").read_bytes()
+    entries.append((3, 0, nv, "nvram"))
+    print(f"nvram: {len(nv)} B, MAC {nv[4:10].hex(':')}, country {nv[10:12]!r}")
 
     head = 16 + 32 * len(entries)
     off = (head + 63) & ~63
