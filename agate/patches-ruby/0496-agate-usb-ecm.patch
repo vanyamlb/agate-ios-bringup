@@ -672,7 +672,7 @@ index fb23643..dd3db9a 100644
          ruby_qmu_primer_kicks++;
          ruby_usb_irq_kick();
 diff --git a/bsd/dev/ruby_usb_qmu.c b/bsd/dev/ruby_usb_qmu.c
-index 22c3d58..a376399 100644
+index 22c3d58..630cde9 100644
 --- a/bsd/dev/ruby_usb_qmu.c
 +++ b/bsd/dev/ruby_usb_qmu.c
 @@ -19,6 +19,7 @@
@@ -683,7 +683,26 @@ index 22c3d58..a376399 100644
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  /* Boot-tunable ring sizes still defined in ruby_usb.c. */
-@@ -1545,7 +1546,8 @@ ruby_ep2_rx_drain(vm_offset_t mac)
+@@ -1449,6 +1450,18 @@ ruby_ep2_rx_drain(vm_offset_t mac)
+      * that shape as a full lap so the completed GPDs are drained/re-armed.
+      */
+     full_lap = (cur == ruby_rx_deq && hwo == 0) ? 1u : 0u;
++    /*
++     * agate ECM: the same shape with only the head consumed: the QMU
++     * completed the GPD at deq (HWO clear), came round to it and stopped
++     * there (cur == deq), while the rest of the ring is still armed. The
++     * walk above would see nothing to drain and RX stayed stopped for
++     * good (back-to-back Ethernet frames, rxhwo=fffe). A GPD at deq with
++     * HWO clear is always a completed one (re-arming sets HWO), unless the
++     * raw consumer left it unarmed on purpose.
++     */
++    if (!full_lap && !raw_owner && cur == ruby_rx_deq &&
++        !(hwo & (1u << cur)))
++        full_lap = 1u;
+ 
+     for (n = 0; n < ruby_rx_ring_n && (full_lap || ruby_rx_deq != cur); n++) {
+         i = ruby_rx_deq;
+@@ -1545,7 +1558,8 @@ ruby_ep2_rx_drain(vm_offset_t mac)
      }
      /* 0231: hand the echo bytes to the TX ring right away; the QMU workloop
       * owns both ends, so this is the same-thread producer -> consumer step. */
