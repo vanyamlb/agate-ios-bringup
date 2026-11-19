@@ -1,0 +1,299 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index abed8ae..e922ee0 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1045,4 +1045,280 @@ agate_ufs_probe(void)
+ 	}
+ 	printf("AGATE UFS: probe done, %u partitions, nothing written\n", shown);
+ }
++
++/*
++ * agate (Xiaomi 11T): ST FingerTip touch (FTM5 "SALIXP", chip id 36 40) on
++ * SPI6, boot-arg agatetouch=1.
++ *
++ * Polled, no interrupt controller: SPI mode 0 is bit-banged on the SPI6 pins
++ * in GPIO mode (GPIO0 CLK, GPIO1 CS, GPIO2 MISO, GPIO3 MOSI), DVDD is GPIO27,
++ * reset GPIO20 (live FDT pinctrl). Protocol as the Android fts_spi driver:
++ * after reset the controller posts CONTROLLER_READY (0x03); otherwise SPI4
++ * mode is set through its GPIO/ICR registers and the chip id is read. Reads
++ * return one dummy byte first. Scanning starts with A0 00 01; events (8
++ * bytes, FIFO command 0x87) carry 16-bit x/y in 1/10 pixel (10800x24000).
++ * Touches go to SweetHID (sweet_hid_touch) on its 1080x2400 canvas.
++ * Only the touch pins are touched; no PMIC, no flash/firmware commands.
++ * agatetouchlog=N prints the first N raw events.
++ */
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++#define AT_GPIO_PA      0x10005000UL
++#define AT_CLK          0u
++#define AT_CS           1u
++#define AT_MISO         2u
++#define AT_MOSI         3u
++#define AT_RST          20u
++#define AT_INT          21u
++#define AT_DVDD         27u
++#define AT_DIR(p)       (0x000u + ((p) / 32u) * 0x10u)
++#define AT_DO(p)        (0x100u + ((p) / 32u) * 0x10u)
++#define AT_DI(p)        (0x200u + ((p) / 32u) * 0x10u)
++#define AT_MODE(p)      (0x300u + ((p) / 8u) * 0x10u)
++#define AT_SET          0x4u
++#define AT_CLR          0x8u
++#define AT_FIFO_CMD     0x87u
++#define AT_REG_R        0xFBu
++#define AT_REG_W        0xFAu
++#define AT_MAX_FINGERS  10u
++
++static struct {
++	vm_offset_t gpio;
++	uint32_t log;
++	uint32_t active;
++	int x[AT_MAX_FINGERS], y[AT_MAX_FINGERS];
++	int chan;
++} at;
++
++static inline uint32_t at_rd(uint32_t off) { return *(volatile uint32_t *)(at.gpio + off); }
++static inline void at_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(at.gpio + off) = v; }
++
++static void
++at_mode_gpio(unsigned pin)
++{
++	uint32_t off = AT_MODE(pin), sh = (pin % 8u) * 4u;
++	at_wr(off, at_rd(off) & ~(0xfu << sh));
++}
++
++static void
++at_out(unsigned pin, int v)
++{
++	at_wr(AT_DO(pin) + (v ? AT_SET : AT_CLR), 1u << (pin % 32u));
++}
++
++static void
++at_dir(unsigned pin, int output)
++{
++	at_wr(AT_DIR(pin) + (output ? AT_SET : AT_CLR), 1u << (pin % 32u));
++}
++
++static int
++at_in(unsigned pin)
++{
++	return (at_rd(AT_DI(pin)) >> (pin % 32u)) & 1;
++}
++
++static void
++at_pin_dump(const char *when)
++{
++	static const unsigned pins[] = { AT_CLK, AT_CS, AT_MISO, AT_MOSI, AT_RST, AT_INT, AT_DVDD };
++	printf("AGATE TOUCH: pins %s:", when);
++	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++		unsigned p = pins[i];
++		printf(" %u:m%u d%u o%u i%u", p, (at_rd(AT_MODE(p)) >> ((p % 8u) * 4u)) & 0xfu,
++		    (at_rd(AT_DIR(p)) >> (p % 32u)) & 1u, (at_rd(AT_DO(p)) >> (p % 32u)) & 1u, at_in(p));
++	}
++	printf("\n");
++}
++
++/* One SPI mode-0 transaction: send tx, then clock in rx (MOSI low). ~250 kHz. */
++static void
++at_spi(const uint8_t *tx, unsigned ntx, uint8_t *rx, unsigned nrx)
++{
++	at_out(AT_CS, 0);
++	delay(2);
++	for (unsigned i = 0; i < ntx + nrx; i++) {
++		uint8_t out = i < ntx ? tx[i] : 0, in = 0;
++		for (int b = 7; b >= 0; b--) {
++			at_out(AT_MOSI, (out >> b) & 1);
++			delay(1);
++			at_out(AT_CLK, 1);
++			in = (uint8_t)((in << 1) | at_in(AT_MISO));
++			delay(1);
++			at_out(AT_CLK, 0);
++		}
++		if (i >= ntx) {
++			rx[i - ntx] = in;
++		}
++	}
++	at_out(AT_MOSI, 0);
++	delay(2);
++	at_out(AT_CS, 1);
++	delay(20);
++}
++
++/* Read: command (+ 32-bit address), then one dummy byte and len bytes. */
++static void
++at_read(uint8_t cmd, int has_addr, uint32_t addr, uint8_t *buf, unsigned len)
++{
++	uint8_t tx[5] = { cmd, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr };
++	uint8_t rx[1 + 8 * 4];
++
++	if (len > sizeof(rx) - 1) {
++		len = sizeof(rx) - 1;
++	}
++	at_spi(tx, has_addr ? 5 : 1, rx, len + 1);
++	memcpy(buf, rx + 1, len);
++}
++
++static void
++at_reg_write(uint32_t addr, uint8_t v)
++{
++	uint8_t tx[6] = { AT_REG_W, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr, v };
++	at_spi(tx, sizeof(tx), NULL, 0);
++}
++
++static void
++at_sleep_ms(unsigned ms)
++{
++	int ticks = (int)((ms * (unsigned)hz + 999u) / 1000u);
++	(void)tsleep(&at.chan, PZERO, "agtouch", ticks > 0 ? ticks : 1);
++}
++
++static void
++at_event(const uint8_t e[8])
++{
++	unsigned id = e[0], finger = e[1] >> 4;
++	if (at.log) {
++		at.log--;
++		printf("AGATE TOUCH: ev %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++	}
++	if (id == 0x03 || id == 0xf3) {
++		for (unsigned f = 0; f < AT_MAX_FINGERS; f++) {
++			if (at.active & (1u << f)) {
++				sweet_hid_touch((int)f, 0, at.x[f], at.y[f]);
++			}
++		}
++		at.active = 0;
++		return;
++	}
++	if ((id != 0x13 && id != 0x23 && id != 0x33) || finger >= AT_MAX_FINGERS) {
++		return;
++	}
++	int x = ((int)e[3] << 8 | e[2]) / 10;
++	int y = ((int)e[5] << 8 | e[4]) / 10;
++	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
++	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	if (id == 0x33) {
++		at.active &= ~(1u << finger);
++		sweet_hid_touch((int)finger, 0, x, y);
++		return;
++	}
++	at.active |= 1u << finger;
++	at.x[finger] = x;
++	at.y[finger] = y;
++	sweet_hid_touch((int)finger, 1, x, y);
++}
++
++static void
++agate_touch_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint8_t e[8], id[4];
++	int ready = 0;
++
++	at_pin_dump("inherited");
++	/* SPI6 pins to GPIO: CLK low, CS high, MOSI low out; MISO in. */
++	at_out(AT_CLK, 0);
++	at_out(AT_CS, 1);
++	at_out(AT_MOSI, 0);
++	at_dir(AT_CLK, 1);
++	at_dir(AT_CS, 1);
++	at_dir(AT_MOSI, 1);
++	at_dir(AT_MISO, 0);
++	at_dir(AT_INT, 0);
++	for (unsigned p = AT_CLK; p <= AT_MOSI; p++) {
++		at_mode_gpio(p);
++	}
++	at_mode_gpio(AT_INT);
++	/* DVDD on, then reset low 10 ms -> high (as fts_system_reset). */
++	at_out(AT_DVDD, 1);
++	at_dir(AT_DVDD, 1);
++	at_mode_gpio(AT_DVDD);
++	at_out(AT_RST, 0);
++	at_dir(AT_RST, 1);
++	at_mode_gpio(AT_RST);
++	at_sleep_ms(10);
++	at_out(AT_RST, 1);
++	at_pin_dump("configured");
++
++	for (int i = 0; i < 50 && !ready; i++) {
++		at_sleep_ms(20);
++		at_read(AT_FIFO_CMD, 0, 0, e, 8);
++		if (e[0] != 0 && e[0] != 0xff) {
++			printf("AGATE TOUCH: after reset %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++		}
++		ready = e[0] == 0x03;
++	}
++	if (!ready) {
++		printf("AGATE TOUCH: no CONTROLLER_READY; setting SPI4 mode\n");
++		at_reg_write(0x20000032, 0x10);   /* GPIO direction */
++		at_reg_write(0x20000034, 0x02);   /* GPIO pull-up */
++		at_reg_write(0x2000003E, 0x07);   /* GPIO config 3 */
++		at_reg_write(0x2000003D, 0x30);   /* GPIO config 0 */
++		at_reg_write(0x2000002D, 0x02);   /* ICR: SPI4 */
++		at_sleep_ms(10);
++	}
++	at_read(AT_REG_R, 1, 0x20000000, id, 2);
++	at_read(AT_REG_R, 1, 0x20000004, id + 2, 2);
++	printf("AGATE TOUCH: chip id %02x %02x fw %02x %02x (want 36 40), ready=%d\n",
++	    id[0], id[1], id[2], id[3], ready);
++	if (id[0] != 0x36 || id[1] != 0x40) {
++		printf("AGATE TOUCH: no ST FTS answer (AVDD/VMCH may be off); stopping\n");
++		return;
++	}
++	{
++		static const uint8_t scan[] = { 0xA0, 0x00, 0x01 };   /* active scan */
++		at_spi(scan, sizeof(scan), NULL, 0);
++	}
++	printf("AGATE TOUCH: active scan on, polling every %u ms\n", 1000u / (unsigned)hz);
++	for (;;) {
++		for (int n = 0; n < 32; n++) {
++			at_read(AT_FIFO_CMD, 0, 0, e, 8);
++			if (e[0] == 0 || e[0] == 0xff) {
++				break;
++			}
++			at_event(e);
++			if ((e[7] & 0x1f) == 0) {
++				break;
++			}
++		}
++		at_sleep_ms(8);
++	}
++}
++
++void agate_touch_start(void);
++
++void
++agate_touch_start(void)
++{
++	uint32_t on = 0;
++	thread_t th;
++
++	if (!PE_parse_boot_argn("agatetouch", &on, sizeof(on)) || on != 1 || at.gpio) {
++		return;
++	}
++	at.log = 40;
++	PE_parse_boot_argn("agatetouchlog", &at.log, sizeof(at.log));
++	at.gpio = ml_io_map(AT_GPIO_PA, 0x1000);
++	if (!at.gpio) {
++		printf("AGATE TOUCH: GPIO map failed\n");
++		return;
++	}
++	if (kernel_thread_start(agate_touch_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		printf("AGATE TOUCH: thread started (ST FTS on SPI6, GPIO bit-bang, polled)\n");
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -773,7 +773,10 @@
+ 	{
+ 		/* agate: optional read-only UFS probe (boot-arg agateufsprobe=1) */
+ 		extern void agate_ufs_probe(void);
+ 		agate_ufs_probe();
++		/* agate: ST FTS touch on SPI6, polled (boot-arg agatetouch=1) */
++		extern void agate_touch_start(void);
++		agate_touch_start();
+ 	}
+ 	if (strcmp(rdBootVar, "ufsroot0") == 0) {
+ 		extern int sweet_ufs_rootdev(dev_t *dev);
