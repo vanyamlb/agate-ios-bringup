@@ -1,0 +1,363 @@
+diff --git a/bsd/dev/agate_ecm.c b/bsd/dev/agate_ecm.c
+index 344b9ff..7735d02 100644
+--- a/bsd/dev/agate_ecm.c
++++ b/bsd/dev/agate_ecm.c
+@@ -42,6 +42,8 @@
+ #define ECM_TXQ_BYTES   (64u * 1024u)
+ 
+ extern int ruby_enum_profile;
++extern int agate_ecm_ioeth_create(void);
++extern void agate_ecm_ioeth_input(const uint8_t *data, uint32_t len);
+ 
+ /* phone side MAC (the host's MAC is the iMACAddress string, 02005E77EE01) */
+ static const uint8_t ecm_phone_mac[ETHER_ADDR_LEN] = {
+@@ -50,6 +52,7 @@ static const uint8_t ecm_phone_mac[ETHER_ADDR_LEN] = {
+ 
+ static struct {
+ 	ifnet_t ifp;
++	int ioeth;                      /* agateecmio=1: AgateECMEthernet */
+ 	lck_grp_t *grp;
+ 	lck_spin_t *lock;
+ 	int on;
+@@ -200,7 +203,16 @@ agate_ecm_rx(const uint8_t *data, uint32_t len)
+ 	int bad = ecm.rx_bad;
+ 	ecm.rx_len = 0;
+ 	ecm.rx_bad = 0;
+-	if (bad || flen < ETHER_HDR_LEN || flen > ECM_FRAME_MAX || ecm.ifp == NULL) {
++	if (bad || flen < ETHER_HDR_LEN || flen > ECM_FRAME_MAX) {
++		ecm.rx_drops++;
++		return;
++	}
++	if (ecm.ioeth) {
++		ecm.rx_frames++;
++		agate_ecm_ioeth_input(ecm.rx, flen);
++		return;
++	}
++	if (ecm.ifp == NULL) {
+ 		ecm.rx_drops++;
+ 		return;
+ 	}
+@@ -233,11 +245,40 @@ agate_ecm_rx(const uint8_t *data, uint32_t len)
+ 	ifnet_input(ecm.ifp, m, &stats);
+ }
+ 
++/* Queue one Ethernet frame (ue0 and AgateECMEthernet). 0 = queued. */
++int
++agate_ecm_queue_frame(const uint8_t *data, uint32_t len)
++{
++	uint8_t pad = 0;
++
++	if (!ecm.on || len < ETHER_HDR_LEN || len > ECM_FRAME_MAX) {
++		ecm.tx_drops++;
++		return -1;
++	}
++	uint32_t wire = len + (((len % ECM_MPS) == 0) ? 1u : 0u);   /* short packet end */
++	lck_spin_lock(ecm.lock);
++	if ((ecm.txq_head - ecm.txq_tail) + wire + 2 > ECM_TXQ_BYTES) {
++		lck_spin_unlock(ecm.lock);
++		ecm.tx_drops++;
++		return -1;
++	}
++	uint8_t h[2] = { (uint8_t)wire, (uint8_t)(wire >> 8) };
++	ecm_txq_put(h, 2);
++	ecm_txq_put(data, len);
++	if (wire != len) {
++		ecm_txq_put(&pad, 1);
++	}
++	lck_spin_unlock(ecm.lock);
++	ecm.tx_frames++;
++	ruby_usb_rx_kick();             /* IRQ mode: wake the QMU workloop */
++	return 0;
++}
++
+ static errno_t
+ ecm_if_output(ifnet_t ifp, mbuf_t m)
+ {
+ 	uint32_t len = (uint32_t)mbuf_pkthdr_len(m);
+-	uint8_t frame[ECM_FRAME_MAX + 1];
++	uint8_t frame[ECM_FRAME_MAX];
+ 
+ 	if (len < ETHER_HDR_LEN || len > ECM_FRAME_MAX) {
+ 		mbuf_freem(m);
+@@ -246,23 +287,11 @@ ecm_if_output(ifnet_t ifp, mbuf_t m)
+ 	}
+ 	mbuf_copydata(m, 0, len, frame);
+ 	mbuf_freem(m);
+-	if ((len % ECM_MPS) == 0) {
+-		frame[len++] = 0;       /* end on a short packet */
+-	}
+-	lck_spin_lock(ecm.lock);
+-	if ((ecm.txq_head - ecm.txq_tail) + len + 2 > ECM_TXQ_BYTES) {
+-		lck_spin_unlock(ecm.lock);
+-		ecm.tx_drops++;
++	if (agate_ecm_queue_frame(frame, len) != 0) {
+ 		ifnet_stat_increment_out(ifp, 0, 0, 1);
+-		return 0;
++	} else {
++		ifnet_stat_increment_out(ifp, 1, len, 0);
+ 	}
+-	uint8_t h[2] = { (uint8_t)len, (uint8_t)(len >> 8) };
+-	ecm_txq_put(h, 2);
+-	ecm_txq_put(frame, len);
+-	lck_spin_unlock(ecm.lock);
+-	ecm.tx_frames++;
+-	ifnet_stat_increment_out(ifp, 1, len, 0);
+-	ruby_usb_rx_kick();             /* IRQ mode: wake the QMU workloop */
+ 	return 0;
+ }
+ 
+@@ -299,6 +328,20 @@ agate_ecm_start(void)
+ 	ecm.grp = lck_grp_alloc_init("agate_ecm", LCK_GRP_ATTR_NULL);
+ 	ecm.lock = lck_spin_alloc_init(ecm.grp, LCK_ATTR_NULL);
+ 
++	int io = 0;
++	PE_parse_boot_argn("agateecmio", &io, sizeof(io));
++	if (io == 1) {
++		/* IONetworkingFamily path: configd names it and runs DHCP. */
++		ruby_usb_io_force_owner(RUBY_USB_IO_NET);
++		ecm.on = 1;
++		if (agate_ecm_ioeth_create() == 0) {
++			ecm.ioeth = 1;
++			printf("AGATE ECM: IOEthernetController path (agateecmio=1), EP1 owner=net\n");
++			return;
++		}
++		printf("AGATE ECM: IOEthernetController failed, falling back to ue0\n");
++	}
++
+ 	bzero(&init, sizeof(init));
+ 	init.ver = IFNET_INIT_CURRENT_VERSION;
+ 	init.len = sizeof(init);
+diff --git a/bsd/dev/agate_ecm.h b/bsd/dev/agate_ecm.h
+index b14109a..1601d95 100644
+--- a/bsd/dev/agate_ecm.h
++++ b/bsd/dev/agate_ecm.h
+@@ -10,6 +10,7 @@ int agate_ecm_tx_pending(void);
+ uint32_t agate_ecm_tx_dequeue(uint8_t *buf, uint32_t max);
+ void agate_ecm_rx(const uint8_t *data, uint32_t len);
+ void agate_ecm_status(void);
++int agate_ecm_queue_frame(const uint8_t *data, uint32_t len);
+ void agate_ecm_link_arm(void);
+ #include <mach/vm_types.h>
+ void agate_ecm_link_poll(vm_offset_t mac);
+diff --git a/iokit/Kernel/arm/AgateECMEthernet.cpp b/iokit/Kernel/arm/AgateECMEthernet.cpp
+new file mode 100644
+index 0000000..c9e6018
+--- /dev/null
++++ b/iokit/Kernel/arm/AgateECMEthernet.cpp
+@@ -0,0 +1,194 @@
++/*
++ * agate (Xiaomi 11T): the USB CDC-ECM link (bsd/dev/agate_ecm.c) as a real
++ * IOEthernetController from the built-in IONetworkingFamily (0497), so the
++ * system sees an Ethernet adapter: IONetworkStack/configd name it (en*),
++ * IPConfiguration runs DHCP on it and apps get a network path.
++ *
++ * Boot-arg agateecmio=1 selects this path instead of the kernel-only ue0.
++ * Frames still go through agate_ecm.c's per-frame TX ring and RX assembly.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/network/IOEthernetController.h>
++#include <IOKit/network/IOEthernetInterface.h>
++#include <IOKit/network/IONetworkMedium.h>
++#include <sys/kpi_mbuf.h>
++
++extern "C" int agate_ecm_queue_frame(const uint8_t *frame, uint32_t len);
++
++class AgateECMEthernet : public IOEthernetController {
++	OSDeclareDefaultStructors(AgateECMEthernet);
++
++public:
++	IOEthernetInterface *fNetif;
++	IONetworkMedium     *fMedium;
++	IOWorkLoop          *fWorkLoop;
++	volatile bool        fEnabled;
++	uint32_t             fRx, fTx;
++
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	bool createWorkLoop(void) APPLE_KEXT_OVERRIDE;
++	IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE;
++	IOReturn enable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
++	IOReturn disable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
++	UInt32 outputPacket(mbuf_t m, void *param) APPLE_KEXT_OVERRIDE;
++	IOReturn getHardwareAddress(IOEthernetAddress *addr) APPLE_KEXT_OVERRIDE;
++	IOReturn setPromiscuousMode(bool active) APPLE_KEXT_OVERRIDE;
++	IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
++	IOReturn setMulticastList(IOEthernetAddress *addrs, UInt32 count) APPLE_KEXT_OVERRIDE;
++	void input(const uint8_t *data, uint32_t len);
++};
++
++OSDefineMetaClassAndStructors(AgateECMEthernet, IOEthernetController);
++
++static AgateECMEthernet *gAgateEth;
++
++bool
++AgateECMEthernet::createWorkLoop(void)
++{
++	fWorkLoop = IOWorkLoop::workLoop();
++	return fWorkLoop != NULL;
++}
++
++IOWorkLoop *
++AgateECMEthernet::getWorkLoop(void) const
++{
++	return fWorkLoop;
++}
++
++bool
++AgateECMEthernet::start(IOService *provider)
++{
++	if (!IOEthernetController::start(provider)) {
++		IOLog("AGATE ETH: IOEthernetController::start failed\n");
++		return false;
++	}
++	OSDictionary *media = OSDictionary::withCapacity(1);
++	fMedium = IONetworkMedium::medium(kIOMediumEthernetAuto, 480000000);
++	if (media == NULL || fMedium == NULL ||
++	    !IONetworkMedium::addMedium(media, fMedium) ||
++	    !publishMediumDictionary(media)) {
++		IOLog("AGATE ETH: medium setup failed\n");
++		OSSafeReleaseNULL(media);
++		return false;
++	}
++	media->release();
++	setProperty("IOModel", "agate USB CDC-ECM");
++	setProperty("IOVendor", "agate");
++	if (!attachInterface((IONetworkInterface **)&fNetif, false)) {
++		IOLog("AGATE ETH: attachInterface failed\n");
++		return false;
++	}
++	fNetif->registerService();
++	IOLog("AGATE ETH: IOEthernetController up, interface registered\n");
++	return true;
++}
++
++IOReturn
++AgateECMEthernet::enable(IONetworkInterface *netif __unused)
++{
++	fEnabled = true;
++	setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, fMedium, 480000000);
++	IOLog("AGATE ETH: enabled, link up\n");
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AgateECMEthernet::disable(IONetworkInterface *netif __unused)
++{
++	fEnabled = false;
++	setLinkStatus(kIONetworkLinkValid, NULL, 0);
++	return kIOReturnSuccess;
++}
++
++UInt32
++AgateECMEthernet::outputPacket(mbuf_t m, void *param __unused)
++{
++	uint8_t frame[1600];
++	size_t len = mbuf_pkthdr_len(m);
++
++	if (fEnabled && len >= 14 && len <= 1536 &&
++	    mbuf_copydata(m, 0, len, frame) == 0) {
++		agate_ecm_queue_frame(frame, (uint32_t)len);
++		fTx++;
++	}
++	freePacket(m);
++	return kIOReturnOutputSuccess;
++}
++
++IOReturn
++AgateECMEthernet::getHardwareAddress(IOEthernetAddress *addr)
++{
++	static const uint8_t mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++	bcopy(mac, addr->bytes, 6);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AgateECMEthernet::setPromiscuousMode(bool active __unused)
++{
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AgateECMEthernet::setMulticastMode(bool active __unused)
++{
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AgateECMEthernet::setMulticastList(IOEthernetAddress *addrs __unused, UInt32 count __unused)
++{
++	return kIOReturnSuccess;
++}
++
++void
++AgateECMEthernet::input(const uint8_t *data, uint32_t len)
++{
++	if (!fEnabled || fNetif == NULL) {
++		return;
++	}
++	mbuf_t m = allocatePacket(len);
++	if (m == NULL) {
++		return;
++	}
++	if (mbuf_copyback(m, 0, len, data, MBUF_DONTWAIT) != 0) {
++		freePacket(m);
++		return;
++	}
++	fRx++;
++	fNetif->inputPacket(m, len, 0);
++}
++
++extern "C" int
++agate_ecm_ioeth_create(void)
++{
++	AgateECMEthernet *e = new AgateECMEthernet;
++	IOService *prov = IOService::getResourceService();
++
++	if (e == NULL || !e->init(NULL) || !e->attach(prov)) {
++		IOLog("AGATE ETH: create failed\n");
++		OSSafeReleaseNULL(e);
++		return -1;
++	}
++	if (!e->start(prov)) {
++		e->detach(prov);
++		e->release();
++		return -1;
++	}
++	e->registerService();
++	gAgateEth = e;
++	return 0;
++}
++
++extern "C" void
++agate_ecm_ioeth_input(const uint8_t *data, uint32_t len)
++{
++	if (gAgateEth != NULL) {
++		gAgateEth->input(data, len);
++	}
++}
++#endif /* SWEET */
+diff --git a/iokit/conf/Makefile.template b/iokit/conf/Makefile.template
+index fa7c402..3e2e1ab 100644
+--- a/iokit/conf/Makefile.template
++++ b/iokit/conf/Makefile.template
+@@ -65,7 +65,7 @@ COMP_SUBDIRS = \
+ # -Wno-cast-align
+ # agate: IONetworkingFamily built in (iokit/sweet_ionet), compiled like its kext.
+ AGATE_IONET_ROOT = $(SRCROOT)/iokit/sweet_ionet
+-AGATE_IONET_OBJS = IOEthernetController.cpo IOEthernetInterface.cpo IOKernelDebugger.cpo IOMbufMemoryCursor.cpo IONetworkController.cpo IONetworkData.cpo IONetworkInterface.cpo IONetworkMedium.cpo IONetworkStack.cpo IONetworkUserClient.cpo IOOutputQueue.cpo IOPacketQueue.cpo
++AGATE_IONET_OBJS = AgateECMEthernet.cpo IOEthernetController.cpo IOEthernetInterface.cpo IOKernelDebugger.cpo IOMbufMemoryCursor.cpo IONetworkController.cpo IONetworkData.cpo IONetworkInterface.cpo IONetworkMedium.cpo IONetworkStack.cpo IONetworkUserClient.cpo IOOutputQueue.cpo IOPacketQueue.cpo
+ $(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CFLAGS_ADD += -D__PRIVATE_SPI__ -I$(AGATE_IONET_ROOT)/include -I$(AGATE_IONET_ROOT)))
+ $(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CXXWARNFLAGS_ADD += -w -Wno-error))
+ 
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 924fdb1..4ad72ae 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -41,3 +41,4 @@ iokit/sweet_ionet/IONetworkStack.cpp             optional iokitcpp
+ iokit/sweet_ionet/IONetworkUserClient.cpp        optional iokitcpp
+ iokit/sweet_ionet/IOOutputQueue.cpp              optional iokitcpp
+ iokit/sweet_ionet/IOPacketQueue.cpp              optional iokitcpp
++iokit/Kernel/arm/AgateECMEthernet.cpp                           optional iokitcpp

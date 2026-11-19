@@ -1,0 +1,70 @@
+diff --git a/iokit/Kernel/arm/SweetNetwork.cpp b/iokit/Kernel/arm/SweetNetwork.cpp
+index c3e54a1..ec1d19b 100644
+--- a/iokit/Kernel/arm/SweetNetwork.cpp
++++ b/iokit/Kernel/arm/SweetNetwork.cpp
+@@ -9,7 +9,7 @@
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && 0  /* agate 0497: the real IONetworkingFamily is built in */
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
+ #include <libkern/c++/OSData.h>
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index a059ebc..2a64a7c 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -68,9 +68,10 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'sweet,display';"
+     "   },"
+     "   {"
+-    "     'IOClass'         = IONetworkController;"
+-    "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'marconi-wifi';"
++    "     'IOClass'         = IONetworkStack;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOResourceMatch' = IOBSD;"
++    "     'IOMatchCategory' = IONetworkStack;"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+diff --git a/iokit/conf/Makefile.template b/iokit/conf/Makefile.template
+index 7613d9b..fa7c402 100644
+--- a/iokit/conf/Makefile.template
++++ b/iokit/conf/Makefile.template
+@@ -63,6 +63,12 @@ COMP_SUBDIRS = \
+ # DO NOT ADD MORE HERE.
+ #
+ # -Wno-cast-align
++# agate: IONetworkingFamily built in (iokit/sweet_ionet), compiled like its kext.
++AGATE_IONET_ROOT = $(SRCROOT)/iokit/sweet_ionet
++AGATE_IONET_OBJS = IOEthernetController.cpo IOEthernetInterface.cpo IOKernelDebugger.cpo IOMbufMemoryCursor.cpo IONetworkController.cpo IONetworkData.cpo IONetworkInterface.cpo IONetworkMedium.cpo IONetworkStack.cpo IONetworkUserClient.cpo IOOutputQueue.cpo IOPacketQueue.cpo
++$(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CFLAGS_ADD += -D__PRIVATE_SPI__ -I$(AGATE_IONET_ROOT)/include -I$(AGATE_IONET_ROOT)))
++$(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CXXWARNFLAGS_ADD += -w -Wno-error))
++
+ IODataQueue.cpo_CXXWARNFLAGS_ADD += -Wno-cast-align
+ IOHibernateIO.cpo_CXXWARNFLAGS_ADD += -Wno-cast-align
+ IOHibernateRestoreKernel.o_CWARNFLAGS_ADD += -Wno-cast-align
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index e5a5071..924fdb1 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -27,3 +27,17 @@ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++
++# agate: Apple OSS IONetworkingFamily-170.140.2, staged by xnu/patches/0497-stage-ionet.sh
++iokit/sweet_ionet/IOEthernetController.cpp       optional iokitcpp
++iokit/sweet_ionet/IOEthernetInterface.cpp        optional iokitcpp
++iokit/sweet_ionet/IOKernelDebugger.cpp           optional iokitcpp
++iokit/sweet_ionet/IOMbufMemoryCursor.cpp         optional iokitcpp
++iokit/sweet_ionet/IONetworkController.cpp        optional iokitcpp
++iokit/sweet_ionet/IONetworkData.cpp              optional iokitcpp
++iokit/sweet_ionet/IONetworkInterface.cpp         optional iokitcpp
++iokit/sweet_ionet/IONetworkMedium.cpp            optional iokitcpp
++iokit/sweet_ionet/IONetworkStack.cpp             optional iokitcpp
++iokit/sweet_ionet/IONetworkUserClient.cpp        optional iokitcpp
++iokit/sweet_ionet/IOOutputQueue.cpp              optional iokitcpp
++iokit/sweet_ionet/IOPacketQueue.cpp              optional iokitcpp

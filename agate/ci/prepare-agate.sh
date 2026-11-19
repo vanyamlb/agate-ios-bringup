@@ -25,9 +25,10 @@ PATCHSET_SHA256=d87e666ff903ad8dc214773495feac827558ab53bf5b8fd3edfc30734c19ff71
 AGATE_BASE=${AGATE_BASE:-sweet}
 if [ "$AGATE_BASE" = ruby ]; then
 	cp "$ROOT"/agate/patches-ruby/*.patch "$DEST/xnu/patches/"
+	cp "$ROOT"/agate/patches-ruby/*.sh "$DEST/xnu/patches/" 2>/dev/null || true
 	python3 "$ROOT/ci/normalize_lf.py" "$DEST/xnu/patches"
 	count=$(ls "$DEST"/xnu/patches | wc -l | tr -d ' ')
-	expected=$((305 + $(ls "$ROOT"/agate/patches-ruby/*.patch | wc -l)))
+	expected=$((305 + $(ls "$ROOT"/agate/patches-ruby/ | grep -cE '\.(patch|sh)$')))
 	echo "agate-on-ruby patchset files: $count"
 	[ "$count" = "$expected" ] || { echo "expected $expected files" >&2; exit 1; }
 	python3 "$ROOT/ci/patchset_hash.py" "$DEST/xnu/patches"
