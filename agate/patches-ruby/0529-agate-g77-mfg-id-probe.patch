@@ -1,0 +1,409 @@
+diff --git a/bsd/dev/agate_gpu.c b/bsd/dev/agate_gpu.c
+index d859b5f..96b5d06 100644
+--- a/bsd/dev/agate_gpu.c
++++ b/bsd/dev/agate_gpu.c
+@@ -1,6 +1,7 @@
+ /*
+  * Xiaomi 11T (agate, MT6893): snapshot of the Mali-G77 dependencies.
+- * agategpu=1 reads the always-on controllers. agategpu=2 also reads rail state.
++ * agategpu=1 reads controllers. agategpu=2 reads rails.
++ * agategpu=3 also tests MFG power and reads the GPU ID at the stock boot point.
+  * Register layout cross-checked with the agate FDT and the MT6893 X6739
+  * reference (hakios_mali_mt6893.h, commit 9eeec2d2e12f).
+  */
+@@ -78,7 +79,7 @@ agate_gpu_read(vm_offset_t base, uint32_t offset)
+ extern void delay(int usec);
+ 
+ static void
+-agate_pmif_write(vm_offset_t base, uint32_t offset, uint32_t value)
++agate_gpu_write(vm_offset_t base, uint32_t offset, uint32_t value)
+ {
+ 	*(volatile uint32_t *)(base + offset) = value;
+ 	__asm__ __volatile__("dsb sy" ::: "memory");
+@@ -118,13 +119,13 @@ agate_mt6315_read(vm_offset_t pmif, uint16_t address, uint8_t *value)
+ 		printf("AGATE GPU: MT6315 reg %#x: AP channel busy before read\n", (unsigned)address);
+ 		return false;
+ 	}
+-	agate_pmif_write(pmif, AGATE_PMIF_ACC, command);
++	agate_gpu_write(pmif, AGATE_PMIF_ACC, command);
+ 	if (!agate_pmif_wait(pmif, AGATE_PMIF_FSM_VALID)) {
+ 		printf("AGATE GPU: MT6315 reg %#x: no valid reply to command %#x\n", (unsigned)address, command);
+ 		return false;
+ 	}
+ 	*value = (uint8_t)agate_gpu_read(pmif, AGATE_PMIF_RDATA);
+-	agate_pmif_write(pmif, AGATE_PMIF_VLD_CLR, 1);
++	agate_gpu_write(pmif, AGATE_PMIF_VLD_CLR, 1);
+ 	return true;
+ }
+ 
+@@ -155,22 +156,22 @@ agate_spmi_master_probe(vm_offset_t clocks)
+ 	return master;
+ }
+ 
+-static void
++static bool
+ agate_gpu_vgpu_probe(vm_offset_t clocks, vm_offset_t infra)
+ {
+ 	const uint32_t cg0 = agate_gpu_read(infra, AGATE_PMIC_CLK_STA);
+ 	if (cg0 & AGATE_PMIC_CLK_GATES) {
+ 		printf("AGATE GPU: PMIF clocks gated, CG0=%#x\n", cg0);
+-		return;
++		return false;
+ 	}
+ 	vm_offset_t master = agate_spmi_master_probe(clocks);
+ 	if (master == 0) {
+-		return;
++		return false;
+ 	}
+ 	vm_offset_t pmif = ml_io_map(AGATE_PMIF_PA, 0x1000);
+ 	if (pmif == 0) {
+ 		printf("AGATE GPU: PMIF map failed\n");
+-		return;
++		return false;
+ 	}
+ 	const uint32_t init = agate_gpu_read(pmif, AGATE_PMIF_INIT);
+ 	const uint32_t inf = agate_gpu_read(pmif, AGATE_PMIF_INF_EN);
+@@ -178,7 +179,7 @@ agate_gpu_vgpu_probe(vm_offset_t clocks, vm_offset_t infra)
+ 	const uint32_t issue = agate_gpu_read(pmif, AGATE_PMIF_ISSUE_EN);
+ 	if (!(init & 1u) || !(inf & arb & AGATE_PMIF_AP_CHANNEL) || !(issue & 1u)) {
+ 		printf("AGATE GPU: PMIF not ready (init %#x inf %#x arb %#x issue %#x)\n", init, inf, arb, issue);
+-		return;
++		return false;
+ 	}
+ 	uint8_t hi, lo, enabled, selector, readback, actual_on;
+ 
+@@ -186,13 +187,13 @@ agate_gpu_vgpu_probe(vm_offset_t clocks, vm_offset_t infra)
+ 	if (!agate_mt6315_read(pmif, AGATE_MT6315_SWCID_HI, &hi) ||
+ 	    !agate_mt6315_read(pmif, AGATE_MT6315_SWCID_LO, &lo)) {
+ 		agate_pmif_trace(pmif, master, "after MT6315 ID failure");
+-		return;
++		return false;
+ 	}
+ 	const unsigned id = ((unsigned)hi << 8) | lo;
+ 	if (id == 0 || id == 0xffff) {
+ 		printf("AGATE GPU: MT6315 SID 7 replied with invalid SWCID %#x\n", id);
+ 		agate_pmif_trace(pmif, master, "after invalid MT6315 ID");
+-		return;
++		return false;
+ 	}
+ 	printf("AGATE GPU: MT6315 SID 7 replied with SWCID %#x\n", id);
+ 	if (!agate_mt6315_read(pmif, AGATE_MT6315_BUCK_EN, &enabled) ||
+@@ -200,10 +201,272 @@ agate_gpu_vgpu_probe(vm_offset_t clocks, vm_offset_t infra)
+ 	    !agate_mt6315_read(pmif, AGATE_MT6315_BUCK1_DBG, &readback) ||
+ 	    !agate_mt6315_read(pmif, AGATE_MT6315_BUCK1_QI, &actual_on)) {
+ 		agate_pmif_trace(pmif, master, "after VGPU read failure");
+-		return;
++		return false;
+ 	}
+ 	printf("AGATE GPU: MT6315 SID 7 id %#x VGPU enable request %u monitor on %u selector %#x readback %#x\n",
+ 	    id, enabled & 1u, actual_on & 1u, (unsigned)selector, (unsigned)readback);
++	/* SID 7 VBUCK1: 0x78 is 750 mV in the MT6315 table. */
++	return (id >> 8) == 0x15u && (enabled & actual_on & 1u) && selector == 0x78 && readback == 0x78;
++}
++
++/* MT6893 MTCMOS sequence from clk-mt6885-pg.c; exercise only the GPU. */
++#define AGATE_GPU_APMIXED_PA       0x1000c000UL
++#define AGATE_GPU_MFGCFG_PA        0x13fbf000UL
++#define AGATE_GPU_REGS_PA          0x13000000UL
++#define AGATE_GPU_MFGPLL_CON0      0x0268
++#define AGATE_GPU_MFGPLL_CON1      0x026c
++#define AGATE_GPU_MFGPLL_POWER     0x0274
++#define AGATE_GPU_PWR_ACCESS       0x0000
++#define AGATE_GPU_SPM_KEY          (0xb16u << 16)
++#define AGATE_GPU_MFG0_CON         0x0308
++#define AGATE_GPU_DOMAIN_COUNT     7
++#define AGATE_GPU_RST_B            (1u << 0)
++#define AGATE_GPU_ISO              (1u << 1)
++#define AGATE_GPU_ON               (1u << 2)
++#define AGATE_GPU_ON_2             (1u << 3)
++#define AGATE_GPU_CLK_DIS          (1u << 4)
++#define AGATE_GPU_SRAM_PDN         (1u << 8)
++#define AGATE_GPU_SRAM_PDN_ACK     (1u << 12)
++#define AGATE_GPU_BG3D_STATUS      0x0000
++#define AGATE_GPU_BG3D_SET         0x0004
++#define AGATE_GPU_BG3D_CLEAR       0x0008
++#define AGATE_GPU_BG3D_GATE        1u
++
++struct agate_gpu_bus_protection {
++	uint32_t enable, set, clear, ack, mask;
++};
++
++/* Release step2 then step1. The off path below uses the vendor's
++ * step1-then-step2 order, preserving only the bits that were set. */
++static const struct agate_gpu_bus_protection agate_gpu_bus[] = {
++	{ 0x0220, 0x02a0, 0x02a4, 0x0228, (1u << 21) | (1u << 22) },
++	{ 0x0710, 0x0714, 0x0718, 0x0724, (1u << 7) },
++	{ 0x0bb4, 0x0bb8, 0x0bbc, 0x0bc4, (1u << 17) | (1u << 19) },
++	{ 0x0250, 0x02a8, 0x02ac, 0x0258, (1u << 19) | (1u << 20) | (1u << 21) },
++	{ 0x0710, 0x0714, 0x0718, 0x0724, (1u << 5) | (1u << 6) },
++};
++
++static bool
++agate_gpu_wait(vm_offset_t base, uint32_t offset, uint32_t mask, uint32_t wanted)
++{
++	for (unsigned retry = 0; retry < 400; retry++) {
++		if ((agate_gpu_read(base, offset) & mask) == wanted) {
++			return true;
++		}
++		delay(50);
++	}
++	printf("AGATE GPU: register %#x value %#x, mask %#x expected %#x\n",
++	    offset, agate_gpu_read(base, offset), mask, wanted);
++	return false;
++}
++
++static void
++agate_gpu_update(vm_offset_t base, uint32_t offset, uint32_t clear, uint32_t set)
++{
++	agate_gpu_write(base, offset, (agate_gpu_read(base, offset) & ~clear) | set);
++}
++
++static bool
++agate_gpu_wait_power(vm_offset_t spm, unsigned domain, bool on)
++{
++	uint32_t mask = 1u << (2 + domain);
++	uint32_t wanted = on ? mask : 0;
++
++	return agate_gpu_wait(spm, AGATE_GPU_SPM_STATUS, mask, wanted) &&
++	    agate_gpu_wait(spm, AGATE_GPU_SPM_STATUS_2, mask, wanted);
++}
++
++struct agate_gpu_power_state {
++	unsigned attempted;
++	unsigned awakened;
++	unsigned bus_released;
++	uint32_t protection[sizeof(agate_gpu_bus) / sizeof(agate_gpu_bus[0])];
++	uint32_t protected_ack[sizeof(agate_gpu_bus) / sizeof(agate_gpu_bus[0])];
++};
++
++static bool
++agate_gpu_domain_on(vm_offset_t spm, unsigned domain, struct agate_gpu_power_state *state)
++{
++	uint32_t con = AGATE_GPU_MFG0_CON + 4u * domain;
++
++	state->attempted = domain + 1;
++	agate_gpu_update(spm, con, 0, AGATE_GPU_ON);
++	agate_gpu_update(spm, con, 0, AGATE_GPU_ON_2);
++	if (!agate_gpu_wait_power(spm, domain, true)) {
++		printf("AGATE GPU: MFG%u power acknowledgement timed out\n", domain);
++		return false;
++	}
++	agate_gpu_update(spm, con, AGATE_GPU_CLK_DIS, 0);
++	agate_gpu_update(spm, con, AGATE_GPU_ISO, 0);
++	agate_gpu_update(spm, con, 0, AGATE_GPU_RST_B);
++	state->awakened = domain + 1;
++	agate_gpu_update(spm, con, AGATE_GPU_SRAM_PDN, 0);
++	if (!agate_gpu_wait(spm, con, AGATE_GPU_SRAM_PDN_ACK, 0)) {
++		printf("AGATE GPU: MFG%u SRAM wake timed out\n", domain);
++		return false;
++	}
++	return true;
++}
++
++static bool
++agate_gpu_open_bus(vm_offset_t infra, struct agate_gpu_power_state *state)
++{
++	for (unsigned i = 0; i < sizeof(agate_gpu_bus) / sizeof(agate_gpu_bus[0]); i++) {
++		const struct agate_gpu_bus_protection *step = &agate_gpu_bus[i];
++		unsigned saved = agate_gpu_read(infra, step->enable) & step->mask;
++
++		state->protection[i] = saved;
++		state->protected_ack[i] = agate_gpu_read(infra, step->ack) & saved;
++		state->bus_released = i + 1;
++		if (saved) {
++			agate_gpu_write(infra, step->clear, saved);
++		}
++		if (!agate_gpu_wait(infra, step->ack, step->mask, 0)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++agate_gpu_restore_bus(vm_offset_t infra, const struct agate_gpu_power_state *state)
++{
++	static const unsigned order[] = { 3, 4, 0, 1, 2 };
++
++	for (unsigned index = 0; index < sizeof(order) / sizeof(order[0]); index++) {
++		unsigned i = order[index];
++		if (i >= state->bus_released || !state->protection[i]) {
++			continue;
++		}
++		const struct agate_gpu_bus_protection *step = &agate_gpu_bus[i];
++		uint32_t saved = state->protection[i];
++		agate_gpu_write(infra, step->set, saved);
++		uint32_t ack = state->protected_ack[i];
++		if (!agate_gpu_wait(infra, step->enable, saved, saved) ||
++		    (ack && !agate_gpu_wait(infra, step->ack, ack, ack))) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++agate_gpu_power_down(vm_offset_t spm, vm_offset_t infra, const struct agate_gpu_power_state *state)
++{
++	for (unsigned n = state->attempted; n != 0; n--) {
++		unsigned domain = n - 1;
++		uint32_t con = AGATE_GPU_MFG0_CON + 4u * domain;
++
++		if (domain == 1 && !agate_gpu_restore_bus(infra, state)) {
++			return false;
++		}
++		if (n <= state->awakened) {
++			agate_gpu_update(spm, con, 0, AGATE_GPU_SRAM_PDN);
++			if (!agate_gpu_wait(spm, con, AGATE_GPU_SRAM_PDN_ACK, AGATE_GPU_SRAM_PDN_ACK)) {
++				return false;
++			}
++			agate_gpu_update(spm, con, 0, AGATE_GPU_ISO);
++			agate_gpu_update(spm, con, 0, AGATE_GPU_CLK_DIS);
++			agate_gpu_update(spm, con, AGATE_GPU_RST_B, 0);
++		}
++		agate_gpu_update(spm, con, AGATE_GPU_ON, 0);
++		agate_gpu_update(spm, con, AGATE_GPU_ON_2, 0);
++		if (!agate_gpu_wait_power(spm, domain, false)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++agate_gpu_preloader_clock(vm_offset_t clocks, vm_offset_t apmixed)
++{
++	const uint32_t mux = agate_gpu_read(clocks, AGATE_GPU_MFG_SEL);
++	const uint32_t en = agate_gpu_read(apmixed, AGATE_GPU_MFGPLL_CON0);
++	const uint32_t pcw = agate_gpu_read(apmixed, AGATE_GPU_MFGPLL_CON1);
++	const uint32_t power = agate_gpu_read(apmixed, AGATE_GPU_MFGPLL_POWER);
++	const unsigned postdiv = (pcw >> 24) & 7u;
++	const unsigned khz = (unsigned)((26000ULL * (pcw & 0x3fffffu)) >> (14u + postdiv));
++	const unsigned parent = (mux >> AGATE_GPU_MFG_SEL_SHIFT) & AGATE_GPU_MFG_SEL_MASK;
++
++	printf("AGATE GPU: MFGPLL %#x/%#x/%#x, parent %u, rate %u kHz\n", en, pcw, power, parent, khz);
++	/* Adopt the roughly 350 MHz stock boot point. Do not program the PLL. */
++	return parent == 1 && !(mux & AGATE_GPU_MFG_SEL_GATE) && (en & 1u) &&
++	    (power & 3u) == 1u && khz >= 345000u && khz <= 350100u;
++}
++
++static void
++agate_gpu_read_id(vm_offset_t mfg, vm_offset_t mali)
++{
++	const bool gated = (agate_gpu_read(mfg, AGATE_GPU_BG3D_STATUS) & AGATE_GPU_BG3D_GATE) != 0;
++	if (gated) {
++		agate_gpu_write(mfg, AGATE_GPU_BG3D_CLEAR, AGATE_GPU_BG3D_GATE);
++	}
++	if (agate_gpu_wait(mfg, AGATE_GPU_BG3D_STATUS, AGATE_GPU_BG3D_GATE, 0)) {
++		const uint32_t id = agate_gpu_read(mali, 0x0000);
++		printf("AGATE GPU: direct Mali GPU_ID %#x\n", id);
++		if ((id & 0xf00f0000u) == 0x90000000u) {
++			printf("AGATE GPU: G77 features tiler %#x memory %#x MMU %#x AS %#x JS %#x shader %#x/%#x\n",
++			    agate_gpu_read(mali, 0x000c), agate_gpu_read(mali, 0x0010), agate_gpu_read(mali, 0x0014),
++			    agate_gpu_read(mali, 0x0018), agate_gpu_read(mali, 0x001c),
++			    agate_gpu_read(mali, 0x0104), agate_gpu_read(mali, 0x0100));
++		}
++	}
++	if (gated) {
++		agate_gpu_write(mfg, AGATE_GPU_BG3D_SET, AGATE_GPU_BG3D_GATE);
++	}
++}
++
++static void
++agate_gpu_probe_mfg(vm_offset_t clocks, vm_offset_t infra)
++{
++	const vm_offset_t spm = ml_io_map(AGATE_GPU_SPM_PA, 0x1000);
++	const vm_offset_t apmixed = ml_io_map(AGATE_GPU_APMIXED_PA, 0x1000);
++	const vm_offset_t mfg = ml_io_map(AGATE_GPU_MFGCFG_PA, 0x1000);
++	const vm_offset_t mali = ml_io_map(AGATE_GPU_REGS_PA, 0x4000);
++	struct agate_gpu_power_state state = {0};
++
++	if (!spm || !apmixed || !mfg || !mali || !agate_gpu_preloader_clock(clocks, apmixed)) {
++		printf("AGATE GPU: MFG test skipped, mapping or preloader clock check failed\n");
++		return;
++	}
++	if ((agate_gpu_read(spm, AGATE_GPU_SPM_STATUS) | agate_gpu_read(spm, AGATE_GPU_SPM_STATUS_2)) &
++	    AGATE_GPU_MFG_DOMAINS) {
++		printf("AGATE GPU: MFG test skipped, pre-existing active domain\n");
++		return;
++	}
++	for (unsigned domain = 0; domain < AGATE_GPU_DOMAIN_COUNT; domain++) {
++		uint32_t con = agate_gpu_read(spm, AGATE_GPU_MFG0_CON + 4u * domain);
++		if (con & (AGATE_GPU_ON | AGATE_GPU_ON_2)) {
++			printf("AGATE GPU: MFG%u test skipped, unexpected control %#x\n", domain, con);
++			return;
++		}
++	}
++
++	const uint32_t config = agate_gpu_read(spm, AGATE_GPU_PWR_ACCESS) & 0xffffu;
++	if (!(config & 1u)) {
++		agate_gpu_write(spm, AGATE_GPU_PWR_ACCESS, AGATE_GPU_SPM_KEY | config | 1u);
++		if (!agate_gpu_wait(spm, AGATE_GPU_PWR_ACCESS, 1u, 1u)) {
++			return;
++		}
++	}
++	for (unsigned domain = 0; domain < AGATE_GPU_DOMAIN_COUNT; domain++) {
++		if (!agate_gpu_domain_on(spm, domain, &state) ||
++		    (domain == 1 && !agate_gpu_open_bus(infra, &state))) {
++			goto power_down;
++		}
++	}
++	printf("AGATE GPU: all seven MFG domains confirmed on\n");
++	agate_gpu_read_id(mfg, mali);
++power_down:
++	if (!agate_gpu_power_down(spm, infra, &state)) {
++		printf("AGATE GPU: MFG test stopped during shutdown; reboot before retrying\n");
++		return;
++	}
++	if (!(config & 1u)) {
++		agate_gpu_write(spm, AGATE_GPU_PWR_ACCESS, AGATE_GPU_SPM_KEY | config);
++	}
++	printf("AGATE GPU: MFG test completed, power domains off\n");
+ }
+ 
+ /* The Wi-Fi conninfra bring-up owns pwrap at this point and passes its existing reader. */
+@@ -213,7 +476,7 @@ agate_gpu_vsram_probe(int (*read_reg)(uint16_t, uint16_t *))
+ 	int step = 0;
+ 	uint16_t ctrl, chip, monitor, selector;
+ 
+-	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || step != 2) {
++	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || (step != 2 && step != 3)) {
+ 		return;
+ 	}
+ 	if (read_reg(AGATE_VSRAM_OTHERS_EN, &ctrl) != 0) {
+@@ -236,6 +499,26 @@ agate_gpu_vsram_probe(int (*read_reg)(uint16_t, uint16_t *))
+ 	}
+ 	printf("AGATE GPU: MT6359P VSRAM_GPU monitor on %u, live selector %#x\n",
+ 	    monitor & 1u, (selector >> 8) & 0x7fu);
++	if (step != 3) {
++		return;
++	}
++	/* VSRAM: 0x28 is 750 mV in the MT6359P table. */
++	if (!(ctrl & monitor & 1u) || ((selector >> 8) & 0x7fu) != 0x28u) {
++		printf("AGATE GPU: MFG test skipped, VSRAM not at verified boot point\n");
++		return;
++	}
++	const vm_offset_t clocks = ml_io_map(AGATE_GPU_TOPCKGEN_PA, 0x1000);
++	const vm_offset_t infra = ml_io_map(AGATE_GPU_INFRACFG_PA, 0x1000);
++	if (!clocks || !infra || !agate_gpu_vgpu_probe(clocks, infra)) {
++		printf("AGATE GPU: MFG test skipped, VGPU not at verified boot point\n");
++		return;
++	}
++	/* This callback runs in the serialized Wi-Fi bring-up path. */
++	static bool tested;
++	if (!tested) {
++		tested = true;
++		agate_gpu_probe_mfg(clocks, infra);
++	}
+ }
+ void
+ agate_gpu_probe(void)
+@@ -245,7 +528,7 @@ agate_gpu_probe(void)
+ 	uint32_t clock, status, status2;
+ 	uint32_t prot0, prot1, prot2, prot3;
+ 
+-	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || (step != 1 && step != 2)) {
++	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || (step < 1 || step > 3)) {
+ 		return;
+ 	}
+ 
