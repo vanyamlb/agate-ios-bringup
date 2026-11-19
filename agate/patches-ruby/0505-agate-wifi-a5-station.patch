@@ -341,10 +341,10 @@ index 751b562..9455586 100644
  		printf("AGATE WIFI: step %d armed\n", aw_step);
 diff --git a/bsd/dev/agate_wlan/agate_mtkwifi.c b/bsd/dev/agate_wlan/agate_mtkwifi.c
 new file mode 100644
-index 0000000..dff7a4c
+index 0000000..21acd63
 --- /dev/null
 +++ b/bsd/dev/agate_wlan/agate_mtkwifi.c
-@@ -0,0 +1,1124 @@
+@@ -0,0 +1,1144 @@
 +/*
 + * agate (Xiaomi 11T, MT6893): the station -- scan, join (open or WPA2 with a passphrase), frames --
 + * on the running N9 firmware (bsd/dev/agate_conninfra/agate_conninfra.c, agatewifi >= 8), behind the
@@ -850,6 +850,8 @@ index 0000000..dff7a4c
 +	scan[3] = 1;                            /* SCAN_REQ_SSID_WILDCARD */
 +	scan[6] = 0x02;                         /* ENUM_SCN_DBDC_SCAN_DIS */
 +	scan[7] = 1;
++	scan[154] = 100;                        /* u2ChannelDwellTime: 100 ms */
++	scan[828] = 50;                         /* u2ChannelMinDwellTime: 50 ms */
 +	(void)agate_wf_cmd(CMD_ID_SCAN_REQ_V2, 1, scan, sizeof(scan));
 +	got = wf_wait(EVENT_ID_SCAN_DONE, 0, done, sizeof(done), 12000);
 +	if (!wf_net.joined) {
@@ -865,6 +867,24 @@ index 0000000..dff7a4c
 +		    done[4], bcn, b24, b5);
 +	}
 +	if (scan_seq <= 2) {
++		/* EVENT_SCAN_DONE per channel: number @20, beacons+probe responses @212, MDRDY (what the PHY
++		 * handed the MAC) @276, scan time @348 -- MDRDY 0 everywhere: the radio hears nothing */
++		char line[200];
++		unsigned n = done[4] < 64 ? done[4] : 64, at = 0;
++		uint32_t mdrdy = 0;
++		for (unsigned i = 0; i < n; i++) {
++			mdrdy += done[276 + i];
++		}
++		printf("agate wifi: scan per channel (channel:beacons/mdrdy), %u packets the PHY passed in all\n", mdrdy);
++		line[0] = 0;
++		for (unsigned i = 0; i < n; i++) {
++			at += snprintf(line + at, sizeof(line) - at, " %u:%u/%u", done[20 + i], done[212 + i], done[276 + i]);
++			if (at > sizeof(line) - 16 || i == n - 1) {
++				printf("agate wifi:%s\n", line);
++				at = 0;
++				line[0] = 0;
++			}
++		}
 +		agate_wf_dump("after scan");
 +	}
 +	return got >= 0;
