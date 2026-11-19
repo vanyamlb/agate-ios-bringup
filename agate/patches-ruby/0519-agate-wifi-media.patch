@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
-index b449938..97ba3b4 100644
+index b449938..aaf7033 100644
 --- a/iokit/Kernel/arm/AgateWLAN.cpp
 +++ b/iokit/Kernel/arm/AgateWLAN.cpp
-@@ -31,9 +31,14 @@
+@@ -31,6 +31,10 @@
  
  #define SIOCSA80211     0x802869c8u
  #define SIOCGA80211     0xc02869c9u
@@ -13,11 +13,7 @@ index b449938..97ba3b4 100644
  
  extern "C" {
  void proc_selfname(char *buf, int size);
-+int copyout(const void *kaddr, user_addr_t udaddr, size_t len);
- int  agate_mtkwifi_transmit(const uint8_t *frame, uint32_t length);
- errno_t redwood_apple80211_ioctl(u_long command, void *data);
- kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
-@@ -107,6 +112,42 @@ AgateWLANInterface::performCommand(IONetworkController *ctr, unsigned long cmd,
+@@ -107,6 +111,42 @@ AgateWLANInterface::performCommand(IONetworkController *ctr, unsigned long cmd,
  
  	if (cmd == SIOCSA80211 || cmd == SIOCGA80211) {
  		r = redwood_apple80211_ioctl(cmd, arg1);
@@ -60,7 +56,7 @@ index b449938..97ba3b4 100644
  	} else {
  		r = IOEthernetInterface::performCommand(ctr, cmd, arg0, arg1);
  	}
-@@ -219,6 +260,7 @@ AgateWLAN::start(IOService *provider)
+@@ -219,6 +259,7 @@ AgateWLAN::start(IOService *provider)
  		return false;
  	}
  	media->release();
@@ -68,7 +64,7 @@ index b449938..97ba3b4 100644
  	setProperty("IOModel", "MT6893 CONNAC2 Wi-Fi");
  	setProperty("IOVendor", "MediaTek");
  	setProperty("IOBuiltin", true);
-@@ -297,6 +339,7 @@ void
+@@ -297,6 +338,7 @@ void
  AgateWLAN::link(bool up)
  {
  	fLinked = up;
