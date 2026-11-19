@@ -1,0 +1,81 @@
+diff --git a/bsd/dev/agate_wlan/agate_mtkwifi.c b/bsd/dev/agate_wlan/agate_mtkwifi.c
+index 21acd63..7b4c10c 100644
+--- a/bsd/dev/agate_wlan/agate_mtkwifi.c
++++ b/bsd/dev/agate_wlan/agate_mtkwifi.c
+@@ -1124,6 +1124,10 @@ agate_mtkwifi_attach(void)
+ 	wf_up = true;
+ 	redwood_sta_attach(&wf_ops);
+ 	printf("agate wifi: the radio is the station behind en0: iOS's Wi-Fi side can scan and join\n");
++	{
++		extern void agate_wlan_republish(void);
++		agate_wlan_republish();
++	}
+ 
+ 	if (PE_parse_boot_argn("agatessid", ssid, sizeof(ssid) - 1) && ssid[0] != 0) {
+ 		bzero(&given, sizeof(given));
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+index 56fdd59..4746cba 100644
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -119,6 +119,34 @@ OSDefineMetaClassAndStructors(AgateWLAN, IO80211Controller);
+ 
+ static AgateWLAN *gAgateWLAN;
+ 
++/* what wifid asks IOKit for (IOServiceMatched, IOPropertyMatch {IO80211InterfaceRole: Infrastructure}):
++ * does it find our interface? */
++static void
++agate_wlan_selftest(AgateWLAN *self, const char *when)
++{
++	OSDictionary *pm = OSDictionary::withCapacity(1);
++	OSDictionary *m = OSDictionary::withCapacity(1);
++	OSString *v = OSString::withCString("Infrastructure");
++	IOService *found = NULL;
++	OSObject *role = self->fNetif ? self->fNetif->copyProperty("IO80211InterfaceRole") : NULL;
++	OSObject *ifname = self->fNetif ? self->fNetif->copyProperty("IOInterfaceName") : NULL;
++
++	if (pm && m && v) {
++		pm->setObject("IO80211InterfaceRole", v);
++		m->setObject(gIOPropertyMatchKey, pm);
++		found = IOService::copyMatchingService(m);
++	}
++	IOLog("AGATE WLAN: selftest (%s): interface role %s, IOInterfaceName %s, state 0x%x; property match finds %s\n",
++	    when, role ? role->getMetaClass()->getClassName() : "NONE", ifname ? ifname->getMetaClass()->getClassName() : "NONE",
++	    self->fNetif ? (unsigned)self->fNetif->getState() : 0, found ? found->getMetaClass()->getClassName() : "NOTHING");
++	OSSafeReleaseNULL(found);
++	OSSafeReleaseNULL(role);
++	OSSafeReleaseNULL(ifname);
++	OSSafeReleaseNULL(pm);
++	OSSafeReleaseNULL(m);
++	OSSafeReleaseNULL(v);
++}
++
+ bool
+ AgateWLAN::createWorkLoop(void)
+ {
+@@ -206,6 +234,7 @@ AgateWLAN::nameThread(void *arg, wait_result_t wr __unused)
+ 		}
+ 		IOLog("AGATE WLAN: asked IONetworkStack for a name: 0x%x, now %s%u\n",
+ 		    ret, self->fNetif->getNamePrefix(), self->fNetif->getUnitNumber());
++		agate_wlan_selftest(self, "named");
+ 		OSSafeReleaseNULL(cmd);
+ 		OSSafeReleaseNULL(type);
+ 		OSSafeReleaseNULL(unit);
+@@ -389,6 +418,18 @@ redwood_net_input(const uint8_t *frame, size_t length)
+ 	}
+ }
+ 
++/* the station is up (agate_mtkwifi_attach, ~45 s in): register the interface again, so the
++ * IOServiceMatched notification of wifid's (started earlier) is sent for it now */
++extern "C" void
++agate_wlan_republish(void)
++{
++	if (gAgateWLAN != NULL && gAgateWLAN->fNetif != NULL) {
++		agate_wlan_selftest(gAgateWLAN, "station up");
++		gAgateWLAN->fNetif->registerService();
++		IOLog("AGATE WLAN: interface registered again for wifid\n");
++	}
++}
++
+ extern "C" void
+ redwood_net_link_state(bool up)
+ {
