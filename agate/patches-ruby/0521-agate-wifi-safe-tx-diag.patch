@@ -1,0 +1,32 @@
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -345,7 +345,8 @@
+ 		setLinkStatus(kIONetworkLinkValid | (up ? kIONetworkLinkActive : 0),
+ 		    up ? fMedium : NULL, up ? 54000000 : 0);
+ 	}
+-	IOLog("AGATE WLAN: link %s\n", up ? "UP" : "down");
++	IOLog("AGATE WLAN: link %s, enabled %d (link status %s)\n",
++	    up ? "UP" : "down", fEnabled, fEnabled ? "published" : "deferred");
+ }
+ 
+ UInt32
+@@ -355,15 +356,17 @@
+ 	size_t len = mbuf_pkthdr_len(m);
+ 	static unsigned said;
+ 	int r = -100;
++	bool copied = false;
+ 
+ 	if (fEnabled && fLinked && len >= 14 && len <= 1514 &&
+ 	    mbuf_copydata(m, 0, len, frame) == 0) {
++		copied = true;
+ 		r = agate_mtkwifi_transmit(frame, (uint32_t)len);
+ 	}
+ 	if (said < 12) {
+ 		said++;
+ 		IOLog("AGATE WLAN: out %u bytes, type %02x%02x, enabled %d linked %d -> %d\n", (unsigned)len,
+-		    len >= 14 ? frame[12] : 0, len >= 14 ? frame[13] : 0, fEnabled, fLinked, r);
++		    copied ? frame[12] : 0, copied ? frame[13] : 0, fEnabled, fLinked, r);
+ 	}
+ 	freePacket(m);
+ 	return kIOReturnOutputSuccess;
