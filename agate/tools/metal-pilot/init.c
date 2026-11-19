@@ -9,11 +9,16 @@ int main(int argc, char **argv)
     (void)argc;
     pid_t child = fork();
     if (child == 0) {
-        execl("/Developer/metal-smoke", "metal-smoke", (char *)NULL);
         int fd = open("/dev/console", O_WRONLY | O_NOCTTY);
         if (fd >= 0) {
-            dprintf(fd, "AGATE METAL: starting metal-smoke failed\n");
+            (void)dup2(fd, STDOUT_FILENO);
+            (void)dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) {
+                close(fd);
+            }
         }
+        execl("/Developer/metal-smoke", "metal-smoke", (char *)NULL);
+        dprintf(STDERR_FILENO, "AGATE METAL: starting metal-smoke failed\n");
         _exit(127);
     }
     if (child < 0) {

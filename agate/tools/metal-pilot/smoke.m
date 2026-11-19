@@ -119,6 +119,7 @@ int main(void)
             return fail(@"accelerator unavailable after 180 seconds");
         }
         setenv("VMG_NO_AIR_CACHE", "1", 1);
+        setenv("VMG_NO_SHM_STATS", "1", 1);
         setenv("VMG_DRIVER", "panfrost", 1);
         setenv("VGPU_BACKEND", "iokit", 1);
         NSBundle *bundle = [NSBundle bundleWithPath:@"/Developer/VivaMTLDriver.bundle"];
