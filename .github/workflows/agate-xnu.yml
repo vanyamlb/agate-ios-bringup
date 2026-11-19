@@ -154,30 +154,3 @@ jobs:
           path: out/
           if-no-files-found: error
 
-  paint-pilot:
-    runs-on: macos-15
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Compile and sign the iOS pilot
-        run: |
-          set -eu
-          mkdir -p pilot
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          CC="$(xcrun --sdk iphoneos -f clang)"
-          "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror \
-            agate/tools/metal-pilot/init.c -o pilot/metal-init
-          "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror -fobjc-arc \
-            agate/tools/metal-pilot/smoke.m -framework Foundation -framework Metal -framework IOKit -o pilot/metal-smoke
-          cd pilot
-          for f in metal-init metal-smoke; do
-            codesign -s - --force "$f"
-            codesign --verify --strict "$f"
-            test "$(lipo -archs "$f")" = arm64
-          done
-          shasum -a 256 metal-init metal-smoke > SHA256SUMS
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: agate-metal-pilot
-          path: pilot/
-          if-no-files-found: error
