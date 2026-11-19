@@ -154,7 +154,8 @@ static int render(id<MTLDevice> device)
 int main(void)
 {
     @autoreleasepool {
-        consoleFD = open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+        /* The Agate kernel tees these writes when sweetnull names this process. */
+        consoleFD = open("/dev/null", O_WRONLY | O_CLOEXEC);
         if (consoleFD < 0) {
             consoleFD = STDERR_FILENO;
         }
