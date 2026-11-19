@@ -1,0 +1,481 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index f2d8bf8..cd1b906 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -52,6 +52,12 @@ sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+ sweet_pthread_support.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+ sweet_pthread_synch.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+ 
++# agate: MediaTek's MT6893 conninfra platform code (staged by
++# 0501-stage-conninfra.sh) and its XNU glue, built against compat/.
++AGATE_CONN_ROOT = $(SRCROOT)/bsd/dev/agate_conninfra
++$(foreach o,mt6893_pos.o agate_conninfra.o,$(eval $(o)_CFLAGS_ADD += -include $(AGATE_CONN_ROOT)/compat/agate_conninfra_compat.h -I$(AGATE_CONN_ROOT)/compat -I$(AGATE_CONN_ROOT)/mtk))
++$(foreach o,mt6893_pos.o agate_conninfra.o,$(eval $(o)_CWARNFLAGS_ADD += -w -Wno-error))
++
+ # Apple OSS HFS built in (bsd/sweet_hfs): compiled like the kext, see sweet_hfs_compat.h.
+ # The compat header must come after the kernel's -D options, hence _CFLAGS_ADD.
+ SWEET_HFS_ROOT = $(SRCROOT)/bsd/sweet_hfs
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 976cc25..4b10ba7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -125,6 +125,8 @@ bsd/dev/ruby_usb_ep_test.c			standard
+ bsd/dev/ruby_usb_io.c			standard
+ bsd/dev/agate_ecm.c			standard
+ bsd/dev/agate_wifi.c			standard
++bsd/dev/agate_conninfra/agate_conninfra.c	standard
++bsd/dev/agate_conninfra/mtk/mt6893_pos.c	standard
+ bsd/dev/ruby_tty.c			standard
+ bsd/dev/ruby_raw.c			standard
+ bsd/dev/ruby_probe.c			standard
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+new file mode 100644
+index 0000000..0c958d1
+--- /dev/null
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -0,0 +1,275 @@
++/*
++ * agate (Xiaomi 11T, MT6893): Wi-Fi milestone A2a - the whole conninfra
++ * first power-on of MediaTek's consys_hw_pwr_on(), driven from XNU:
++ *   PMIC (VCN18/VCN13 on the MT6359P, through the pwrap WACS2 interface),
++ *   pinmux, MTCMOS + AXI bus, chip id, EMI remap, D-die, SPI master,
++ *   A-die (MT6635 over the conn RF SPI, with its efuse), AFE WBG calibration,
++ *   sub-system PLLs (BPLL/WPLL: the Wi-Fi bus clock), low-power setting.
++ * The register sequences are MediaTek's own (mtk/mt6893_pos.c, staged by
++ * 0501-stage-conninfra.sh, built against compat/). Every step is logged.
++ * Called from agate_wifi.c for agatewifi=3; agatewifi=4 also turns the
++ * Wi-Fi sub-system (WFSYS) on and reads its version id.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "consys_hw.h"
++#include "consys_reg_util.h"
++#include "consys_reg_mng.h"
++#include "mt6893_consys_reg.h"
++#include "mt6893_consys_reg_offset.h"
++#include "mt6893_pos.h"
++#include "mt6893.h"
++
++struct consys_base_addr conn_reg_mt6893;
++struct consys_hw_env conn_hw_env;
++
++/* the phone's /soc/consys@18000000 reg list, in MediaTek's index order */
++static const struct { uint64_t pa; uint32_t size; } ac_bases[CONSYS_BASE_ADDR_MAX] = {
++	[CONN_INFRA_RGU_BASE_INDEX]     = { 0x18000000, 0x1000 },
++	[CONN_INFRA_CFG_BASE_INDEX]     = { 0x18001000, 0x1000 },
++	[CONN_HOST_CSR_TOP_BASE_INDEX]  = { 0x18060000, 0x10000 },
++	[INFRACFG_AO_BASE_INDEX]        = { 0x10001000, 0x1000 },
++	[TOPRGU_BASE_INDEX]             = { 0x10007000, 0x1000 },
++	[SPM_BASE_INDEX]                = { 0x10006000, 0x1000 },
++	[INFRACFG_BASE_INDEX]           = { 0x1020e000, 0x1000 },
++	[CONN_WT_SLP_CTL_REG_INDEX]     = { 0x18005000, 0x1000 },
++	[CONN_AFE_CTL_INDEX]            = { 0x18003000, 0x1000 },
++	[CONN_INFRA_SYSRAM_INDEX]       = { 0x18050000, 0x10000 },
++	[GPIO_INDEX]                    = { 0x10005000, 0x1000 },
++	[CONN_RF_SPI_MST_REG_INDEX]     = { 0x18004000, 0x1000 },
++	[CONN_SEMAPHORE_INDEX]          = { 0x18070000, 0x10000 },
++	[CONN_TOP_THERM_CTL_INDEX]      = { 0x18002000, 0x1000 },
++	[IOCFG_RT_INDEX]                = { 0x11ea0000, 0x1000 },
++	[CONN_DEBUG_CTRL]               = { 0x1800f000, 0x1000 },
++};
++
++static int
++ac_map(void)
++{
++	for (int i = 0; i < CONSYS_BASE_ADDR_MAX; i++) {
++		vm_offset_t va = ml_io_map((vm_offset_t)ac_bases[i].pa, ac_bases[i].size);
++		if (va == 0) {
++			pr_err("map %d (0x%llx) failed\n", i, ac_bases[i].pa);
++			return -1;
++		}
++		conn_reg_mt6893.reg_base_addr[i].vir_addr = (unsigned long)va;
++		conn_reg_mt6893.reg_base_addr[i].phy_addr = (unsigned long)ac_bases[i].pa;
++		conn_reg_mt6893.reg_base_addr[i].size = ac_bases[i].size;
++	}
++	return 0;
++}
++
++/* ---- what mt6893_pos.c calls outside itself ---- */
++
++int
++consys_co_clock_type_mt6893(void)
++{
++	/* the phone's conninfra.cfg / DT: tcxo=0, co-clock: 26 MHz COTMS */
++	return CONNSYS_CLOCK_SCHEMATIC_26M_COTMS;
++}
++
++void
++update_thermal_data_mt6893(struct consys_plat_thermal_data_mt6893 *input)
++{
++	if (input) {
++		pr_info("thermal cal b=%d slope=%d offset=%d\n", input->thermal_b,
++		    input->slop_molecule, input->offset);
++	}
++}
++
++int
++consys_reg_mng_reg_readable(void)
++{
++	return 1;
++}
++
++int
++consys_reg_mng_is_bus_hang(void)
++{
++	return 0;
++}
++
++int
++consys_reg_mng_dump_bus_status(void)
++{
++	return 0;
++}
++
++int
++consys_reg_mng_dump_cpupcr(enum conn_dump_cpupcr_type t, int times, unsigned long us)
++{
++	(void)t; (void)times; (void)us;
++	return 0;
++}
++
++/* ---- MT6359P over the MT6885/6893 pwrap, WACS2 (pwrap_hal_6885.h) ---- */
++
++#define PW_PA           0x10026000UL
++#define PW_WACS2_CMD    0xc20
++#define PW_WACS2_RDATA  0xc24
++#define PW_WACS2_VLDCLR 0xc28
++#define PW_FSM(v)       (((v) >> 16) & 7u)
++#define PW_INIT(v)      (((v) >> 21) & 1u)
++#define PW_FSM_IDLE     0
++#define PW_FSM_WFVLDCLR 6
++
++static vm_offset_t ac_pw;
++
++static int
++pw_wait(uint32_t fsm)
++{
++	for (int i = 0; i < 100000; i++) {
++		if (PW_FSM(readl(ac_pw + PW_WACS2_RDATA)) == fsm) {
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++pw_read(uint16_t adr, uint16_t *val)
++{
++	if (!PW_INIT(readl(ac_pw + PW_WACS2_RDATA)) || pw_wait(PW_FSM_IDLE)) {
++		return -1;
++	}
++	writel((uint32_t)adr << 16, ac_pw + PW_WACS2_CMD);
++	if (pw_wait(PW_FSM_WFVLDCLR)) {
++		return -1;
++	}
++	*val = (uint16_t)(readl(ac_pw + PW_WACS2_RDATA) & 0xffff);
++	writel(1, ac_pw + PW_WACS2_VLDCLR);
++	return 0;
++}
++
++static int
++pw_write(uint16_t adr, uint16_t val)
++{
++	if (!PW_INIT(readl(ac_pw + PW_WACS2_RDATA)) || pw_wait(PW_FSM_IDLE)) {
++		return -1;
++	}
++	writel((1u << 31) | ((uint32_t)adr << 16) | val, ac_pw + PW_WACS2_CMD);
++	return pw_wait(PW_FSM_IDLE);
++}
++
++#define VCN13_CON0  0x1c1c
++#define VCN18_CON0  0x1c2e
++#define LDO_EN      0x0001
++
++static void
++ac_ldo(const char *name, uint16_t con0)
++{
++	uint16_t v = 0;
++	if (pw_read(con0, &v)) {
++		pr_err("PMIC %s CON0 read failed\n", name);
++		return;
++	}
++	pr_info("PMIC %s CON0=0x%04x%s\n", name, v, (v & LDO_EN) ? " (on)" : "");
++	if (!(v & LDO_EN)) {
++		pw_write(con0, v | LDO_EN);
++		delay(1000);
++		pw_read(con0, &v);
++		pr_info("PMIC %s CON0=0x%04x after enable\n", name, v);
++	}
++}
++
++/* ---- the sequence ---- */
++
++#define STEP(name, call) do { \
++	int _r = (call); \
++	pr_info("A2a %-22s -> %d\n", name, _r); \
++	if (_r) { pr_err("A2a stops at %s\n", name); return _r; } \
++} while (0)
++
++static int
++ac_wfsys_on(void)
++{
++	vm_offset_t rgu = conn_reg_mt6893.reg_base_addr[CONN_INFRA_RGU_BASE_INDEX].vir_addr;
++	vm_offset_t cfg = conn_reg_mt6893.reg_base_addr[CONN_INFRA_CFG_BASE_INDEX].vir_addr;
++	vm_offset_t csr = conn_reg_mt6893.reg_base_addr[CONN_HOST_CSR_TOP_BASE_INDEX].vir_addr;
++	vm_offset_t afe = conn_reg_mt6893.reg_base_addr[CONN_AFE_CTL_INDEX].vir_addr;
++	vm_offset_t brcm = ml_io_map(0x1800e000, 0x1000);
++	vm_offset_t misc = ml_io_map(0x184b0000, 0x1000);
++	int i;
++
++	if (!brcm || !misc) {
++		return -1;
++	}
++	/* gen4m soc3_0.c wf_pwr_on_consys_mcu() */
++	writel(readl(csr + 0x1a4) | 1, csr + 0x1a4);            /* wake conn_infra for WF */
++	for (i = 0; i < 10 && (readl(csr + 0x184) & 0x20); i++) {
++		delay(1000);
++	}
++	pr_info("WFSYS: slpprot %s, CONN_HW_VER=%08x\n", i < 10 ? "ready" : "NOT ready",
++	    readl(cfg + 0));
++	writel(readl(rgu + 0x10) & ~1u, rgu + 0x10);            /* WM CPU in reset */
++	/* conninfra_bus_clock_ctrl(WIFI, ALL, 1): BPLL then WPLL */
++	writel(readl(afe + CONN_AFE_CTL_RG_DIG_EN_03) | (1u << 21), afe + CONN_AFE_CTL_RG_DIG_EN_03);
++	delay(30);
++	writel(readl(afe + CONN_AFE_CTL_RG_DIG_EN_03) | (1u << 20), afe + CONN_AFE_CTL_RG_DIG_EN_03);
++	delay(50);
++	writel((readl(rgu + 0x0) & 0x0000ff7fu) | 0x57460080u, rgu + 0x0);   /* wfsys_top_on */
++	for (i = 0; i < 10 && !(readl(csr + 0x2cc) & 0x4); i++) {
++		delay(500);
++	}
++	pr_info("WFSYS: rgu_off_hreset %s (0x%08x)\n", i < 10 ? "released" : "STUCK",
++	    readl(csr + 0x2cc));
++	if (i == 10) {
++		return -1;
++	}
++	writel(readl(cfg + 0x620) & ~1u, cfg + 0x620);          /* WF sleep protect off */
++	for (i = 0; i < 100 && (readl(cfg + 0x620) & 0x8); i++) {
++		delay(500);
++	}
++	writel(readl(cfg + 0x624) & ~1u, cfg + 0x624);          /* WFDMA sleep protect off */
++	for (i = 0; i < 100 && (readl(cfg + 0x624) & 0x8); i++) {
++		delay(500);
++	}
++	pr_info("WFSYS: slp_ctrl wf=%08x wfdma=%08x\n", readl(cfg + 0x620), readl(cfg + 0x624));
++	writel(readl(brcm + 0x6c) | 1, brcm + 0x6c);            /* WF_VDNR_EN */
++	uint32_t ver = 0;
++	for (i = 0; i < 10; i++) {
++		ver = readl(misc + 0x10);
++		if (ver == 0x20010000) {
++			break;
++		}
++		delay(500);
++	}
++	pr_info("WFSYS_VERSION_ID=%08x -> %s\n", ver,
++	    ver == 0x20010000 ? "MT6893 Wi-Fi sub-system is ALIVE" : "unexpected");
++	return ver == 0x20010000 ? 0 : -1;
++}
++
++int
++agate_conninfra_a2a(int step)
++{
++	unsigned int next = 1u << CONNDRV_TYPE_WIFI;
++
++	if (ac_map()) {
++		return -1;
++	}
++	ac_pw = ml_io_map(PW_PA, 0x1000);
++	if (!ac_pw) {
++		return -1;
++	}
++	/* POS part 1: PMIC (the clock buffer is HW-controlled on this SoC) */
++	ac_ldo("VCN18", VCN18_CON0);
++	ac_ldo("VCN13", VCN13_CON0);
++	/* POS part 2 */
++	consys_set_if_pinmux_mt6893(1);
++	STEP("conninfra_on_power", consys_conninfra_on_power_ctrl_mt6893(1));
++	STEP("polling_chipid", consys_polling_chipid_mt6893());
++	/* POS part 3 */
++	consys_emi_set_remapping_reg_mt6893(0x8fb00000ULL, 0, 0);
++	STEP("d_die_cfg", connsys_d_die_cfg_mt6893());
++	STEP("spi_master_cfg", connsys_spi_master_cfg_mt6893(next));
++	STEP("a_die_cfg", connsys_a_die_cfg_mt6893());
++	STEP("afe_wbg_cal", connsys_afe_wbg_cal_mt6893());
++	STEP("subsys_pll_initial", connsys_subsys_pll_initial_mt6893());
++	consys_subsys_status_update_mt6893(true, CONNDRV_TYPE_WIFI);
++	STEP("low_power_setting", connsys_low_power_setting_mt6893(0, next));
++	pr_info("A2a: conninfra first power-on complete\n");
++	if (step >= 4) {
++		STEP("wfsys_on", ac_wfsys_on());
++	}
++	return 0;
++}
++#endif
+diff --git a/bsd/dev/agate_conninfra/compat/agate_conninfra_compat.h b/bsd/dev/agate_conninfra/compat/agate_conninfra_compat.h
+new file mode 100644
+index 0000000..62a6e31
+--- /dev/null
++++ b/bsd/dev/agate_conninfra/compat/agate_conninfra_compat.h
+@@ -0,0 +1,46 @@
++/*
++ * agate: the Linux environment MediaTek's MT6893 conninfra platform code
++ * (mtk/mt6893_pos.c, staged by 0501-stage-conninfra.sh) expects, on XNU.
++ * Force-included before every agate_conninfra source.
++ */
++#ifndef _AGATE_CONNINFRA_COMPAT_H_
++#define _AGATE_CONNINFRA_COMPAT_H_
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <string.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <mach/vm_types.h>
++
++typedef uint64_t phys_addr_t;
++typedef uint64_t u64;
++typedef uint32_t u32;
++typedef uint16_t u16;
++typedef uint8_t u8;
++typedef int32_t s32;
++
++extern void delay(int usec);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define pr_info(fmt, ...)   printf("AGATE CONN: " fmt, ##__VA_ARGS__)
++#define pr_notice(fmt, ...) printf("AGATE CONN: " fmt, ##__VA_ARGS__)
++#define pr_warn(fmt, ...)   printf("AGATE CONN warn: " fmt, ##__VA_ARGS__)
++#define pr_err(fmt, ...)    printf("AGATE CONN err: " fmt, ##__VA_ARGS__)
++#define pr_debug(fmt, ...)  do { } while (0)
++
++#define udelay(us)          delay((int)(us))
++#define mdelay(ms)          delay((int)(ms) * 1000)
++#define msleep(ms)          delay((int)(ms) * 1000)
++#define usleep_range(a, b)  delay((int)(a))
++
++#define writel(v, a)        (*(volatile uint32_t *)(uintptr_t)(a) = (uint32_t)(v))
++#define readl(a)            (*(volatile uint32_t *)(uintptr_t)(a))
++#define mb()                __asm__ volatile ("dsb sy" ::: "memory")
++#define ioremap(pa, sz)     ((void *)ml_io_map((vm_offset_t)(pa), (vm_size_t)(sz)))
++#define iounmap(p)          do { (void)(p); } while (0)
++#define memset_io(p, v, n)  memset((void *)(p), (v), (n))
++
++#ifndef BITS_PER_LONG
++#define BITS_PER_LONG 64
++#endif
++#endif
+diff --git a/bsd/dev/agate_conninfra/compat/consys_hw.h b/bsd/dev/agate_conninfra/compat/consys_hw.h
+new file mode 100644
+index 0000000..1893331
+--- /dev/null
++++ b/bsd/dev/agate_conninfra/compat/consys_hw.h
+@@ -0,0 +1,14 @@
++/* agate: the part of MediaTek's consys_hw.h the MT6893 platform code uses. */
++#ifndef _PLATFORM_CONSYS_HW_H_
++#define _PLATFORM_CONSYS_HW_H_
++#include "conninfra.h"
++#define CONN_SEMA_GET_SUCCESS	0
++#define CONN_SEMA_GET_FAIL	1
++#define CONN_SEMA_TIMEOUT	(1*1000) /* 1ms */
++/* the fields of MediaTek's struct consys_hw_env the MT6893 code sets */
++struct consys_hw_env {
++	unsigned int adie_hw_version;
++	bool is_rc_mode;
++};
++extern struct consys_hw_env conn_hw_env;
++#endif
+diff --git a/bsd/dev/agate_conninfra/compat/consys_reg_mng.h b/bsd/dev/agate_conninfra/compat/consys_reg_mng.h
+new file mode 100644
+index 0000000..371b446
+--- /dev/null
++++ b/bsd/dev/agate_conninfra/compat/consys_reg_mng.h
+@@ -0,0 +1,14 @@
++/* agate: MediaTek's register-manager API, reduced to what mt6893_pos.c calls. */
++#ifndef _PLATFORM_CONSYS_REG_MNG_H_
++#define _PLATFORM_CONSYS_REG_MNG_H_
++#include "consys_hw.h"
++enum conn_dump_cpupcr_type {
++	CONN_DUMP_CPUPCR_TYPE_BT = 1,
++	CONN_DUMP_CPUPCR_TYPE_WF = 2,
++	CONN_DUMP_CPUPCR_TYPE_ALL = 3,
++};
++int consys_reg_mng_reg_readable(void);
++int consys_reg_mng_is_bus_hang(void);
++int consys_reg_mng_dump_bus_status(void);
++int consys_reg_mng_dump_cpupcr(enum conn_dump_cpupcr_type dump_type, int times, unsigned long interval_us);
++#endif
+diff --git a/bsd/dev/agate_conninfra/compat/consys_reg_util.h b/bsd/dev/agate_conninfra/compat/consys_reg_util.h
+new file mode 100644
+index 0000000..3b6aebe
+--- /dev/null
++++ b/bsd/dev/agate_conninfra/compat/consys_reg_util.h
+@@ -0,0 +1,43 @@
++/* agate: register helpers with the semantics of MediaTek's consys_reg_util.h. */
++#ifndef _PLATFORM_CONSYS_REG_UTIL_H_
++#define _PLATFORM_CONSYS_REG_UTIL_H_
++#include "plat_def.h"
++#define KBYTE (1024*sizeof(char))
++#ifndef GENMASK
++#define GENMASK(h, l) (((~0UL) - (1UL << (l)) + 1) & (~0UL >> (BITS_PER_LONG - 1 - (h))))
++#endif
++#define GET_BIT_MASK(value, mask) ((value) & (mask))
++#define SET_BIT_MASK(pdest, value, mask) (*(pdest) = (GET_BIT_MASK(*(pdest), ~(mask)) | GET_BIT_MASK(value, mask)))
++#define GET_BIT_RANGE(data, end, begin) ((data) & GENMASK(end, begin))
++#define SET_BIT_RANGE(pdest, data, end, begin) (SET_BIT_MASK(pdest, data, GENMASK(end, begin)))
++#define CONSYS_SET_BIT(REG, BITVAL) do { writel(readl(REG) | (unsigned int)(BITVAL), REG); mb(); } while (0)
++#define CONSYS_CLR_BIT(REG, BITVAL) do { writel(readl(REG) & ~(unsigned int)(BITVAL), REG); mb(); } while (0)
++#define CONSYS_CLR_BIT_WITH_KEY(REG, BITVAL, KEY) do { \
++	unsigned int _v = readl(REG); _v &= ~((unsigned int)(BITVAL)); _v |= (unsigned int)(KEY); \
++	writel(_v, REG); mb(); } while (0)
++#define CONSYS_REG_READ(addr) readl(addr)
++#define CONSYS_REG_READ_BIT(addr, BITVAL) (readl(addr) & ((unsigned int)(BITVAL)))
++#define CONSYS_REG_WRITE(addr, data) do { writel(data, addr); mb(); } while (0)
++#define CONSYS_REG_WRITE_RANGE(reg, data, end, begin) do { \
++	unsigned int _v = CONSYS_REG_READ(reg); SET_BIT_RANGE(&_v, data, end, begin); \
++	CONSYS_REG_WRITE(reg, _v); } while (0)
++#define CONSYS_REG_WRITE_MASK(reg, data, mask) do { \
++	unsigned int _v = CONSYS_REG_READ(reg); SET_BIT_MASK(&_v, data, mask); \
++	CONSYS_REG_WRITE(reg, _v); } while (0)
++#define CONSYS_REG_WRITE_OFFSET_RANGE(reg, value, reg_offset, value_offset, size) ({ \
++	unsigned int _d = (unsigned int)((value) >> (value_offset)); \
++	_d = GET_BIT_RANGE(_d, size, 0); _d = _d << (reg_offset); \
++	CONSYS_REG_WRITE_RANGE(reg, _d, ((reg_offset) + ((size) - 1)), reg_offset); })
++#define CONSYS_REG_WRITE_BIT(reg, offset, val) CONSYS_REG_WRITE_OFFSET_RANGE(reg, ((val) & 1), offset, 0, 1)
++#define CONSYS_REG_BIT_POLLING(addr, bit_index, exp_val, loop, delay_us, success) do { \
++	unsigned int _pc = 0; unsigned int _rv; success = 0; \
++	_rv = (CONSYS_REG_READ_BIT(addr, (0x1 << bit_index)) >> bit_index); \
++	while (_rv != (exp_val)) { \
++		if (_pc > (loop)) { success = -1; break; } \
++		_rv = (CONSYS_REG_READ_BIT(addr, (0x1 << bit_index)) >> bit_index); \
++		udelay(delay_us); _pc++; } } while (0)
++#define ADDR(Field) (Field##_ADDR)
++#define MASK(Field) (Field##_MASK)
++#define SHFT(Field) (Field##_SHFT)
++#define CONSYS_REG_WRITE_HW_ENTRY(Field, Value) CONSYS_REG_WRITE_MASK(ADDR(Field), (Value << SHFT(Field)), MASK(Field))
++#endif
+diff --git a/bsd/dev/agate_conninfra/compat/plat_def.h b/bsd/dev/agate_conninfra/compat/plat_def.h
+new file mode 100644
+index 0000000..2ba62dd
+--- /dev/null
++++ b/bsd/dev/agate_conninfra/compat/plat_def.h
+@@ -0,0 +1,4 @@
++/* agate: MediaTek's plat_def.h only pulls <linux/delay.h> (see agate_conninfra_compat.h). */
++#ifndef _PLATFORM_DEF_H_
++#define _PLATFORM_DEF_H_
++#endif
+diff --git a/bsd/dev/agate_wifi.c b/bsd/dev/agate_wifi.c
+index 80a2ee7..751b562 100644
+--- a/bsd/dev/agate_wifi.c
++++ b/bsd/dev/agate_wifi.c
+@@ -196,7 +196,13 @@ agate_wifi_thread(void *arg __unused, wait_result_t wr __unused)
+ 		return;
+ 	}
+ 	aw_state("initial");
+-	if (aw_step >= 2) {
++	if (aw_step >= 3) {
++		/* A2a/A2b: MediaTek's full conninfra power-on (+ WFSYS for 4) */
++		extern int agate_conninfra_a2a(int step);
++		int r = agate_conninfra_a2a(aw_step);
++		printf("AGATE WIFI: A2 step %d returned %d\n", aw_step, r);
++		aw_state("final");
++	} else if (aw_step >= 2) {
+ 		if (aw_power_on() == 0) {
+ 			aw_chipid();
+ 		}
