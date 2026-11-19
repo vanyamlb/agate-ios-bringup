@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+index 4746cba..4a47a3a 100644
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -78,6 +78,14 @@ AgateWLANInterface::init(IONetworkController *controller)
+ 	/* IO80211.framework binds to the interface through the service whose IOInterfaceName is its
+ 	 * name (IONetworkStack sets only "BSD Name"): en0, which AgateWLAN asks for */
+ 	setProperty("IOInterfaceName", "en0");
++	{
++		/* the controller's address (set on it before its interface is made) */
++		OSObject *mac = controller ? controller->copyProperty("local-mac-address") : NULL;
++		if (mac != NULL) {
++			setProperty("local-mac-address", mac);
++			mac->release();
++		}
++	}
+ 	setProperty("IOBuiltin", true);
+ 	return true;
+ }
+@@ -376,6 +384,19 @@ agate_wlan_dt_node(const uint8_t *mac)
+ 		node->release();
+ 	}
+ 	parent->release();
++
++	/* iBoot puts the Wi-Fi address in /chosen: wifid reads mac-address-wifi0 there as soon as its
++	 * IO80211InterfaceRole notification hands it the interface, and went no further without it */
++	IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++	if (chosen != NULL) {
++		OSData *d = OSData::withBytes(mac, 6);
++		if (d != NULL) {
++			chosen->setProperty("mac-address-wifi0", d);
++			d->release();
++			IOLog("AGATE WLAN: /chosen mac-address-wifi0 set\n");
++		}
++		chosen->release();
++	}
+ }
+ 
+ extern "C" int
+@@ -394,6 +415,9 @@ agate_wlan_create(const uint8_t *mac)
+ 	OSData *d = OSData::withBytes(mac, 6);
+ 	if (d != NULL) {
+ 		w->setProperty("IOMACAddress", d);
++		/* wifid looks for local-mac-address from the controller up its providers (the device tree
++		 * node an IO80211 driver sits on has it) */
++		w->setProperty("local-mac-address", d);
+ 		d->release();
+ 	}
+ 	if (!w->attach(prov)) {
