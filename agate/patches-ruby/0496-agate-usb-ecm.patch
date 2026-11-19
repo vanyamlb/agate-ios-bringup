@@ -12,10 +12,10 @@ index 2804375..cb50713 100644
  bsd/dev/ruby_probe.c			standard
 diff --git a/bsd/dev/agate_ecm.c b/bsd/dev/agate_ecm.c
 new file mode 100644
-index 0000000..a560013
+index 0000000..344b9ff
 --- /dev/null
 +++ b/bsd/dev/agate_ecm.c
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,380 @@
 +/*
 + * agate (Xiaomi 11T): CDC-ECM network function on ruby's MTU3 USB device
 + * stack (boot-arg ruby_enum=3, needs rubyusb=1 ruby_echo=1).
@@ -87,6 +87,64 @@ index 0000000..a560013
 +agate_ecm_enabled(void)
 +{
 +	return ecm.on;
++}
++
++/*
++ * Link notifications on the interrupt EP 0x83 (PIO, EP3 FIFO at
++ * FIFO0 + 3 * 0x10): NETWORK_CONNECTION(1), then CONNECTION_SPEED_CHANGE
++ * 480/480 Mb/s. macOS keeps the interface "inactive" (no IPv4) without
++ * them. Armed by SET_INTERFACE(data, alt 1), sent from the TX pump.
++ */
++#define ECM_TX3CSR0     0x0130u
++#define ECM_EP3_FIFO    (0x0300u + 3u * 0x10u)
++#define ECM_TXPKTRDY    (1u << 16)
++
++static volatile uint32_t ecm_notify_step;       /* 0 idle, 1 connect, 2 speed */
++static uint32_t ecm_notify_sent;
++
++void
++agate_ecm_link_arm(void)
++{
++	ecm_notify_step = 1;
++}
++
++static void
++ecm_fifo_put(vm_offset_t mac, const uint8_t *p, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t w = (uint32_t)p[i] | ((uint32_t)p[i + 1] << 8) |
++		    ((uint32_t)p[i + 2] << 16) | ((uint32_t)p[i + 3] << 24);
++		*(volatile uint32_t *)(mac + ECM_EP3_FIFO) = w;
++	}
++}
++
++void
++agate_ecm_link_poll(vm_offset_t mac)
++{
++	uint32_t step = ecm_notify_step;
++
++	if (!ecm.on || step == 0 || mac == 0) {
++		return;
++	}
++	if (*(volatile uint32_t *)(mac + ECM_TX3CSR0) & ECM_TXPKTRDY) {
++		return;                 /* previous notification not taken yet */
++	}
++	if (step == 1) {
++		static const uint8_t conn[8] = { 0xA1, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
++		ecm_fifo_put(mac, conn, sizeof(conn));
++		*(volatile uint32_t *)(mac + ECM_TX3CSR0) = 16u | ECM_TXPKTRDY;
++		ecm_notify_step = 2;
++	} else {
++		static const uint8_t speed[16] = {
++			0xA1, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
++			0x00, 0x38, 0x9C, 0x1C, 0x00, 0x38, 0x9C, 0x1C  /* 480000000 x2 */
++		};
++		ecm_fifo_put(mac, speed, sizeof(speed));
++		*(volatile uint32_t *)(mac + ECM_TX3CSR0) = 16u | ECM_TXPKTRDY;
++		ecm_notify_step = 0;
++	}
++	ecm_notify_sent++;
++	printf("AGATE ECM: link notification %u sent\n", ecm_notify_sent);
 +}
 +
 +static void
@@ -340,10 +398,10 @@ index 0000000..a560013
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/agate_ecm.h b/bsd/dev/agate_ecm.h
 new file mode 100644
-index 0000000..fe027a3
+index 0000000..b14109a
 --- /dev/null
 +++ b/bsd/dev/agate_ecm.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,17 @@
 +#ifndef _AGATE_ECM_H_
 +#define _AGATE_ECM_H_
 +
@@ -356,10 +414,13 @@ index 0000000..fe027a3
 +uint32_t agate_ecm_tx_dequeue(uint8_t *buf, uint32_t max);
 +void agate_ecm_rx(const uint8_t *data, uint32_t len);
 +void agate_ecm_status(void);
++void agate_ecm_link_arm(void);
++#include <mach/vm_types.h>
++void agate_ecm_link_poll(vm_offset_t mac);
 +
 +#endif /* _AGATE_ECM_H_ */
 diff --git a/bsd/dev/ruby_usb.c b/bsd/dev/ruby_usb.c
-index 3e08c11..6671a39 100644
+index 3e08c11..01092e1 100644
 --- a/bsd/dev/ruby_usb.c
 +++ b/bsd/dev/ruby_usb.c
 @@ -80,6 +80,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -379,7 +440,15 @@ index 3e08c11..6671a39 100644
  int ruby_zlp_en;             /* 0 = no ACM echo ZLP (0301 default) */
  /* 0302: echo behaviour is independent of the declared descriptor class. */
  int ruby_echo_en;
-@@ -1378,6 +1379,14 @@ ruby_ep2_push_log(vm_offset_t mac)
+@@ -1120,6 +1121,7 @@ ruby_ep2_push_log(vm_offset_t mac)
+ 
+     if (!ruby_ep_ready || (!ruby_ep2log_on && !ruby_echo_en))
+         return;
++    agate_ecm_link_poll(mac);   /* agate ECM: link-up notification on EP 0x83 */
+     ruby_push_tries++;
+ 
+     q0 = ruby_rd32(mac, QISAR0_OFF);
+@@ -1378,6 +1380,14 @@ ruby_ep2_push_log(vm_offset_t mac)
               * The ring budget bounds a single push pass; the remainder
               * stays queued for the next pass.
               */
@@ -394,7 +463,7 @@ index 3e08c11..6671a39 100644
              n = ruby_acm_echo_dequeue(buf, ruby_tx_gpd_len);
              if (!n)
                  break;
-@@ -1385,6 +1394,7 @@ ruby_ep2_push_log(vm_offset_t mac)
+@@ -1385,6 +1395,7 @@ ruby_ep2_push_log(vm_offset_t mac)
               * dequeue also drained the ring; then this chunk carries ZLP. */
              acm_zlp = (ruby_zlp_en && n == ruby_tx_gpd_len &&
                  ruby_acm_echo_head == ruby_acm_echo_tail) ? 1u : 0u;
@@ -402,7 +471,7 @@ index 3e08c11..6671a39 100644
              if (ruby_acm_echo_dbg_tx < 8) {
                  ruby_acm_echo_dbg_tx++;
                  printf("RUBY USB ACM TX n=%u enq=%u inflight=%u zlp=%u\n",
-@@ -2133,7 +2143,7 @@ ruby_usb_probe(void)
+@@ -2133,7 +2144,7 @@ ruby_usb_probe(void)
          int zlp = 0;
  
          PE_parse_boot_argn("ruby_enum", &enumprof, sizeof(enumprof));
@@ -411,7 +480,7 @@ index 3e08c11..6671a39 100644
              ruby_enum_profile = enumprof;
              ruby_acm_cmd = (enumprof != 0);
          } else {
-@@ -2221,6 +2231,14 @@ ruby_usb_probe(void)
+@@ -2221,6 +2232,14 @@ ruby_usb_probe(void)
      for (uint32_t si = 0; si < sizeof(ruby_str_ser); si++)
          ruby_str_ser[si] = ruby_str_ser_base[si];
      ruby_str_ser[8] = (uint8_t)('0' + ruby_enum_profile);
@@ -427,7 +496,7 @@ index 3e08c11..6671a39 100644
          ruby_dev_desc[4] = 0xEF;    /* bDeviceClass: Misc */
          ruby_dev_desc[5] = 0x02;    /* bDeviceSubClass: Common */
 diff --git a/bsd/dev/ruby_usb_gadget.c b/bsd/dev/ruby_usb_gadget.c
-index e1ee546..3f3e508 100644
+index e1ee546..1d22a30 100644
 --- a/bsd/dev/ruby_usb_gadget.c
 +++ b/bsd/dev/ruby_usb_gadget.c
 @@ -23,6 +23,7 @@ extern volatile int ruby_usb_suspended;
@@ -507,7 +576,7 @@ index e1ee546..3f3e508 100644
      default:
          return NULL;
      }
-@@ -966,10 +1015,14 @@ ruby_ep0_standard(vm_offset_t mac, uint32_t t, uint8_t type, uint8_t req,
+@@ -966,10 +1015,16 @@ ruby_ep0_standard(vm_offset_t mac, uint32_t t, uint8_t type, uint8_t req,
          ruby_ep0_send(mac, t, key, status, 2, wlen);
          return;
      case 10: /* GET_INTERFACE */
@@ -519,11 +588,13 @@ index e1ee546..3f3e508 100644
 +        if (ruby_enum_profile == 3 && index == 1) {
 +            agate_ecm_alt = (uint8_t)(value & 1u);
 +            printf("RUBY USB: ECM data alt %u\n", agate_ecm_alt);
++            if (agate_ecm_alt == 1)
++                agate_ecm_link_arm();
 +        }
          ruby_ep0_ack(mac, t, key, wlen);
          return;
      case 1: /* CLEAR_FEATURE */ {
-@@ -1149,6 +1202,10 @@ ruby_ep0_capture(vm_offset_t mac, uint32_t t)
+@@ -1149,6 +1204,10 @@ ruby_ep0_capture(vm_offset_t mac, uint32_t t)
          ruby_ep0_send(mac, t, key, ruby_acm_line_coding, 7, len);
      } else if (st[0] == 0xA1 && st[1] == 0x20) {
          ruby_ep0_stall(mac, t, key, len);

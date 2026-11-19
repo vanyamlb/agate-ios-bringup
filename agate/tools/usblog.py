@@ -19,15 +19,19 @@ import time
 
 import usb.core
 
-VID, PID = 0x1209, 0x0002
+VID, PIDS = 0x1209, (0x0002, 0x0003)   # P2 vendor/ACM, agate ECM
 SLICE = 64
 RING = 4 << 20
 
 
 def open_dev():
-    dev = usb.core.find(idVendor=VID, idProduct=PID)
+    dev = None
+    for pid in PIDS:
+        dev = usb.core.find(idVendor=VID, idProduct=pid)
+        if dev is not None:
+            break
     if dev is None:
-        raise SystemExit("ruby USB device 1209:0002 not found")
+        raise SystemExit("ruby USB device 1209:0002/0003 not found")
     return dev
 
 
