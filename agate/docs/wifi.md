@@ -17,6 +17,26 @@ then `CONN_INFRA_WAKEPU_TOP` = 1, `slpprot` ready, **`CONN_HW_VER` (0x18001000) 
 `0x20010101`, `CFG_ID` = 3** - the same id Android's driver reads. Nothing hung; USB networking
 kept running.
 
+**A2a + A2b (2026-11-19, patches 0501, `agatewifi=4`).** MediaTek's own `mt6893_pos.c`
+(staged at build time by `0501-stage-conninfra.sh`, built in XNU against `bsd/dev/agate_conninfra/compat/`)
+runs the whole first power-on of `consys_hw_pwr_on()`; the PMIC is reached over the MT6885-family
+pwrap **ARB_V3 / SWINF_2** (`ACC 0xc80`, `WDATA 0xc84`, `RDATA 0xc94`, `VLD_CLR 0xca4`,
+`STA 0xca8`; the older WACS2 at `0xc20` does not answer):
+
+```
+PMIC VCN18 CON0=0x0001 after enable
+PMIC VCN13 ANA_CON0=0x0d00 (1.3 V), CON0=0x0001 after enable
+A-die CHIP_ID=0x66358a11            (MT6635 E3)
+efuse = [0xa0000000, 0x00b700c4, 0x0000b4f8, 0x79797372]
+afe_wbg_cal / subsys_pll_initial / low_power_setting -> 0
+WFSYS: rgu_off_hreset released, WF/WFDMA sleep protect off
+WFSYS_VERSION_ID=20010000 -> MT6893 Wi-Fi sub-system is ALIVE
+```
+
+Two traps on the way: `memset_io` on the conn sysram must be 32-bit device stores (a plain
+`memset` faulted with an alignment abort, ESR `0x96000061`), and without VCN18/VCN13 the A-die
+reads `0x00000000` while every step still returns 0.
+
 ## Material collected (not in the repository: the owner's own phone data)
 
 `agate-data/wifi-fw/` on the build machine, read from the running Android with root:
