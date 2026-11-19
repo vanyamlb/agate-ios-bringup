@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/ruby_usb_qmu.c b/bsd/dev/ruby_usb_qmu.c
+index 630cde9..f400fd7 100644
+--- a/bsd/dev/ruby_usb_qmu.c
++++ b/bsd/dev/ruby_usb_qmu.c
+@@ -1463,10 +1463,29 @@ ruby_ep2_rx_drain(vm_offset_t mac)
+         !(hwo & (1u << cur)))
+         full_lap = 1u;
+ 
+-    for (n = 0; n < ruby_rx_ring_n && (full_lap || ruby_rx_deq != cur); n++) {
++    /*
++     * agate ECM frame mode (EP1 owner NET, ruby_rxbuf >= 2048): every GPD
++     * holds one whole Ethernet frame, and the QMU does not always complete
++     * GPDs in ring order (0267). Walk the whole ring from the QMU's
++     * current slot (the oldest completed GPD follows it) and take every
++     * completed GPD, stepping over armed ones instead of stopping at the
++     * first: the in-order walk stranded completed frames behind an armed
++     * slot (deq ahead of cur, seconds of RX stall).
++     */
++    int frame_mode = (ruby_usb_io_owner() == RUBY_USB_IO_NET &&
++        ruby_rx_buf_size >= 2048u);
++    if (frame_mode)
++        ruby_rx_deq = cur;
++
++    for (n = 0; n < ruby_rx_ring_n &&
++        (frame_mode || full_lap || ruby_rx_deq != cur); n++) {
+         i = ruby_rx_deq;
+         g = ruby_rx_gpd_ring_cpu + i * 16;
+         if (hwo & (1u << i)) {
++            if (frame_mode) {
++                ruby_rx_deq = (i + 1u) % ruby_rx_ring_n;
++                continue;
++            }
+             /*
+              * 0267: the QMU can skip the ring head (its HWO stays set)
+              * and complete later slots.  Advance past the orphaned head
