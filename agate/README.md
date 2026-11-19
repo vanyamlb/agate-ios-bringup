@@ -179,3 +179,25 @@ as before (7 cores, touch, kernel-driven frames), and
 `tools/usblog.py dump|follow OUT` (pyusb + libusb, read-only vendor
 requests 0x2B/0x2A) pulls the whole console ring off the phone: no more
 filming the screen.
+
+## Result: internet in iOS over USB (2026-11-19)
+
+- **0496** (`ruby_enum=3`): ruby's MTU3 stack enumerates as a CDC-ECM
+  device (1209:0003); one Ethernet frame per USB transfer, RX GPD chunks
+  joined until a short packet, a pad byte instead of a ZLP,
+  NETWORK_CONNECTION + speed notifications on EP 0x83 (macOS keeps the link
+  inactive without them), and a fix for an RX ring that stopped when the QMU
+  came round to a completed head GPD. Kernel-only `ue0` (192.168.7.2):
+  ping from the Mac, 0 % loss.
+- **0497**: Apple's IONetworkingFamily-170.140.2 built into the kernel
+  (`0497-stage-ionet.sh` stages it at a pinned commit; include-only
+  `extern "C"` blocks unwrapped because the kernel's own headers carry C++
+  templates; `bpf.h` kept C).
+- **0498**: `AgateECMEthernet`, an IOEthernetController on the ECM frame
+  path (`agateecmio=1`, `config/xnu17-eth.cmdline`).
+
+configd's InterfaceNamer names the new interface `en0` after its 240 s
+IOKit-quiet timeout (something stays busy), IONetworkStack attaches it, the
+Mac's Internet Sharing (Wi-Fi -> "ruby USB P2") hands out 192.168.2.2 by
+DHCP, and Safari loads HTTPS sites. Slow so far (polled USB, 16 x 512 B RX
+ring, CPU rendering). Kernel run 44481462857.
