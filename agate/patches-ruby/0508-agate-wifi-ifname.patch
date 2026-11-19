@@ -1,0 +1,39 @@
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+index fbcccd3..32ee483 100644
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -49,9 +49,24 @@ class AgateWLANInterface : public IOEthernetInterface {
+ public:
+ 	bool init(IONetworkController *controller) APPLE_KEXT_OVERRIDE;
+ 	SInt32 performCommand(IONetworkController *ctr, unsigned long cmd, void *arg0, void *arg1) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+ };
+ OSDefineMetaClassAndStructors(AgateWLANInterface, IOEthernetInterface);
+ 
++/* IONetworkUserClient for its own type (configd's); what IO80211.framework asks for fails, and it
++ * then falls back to the ioctls (HakiOS's RedwoodWLAN): said, so the log shows wifid found us */
++IOReturn
++AgateWLANInterface::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler)
++{
++	static unsigned said;
++	IOReturn r = IOEthernetInterface::newUserClient(owningTask, securityID, type, handler);
++
++	if (said++ < 12) {
++		IOLog("AGATE WLAN: user client of type %u asked for -> 0x%x\n", (unsigned)type, r);
++	}
++	return r;
++}
++
+ bool
+ AgateWLANInterface::init(IONetworkController *controller)
+ {
+@@ -60,6 +75,9 @@ AgateWLANInterface::init(IONetworkController *controller)
+ 	}
+ 	setInterfaceSubType(IFNET_SUBFAMILY_WIFI);
+ 	setProperty("IO80211InterfaceRole", "Infrastructure");
++	/* IO80211.framework binds to the interface through the service whose IOInterfaceName is its
++	 * name (IONetworkStack sets only "BSD Name"): en0, which AgateWLAN asks for */
++	setProperty("IOInterfaceName", "en0");
+ 	setProperty("IOBuiltin", true);
+ 	return true;
+ }
