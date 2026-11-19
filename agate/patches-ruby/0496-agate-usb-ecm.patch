@@ -1,0 +1,638 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 2804375..cb50713 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -123,6 +123,7 @@ bsd/dev/ruby_usb_gadget.c			standard
+ bsd/dev/ruby_usb_config.c			standard
+ bsd/dev/ruby_usb_ep_test.c			standard
+ bsd/dev/ruby_usb_io.c			standard
++bsd/dev/agate_ecm.c			standard
+ bsd/dev/ruby_tty.c			standard
+ bsd/dev/ruby_raw.c			standard
+ bsd/dev/ruby_probe.c			standard
+diff --git a/bsd/dev/agate_ecm.c b/bsd/dev/agate_ecm.c
+new file mode 100644
+index 0000000..a560013
+--- /dev/null
++++ b/bsd/dev/agate_ecm.c
+@@ -0,0 +1,322 @@
++/*
++ * agate (Xiaomi 11T): CDC-ECM network function on ruby's MTU3 USB device
++ * stack (boot-arg ruby_enum=3, needs rubyusb=1 ruby_echo=1).
++ *
++ * The EP1 data plane (bulk OUT 0x01 / IN 0x81) carries one Ethernet frame
++ * per USB transfer:
++ *   RX: ruby's QMU hands over <= 512-byte GPD chunks; a chunk shorter than
++ *       the 512-byte max packet (or a zero-length one) ends the frame.
++ *   TX: frames sit in a length-prefixed ring; the TX pump takes at most one
++ *       max packet per GPD and never crosses a frame boundary, so every
++ *       frame's last GPD is a short packet. A frame whose length is a
++ *       multiple of 512 gets one pad byte (as sweet's ue0: IP ignores it),
++ *       so no zero-length packet is needed.
++ *
++ * The kernel interface is ue0 (sweet 0075): Ethernet ifnet, phone
++ * 192.168.7.2/24, the Mac is expected at 192.168.7.1.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++#include <netinet/in_var.h>
++
++#include "ruby_usb_io.h"
++#include "agate_ecm.h"
++
++#define ECM_MPS         512u
++#define ECM_FRAME_MAX   1536u
++#define ECM_TXQ_BYTES   (64u * 1024u)
++
++extern int ruby_enum_profile;
++
++/* phone side MAC (the host's MAC is the iMACAddress string, 02005E77EE01) */
++static const uint8_t ecm_phone_mac[ETHER_ADDR_LEN] = {
++	0x02, 0x00, 0x5e, 0x77, 0xee, 0x02
++};
++
++static struct {
++	ifnet_t ifp;
++	lck_grp_t *grp;
++	lck_spin_t *lock;
++	int on;
++	/* RX assembly */
++	uint8_t rx[ECM_FRAME_MAX + ECM_MPS];
++	uint32_t rx_len;
++	int rx_bad;
++	/* TX ring: [u16 len][bytes]... */
++	uint8_t txq[ECM_TXQ_BYTES];
++	uint32_t txq_head, txq_tail;    /* free-running byte counters */
++	uint32_t tx_left;               /* bytes left of the frame being sent */
++	/* stats */
++	uint32_t rx_frames, rx_drops, tx_frames, tx_drops;
++} ecm;
++
++int
++agate_ecm_enabled(void)
++{
++	return ecm.on;
++}
++
++static void
++ecm_txq_put(const uint8_t *p, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		ecm.txq[(ecm.txq_head + i) % ECM_TXQ_BYTES] = p[i];
++	}
++	ecm.txq_head += n;
++}
++
++static void
++ecm_txq_get(uint8_t *p, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		p[i] = ecm.txq[(ecm.txq_tail + i) % ECM_TXQ_BYTES];
++	}
++	ecm.txq_tail += n;
++}
++
++int
++agate_ecm_tx_pending(void)
++{
++	return ecm.on && (ecm.tx_left != 0 || ecm.txq_head != ecm.txq_tail);
++}
++
++/*
++ * TX pump hook (ruby_ep2_push_log): copy at most max bytes of the current
++ * frame into buf. Returns 0 when nothing is queued.
++ */
++uint32_t
++agate_ecm_tx_dequeue(uint8_t *buf, uint32_t max)
++{
++	uint32_t n = 0;
++
++	if (!ecm.on) {
++		return 0;
++	}
++	lck_spin_lock(ecm.lock);
++	if (ecm.tx_left == 0 && ecm.txq_head != ecm.txq_tail) {
++		uint8_t h[2];
++		ecm_txq_get(h, 2);
++		ecm.tx_left = (uint32_t)h[0] | ((uint32_t)h[1] << 8);
++	}
++	if (ecm.tx_left != 0) {
++		n = ecm.tx_left < max ? ecm.tx_left : max;
++		ecm_txq_get(buf, n);
++		ecm.tx_left -= n;
++	}
++	lck_spin_unlock(ecm.lock);
++	return n;
++}
++
++/* RX hook (ruby_usb_io_rx with owner NET): one GPD chunk. */
++void
++agate_ecm_rx(const uint8_t *data, uint32_t len)
++{
++	if (!ecm.on) {
++		return;
++	}
++	if (ecm.rx_len + len > sizeof(ecm.rx)) {
++		ecm.rx_bad = 1;         /* oversized: drop until the frame ends */
++	} else if (len) {
++		memcpy(ecm.rx + ecm.rx_len, data, len);
++		ecm.rx_len += len;
++	}
++	if (len == ECM_MPS) {
++		return;                 /* the transfer continues */
++	}
++	uint32_t flen = ecm.rx_len;
++	int bad = ecm.rx_bad;
++	ecm.rx_len = 0;
++	ecm.rx_bad = 0;
++	if (bad || flen < ETHER_HDR_LEN || flen > ECM_FRAME_MAX || ecm.ifp == NULL) {
++		ecm.rx_drops++;
++		return;
++	}
++	mbuf_t m = NULL;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < flen) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		ecm.rx_drops++;
++		return;
++	}
++	struct ifnet_stat_increment_param stats = {};
++	memcpy(mbuf_data(m), ecm.rx, flen);
++	mbuf_setlen(m, flen);
++	mbuf_pkthdr_setlen(m, flen);
++	void *frame_header = mbuf_data(m);
++	mbuf_pkthdr_setrcvif(m, ecm.ifp);
++	mbuf_pkthdr_setheader(m, frame_header);
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++	stats.packets_in = 1;
++	stats.bytes_in = flen;
++	ecm.rx_frames++;
++	if (ecm.rx_frames <= 4) {
++		printf("AGATE ECM: rx frame %u len %u type %02x%02x\n", ecm.rx_frames,
++		    flen, ecm.rx[12], ecm.rx[13]);
++	}
++	ifnet_input(ecm.ifp, m, &stats);
++}
++
++static errno_t
++ecm_if_output(ifnet_t ifp, mbuf_t m)
++{
++	uint32_t len = (uint32_t)mbuf_pkthdr_len(m);
++	uint8_t frame[ECM_FRAME_MAX + 1];
++
++	if (len < ETHER_HDR_LEN || len > ECM_FRAME_MAX) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	mbuf_copydata(m, 0, len, frame);
++	mbuf_freem(m);
++	if ((len % ECM_MPS) == 0) {
++		frame[len++] = 0;       /* end on a short packet */
++	}
++	lck_spin_lock(ecm.lock);
++	if ((ecm.txq_head - ecm.txq_tail) + len + 2 > ECM_TXQ_BYTES) {
++		lck_spin_unlock(ecm.lock);
++		ecm.tx_drops++;
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	uint8_t h[2] = { (uint8_t)len, (uint8_t)(len >> 8) };
++	ecm_txq_put(h, 2);
++	ecm_txq_put(frame, len);
++	lck_spin_unlock(ecm.lock);
++	ecm.tx_frames++;
++	ifnet_stat_increment_out(ifp, 1, len, 0);
++	ruby_usb_rx_kick();             /* IRQ mode: wake the QMU workloop */
++	return 0;
++}
++
++static errno_t
++ecm_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++ecm_if_detach(ifnet_t ifp __unused)
++{
++}
++
++void
++agate_ecm_start(void)
++{
++	struct ifnet_init_eparams init;
++
++	if (ruby_enum_profile != 3) {
++		return;
++	}
++	ecm.grp = lck_grp_alloc_init("agate_ecm", LCK_GRP_ATTR_NULL);
++	ecm.lock = lck_spin_alloc_init(ecm.grp, LCK_ATTR_NULL);
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "agate-usb-ecm";
++	init.uniqueid_len = sizeof("agate-usb-ecm") - 1;
++	init.name = "ue";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = ecm_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = ecm_if_ioctl;
++	init.detach = ecm_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &ecm.ifp) != 0) {
++		printf("AGATE ECM: ifnet_allocate failed\n");
++		ecm.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(ecm.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ecm.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(ecm.ifp, ETHERMTU);
++	ifnet_set_baudrate(ecm.ifp, 480000000);
++	ifnet_set_flags(ecm.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(ecm.ifp, NULL) != 0) {
++		printf("AGATE ECM: ifnet_attach failed\n");
++		ecm.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(ecm.ifp, ecm_phone_mac, ETHER_ADDR_LEN);
++
++	errno_t err = proto_plumb(PF_INET, ecm.ifp);
++	socket_t so = NULL;
++	if (err == 0) {
++		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	}
++	if (err == 0) {
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ue0");
++		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xffffff00);
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a807ff);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	ifnet_set_flags(ecm.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	ruby_usb_io_force_owner(RUBY_USB_IO_NET);
++	ecm.on = 1;
++	printf("AGATE ECM: ue0 192.168.7.2/24 %s (err %d), EP1 owner=net\n",
++	    err ? "NOT configured" : "up", err);
++}
++
++void
++agate_ecm_status(void)
++{
++	if (!ecm.on) {
++		return;
++	}
++	printf("AGATE ECM: rx %u drop %u | tx %u drop %u | txq %u left %u\n",
++	    ecm.rx_frames, ecm.rx_drops, ecm.tx_frames, ecm.tx_drops,
++	    ecm.txq_head - ecm.txq_tail, ecm.tx_left);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/agate_ecm.h b/bsd/dev/agate_ecm.h
+new file mode 100644
+index 0000000..fe027a3
+--- /dev/null
++++ b/bsd/dev/agate_ecm.h
+@@ -0,0 +1,14 @@
++#ifndef _AGATE_ECM_H_
++#define _AGATE_ECM_H_
++
++#include <sys/types.h>
++
++/* agate CDC-ECM (ruby_enum=3), bsd/dev/agate_ecm.c */
++void agate_ecm_start(void);
++int agate_ecm_enabled(void);
++int agate_ecm_tx_pending(void);
++uint32_t agate_ecm_tx_dequeue(uint8_t *buf, uint32_t max);
++void agate_ecm_rx(const uint8_t *data, uint32_t len);
++void agate_ecm_status(void);
++
++#endif /* _AGATE_ECM_H_ */
+diff --git a/bsd/dev/ruby_usb.c b/bsd/dev/ruby_usb.c
+index 3e08c11..6671a39 100644
+--- a/bsd/dev/ruby_usb.c
++++ b/bsd/dev/ruby_usb.c
+@@ -80,6 +80,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ /* EP0 responses are copied here: handler buffers may live on the stack. */
+ #include "ruby_usb_io.h"
++#include "agate_ecm.h"
+ #include "ruby_usb_ep.h"
+ #include "ruby_usb_qmu.h"
+ 
+@@ -230,7 +231,7 @@ static struct ruby_req ruby_xfer_reqs[RUBY_GPD_NUM];
+  */
+ int ruby_acm_cmd;  /* rubyusbcmd=1 enables CDC-ACM descriptors */
+ /* 0301: zero-build enumeration/ZLP axes (cmdline selected). */
+-int ruby_enum_profile = 1;   /* 0 vendor, 1 ACM, 2 ACM-composite */
++int ruby_enum_profile = 1;   /* 0 vendor, 1 ACM, 2 ACM-composite, 3 agate CDC-ECM */
+ int ruby_zlp_en;             /* 0 = no ACM echo ZLP (0301 default) */
+ /* 0302: echo behaviour is independent of the declared descriptor class. */
+ int ruby_echo_en;
+@@ -1378,6 +1379,14 @@ ruby_ep2_push_log(vm_offset_t mac)
+              * The ring budget bounds a single push pass; the remainder
+              * stays queued for the next pass.
+              */
++            if (agate_ecm_enabled()) {
++                /* agate ECM: one frame per transfer, never crossing a frame
++                 * boundary; frames end on a short packet (no ZLP). */
++                n = agate_ecm_tx_dequeue(buf, ruby_tx_gpd_len);
++                if (!n)
++                    break;
++                acm_zlp = 0;
++            } else {
+             n = ruby_acm_echo_dequeue(buf, ruby_tx_gpd_len);
+             if (!n)
+                 break;
+@@ -1385,6 +1394,7 @@ ruby_ep2_push_log(vm_offset_t mac)
+              * dequeue also drained the ring; then this chunk carries ZLP. */
+             acm_zlp = (ruby_zlp_en && n == ruby_tx_gpd_len &&
+                 ruby_acm_echo_head == ruby_acm_echo_tail) ? 1u : 0u;
++            }
+             if (ruby_acm_echo_dbg_tx < 8) {
+                 ruby_acm_echo_dbg_tx++;
+                 printf("RUBY USB ACM TX n=%u enq=%u inflight=%u zlp=%u\n",
+@@ -2133,7 +2143,7 @@ ruby_usb_probe(void)
+         int zlp = 0;
+ 
+         PE_parse_boot_argn("ruby_enum", &enumprof, sizeof(enumprof));
+-        if (enumprof >= 0 && enumprof <= 2) {
++        if (enumprof >= 0 && enumprof <= 3) {
+             ruby_enum_profile = enumprof;
+             ruby_acm_cmd = (enumprof != 0);
+         } else {
+@@ -2221,6 +2231,14 @@ ruby_usb_probe(void)
+     for (uint32_t si = 0; si < sizeof(ruby_str_ser); si++)
+         ruby_str_ser[si] = ruby_str_ser_base[si];
+     ruby_str_ser[8] = (uint8_t)('0' + ruby_enum_profile);
++    if (ruby_enum_profile == 3) {
++        /* agate: CDC-ECM, a different PID so hosts never mix it with P2 */
++        ruby_dev_desc[4] = 0x02;    /* bDeviceClass: CDC */
++        ruby_dev_desc[5] = 0x00;
++        ruby_dev_desc[6] = 0x00;
++        ruby_dev_desc[10] = 0x03;   /* idProduct 0x0003 */
++        ruby_dev_desc[11] = 0x00;
++    }
+     if (ruby_enum_profile == 2) {
+         ruby_dev_desc[4] = 0xEF;    /* bDeviceClass: Misc */
+         ruby_dev_desc[5] = 0x02;    /* bDeviceSubClass: Common */
+diff --git a/bsd/dev/ruby_usb_gadget.c b/bsd/dev/ruby_usb_gadget.c
+index e1ee546..3f3e508 100644
+--- a/bsd/dev/ruby_usb_gadget.c
++++ b/bsd/dev/ruby_usb_gadget.c
+@@ -23,6 +23,7 @@ extern volatile int ruby_usb_suspended;
+ #include "ruby_battery.h"
+ #include "ruby_probe.h"
+ #include "ruby_usb_gadget.h"
++#include "agate_ecm.h"
+ 
+ static inline uint32_t
+ ruby_rd32(vm_offset_t base, uint32_t off)
+@@ -94,6 +95,8 @@ void ruby_func_register(const char *name,
+  * tied to the same constant. */
+ #define RUBY_VENDOR_IFACE_P2 2u
+ 
++static uint8_t agate_ecm_alt;   /* agate ECM data interface alt */
++
+ uint32_t
+ ruby_build_cfg_desc(uint8_t *out)
+ {
+@@ -108,6 +111,42 @@ ruby_build_cfg_desc(uint8_t *out)
+             continue;
+         n_eps_total++;
+     }
++    if (ruby_enum_profile == 3) {
++        /*
++         * agate CDC-ECM (ECM120): Config + Iface0 Comm (subclass 6) with
++         * Header/Union/Ethernet functional descriptors and the notification
++         * EP 0x83, Iface1 Data alt 0 (no EPs) and alt 1 (bulk 0x01/0x81).
++         */
++        vout[off++] = 9; vout[off++] = 2; vout[off++] = 0; vout[off++] = 0;
++        vout[off++] = 2; vout[off++] = 1; vout[off++] = 0; vout[off++] = 0x80; vout[off++] = 250;
++        vout[off++] = 9; vout[off++] = 4; vout[off++] = 0; vout[off++] = 0;
++        vout[off++] = 1; vout[off++] = 0x02; vout[off++] = 0x06; vout[off++] = 0; vout[off++] = 0;
++        vout[off++] = 5; vout[off++] = 0x24; vout[off++] = 0x00; vout[off++] = 0x10; vout[off++] = 0x01;
++        vout[off++] = 5; vout[off++] = 0x24; vout[off++] = 0x06; vout[off++] = 0; vout[off++] = 1;
++        /* Ethernet Networking: iMACAddress=4, stats 0, wMaxSegmentSize 1514,
++         * no MC filters, no power filters */
++        vout[off++] = 13; vout[off++] = 0x24; vout[off++] = 0x0F; vout[off++] = 4;
++        vout[off++] = 0; vout[off++] = 0; vout[off++] = 0; vout[off++] = 0;
++        vout[off++] = 0xEA; vout[off++] = 0x05; vout[off++] = 0; vout[off++] = 0;
++        vout[off++] = 0;
++        vout[off++] = 7; vout[off++] = 5; vout[off++] = 0x83; vout[off++] = 3;
++        vout[off++] = 16; vout[off++] = 0; vout[off++] = 9;
++        vout[off++] = 9; vout[off++] = 4; vout[off++] = 1; vout[off++] = 0;
++        vout[off++] = 0; vout[off++] = 0x0A; vout[off++] = 0; vout[off++] = 0; vout[off++] = 0;
++        vout[off++] = 9; vout[off++] = 4; vout[off++] = 1; vout[off++] = 1;
++        vout[off++] = 2; vout[off++] = 0x0A; vout[off++] = 0; vout[off++] = 0; vout[off++] = 0;
++        vout[off++] = 7; vout[off++] = 5; vout[off++] = 0x01; vout[off++] = 2;
++        vout[off++] = (uint8_t)(ruby_eps[1].mps & 0xffu);
++        vout[off++] = (uint8_t)((ruby_eps[1].mps >> 8) & 0xffu);
++        vout[off++] = 0;
++        vout[off++] = 7; vout[off++] = 5; vout[off++] = 0x81; vout[off++] = 2;
++        vout[off++] = (uint8_t)(ruby_eps[3].mps & 0xffu);
++        vout[off++] = (uint8_t)((ruby_eps[3].mps >> 8) & 0xffu);
++        vout[off++] = 0;
++        vout[2] = (uint8_t)(off & 0xffu);
++        vout[3] = (uint8_t)((off >> 8) & 0xffu);
++        return off;
++    }
+     if (ruby_enum_profile == 1 || ruby_enum_profile == 2) {
+         /* 0225 CDC-ACM full 75B: Config(9)+IAD(8)+Iface0(9)+CDC(19)+EP83(7)+Iface1(9)+EP01(7)+EP81(7) */
+         vout[off++] = 9; vout[off++] = 2; vout[off++] = 0; vout[off++] = 0;
+@@ -831,6 +870,16 @@ ruby_descriptor(uint32_t value, uint32_t *len)
+     case 0x0303:
+         *len = sizeof(ruby_str_ser);
+         return ruby_str_ser;
++    case 0x0304: {  /* agate ECM iMACAddress: host side 02:00:5E:77:EE:01 */
++        static const uint8_t mac_str[26] = {
++            26, 3, '0', 0, '2', 0, '0', 0, '0', 0, '5', 0, 'E', 0,
++            '7', 0, '7', 0, 'E', 0, 'E', 0, '0', 0, '1', 0
++        };
++        if (ruby_enum_profile != 3)
++            return NULL;
++        *len = sizeof(mac_str);
++        return mac_str;
++    }
+     default:
+         return NULL;
+     }
+@@ -966,10 +1015,14 @@ ruby_ep0_standard(vm_offset_t mac, uint32_t t, uint8_t type, uint8_t req,
+         ruby_ep0_send(mac, t, key, status, 2, wlen);
+         return;
+     case 10: /* GET_INTERFACE */
+-        byte = 0;
++        byte = (ruby_enum_profile == 3 && index == 1) ? agate_ecm_alt : 0;
+         ruby_ep0_send(mac, t, key, &byte, 1, wlen);
+         return;
+     case 11: /* SET_INTERFACE */
++        if (ruby_enum_profile == 3 && index == 1) {
++            agate_ecm_alt = (uint8_t)(value & 1u);
++            printf("RUBY USB: ECM data alt %u\n", agate_ecm_alt);
++        }
+         ruby_ep0_ack(mac, t, key, wlen);
+         return;
+     case 1: /* CLEAR_FEATURE */ {
+@@ -1149,6 +1202,10 @@ ruby_ep0_capture(vm_offset_t mac, uint32_t t)
+         ruby_ep0_send(mac, t, key, ruby_acm_line_coding, 7, len);
+     } else if (st[0] == 0xA1 && st[1] == 0x20) {
+         ruby_ep0_stall(mac, t, key, len);
++    } else if (ruby_enum_profile == 3 && st[0] == 0x21 &&
++        st[1] >= 0x40 && st[1] <= 0x44 && len == 0) {
++        /* agate ECM: SET_ETHERNET_MULTICAST_FILTERS .. PACKET_FILTER */
++        ruby_ep0_ack(mac, t, key, len);
+     } else
+         ruby_ep0_stall(mac, t, key, len);
+ }
+diff --git a/bsd/dev/ruby_usb_io.c b/bsd/dev/ruby_usb_io.c
+index 7543de8..b97c282 100644
+--- a/bsd/dev/ruby_usb_io.c
++++ b/bsd/dev/ruby_usb_io.c
+@@ -12,6 +12,7 @@
+ #include <sys/types.h>
+ 
+ #include "ruby_usb_io.h"
++#include "agate_ecm.h"
+ 
+ static volatile uint32_t ruby_io_owner = RUBY_USB_IO_ECHO;
+ static volatile uint32_t ruby_io_gen;
+@@ -38,6 +39,8 @@ ruby_usb_io_owner_name(uint32_t owner)
+ 		return "tty";
+ 	case RUBY_USB_IO_RAW:
+ 		return "raw";
++	case RUBY_USB_IO_NET:
++		return "net";
+ 	default:
+ 		return "echo";
+ 	}
+@@ -126,6 +129,10 @@ ruby_usb_io_rx(const uint8_t *data, uint32_t len)
+ 		ruby_raw_input(data, len);
+ 		return 1;
+ 	}
++	if (owner == RUBY_USB_IO_NET) {
++		agate_ecm_rx(data, len);
++		return 1;
++	}
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/ruby_usb_io.h b/bsd/dev/ruby_usb_io.h
+index 1d4f05c..4ff7bcb 100644
+--- a/bsd/dev/ruby_usb_io.h
++++ b/bsd/dev/ruby_usb_io.h
+@@ -8,6 +8,7 @@
+ #define RUBY_USB_IO_ECHO 0u
+ #define RUBY_USB_IO_TTY  1u
+ #define RUBY_USB_IO_RAW  2u
++#define RUBY_USB_IO_NET  3u      /* agate CDC-ECM (agate_ecm.c) */
+ 
+ void ruby_usb_io_init(void);
+ uint32_t ruby_usb_io_owner(void);
+diff --git a/bsd/dev/ruby_usb_port.c b/bsd/dev/ruby_usb_port.c
+index fb23643..dd3db9a 100644
+--- a/bsd/dev/ruby_usb_port.c
++++ b/bsd/dev/ruby_usb_port.c
+@@ -18,6 +18,7 @@
+ #include "ruby_battery.h"
+ #include "ruby_probe.h"
+ #include "ruby_usb_port.h"
++#include "agate_ecm.h"
+ 
+ static inline uint32_t
+ ruby_rd32(vm_offset_t base, uint32_t off)
+@@ -626,7 +627,8 @@ ruby_ep2_tick_assist(vm_offset_t mac)
+     }
+     if ((ruby_ep_ready && ruby_ep2log_on &&
+         sweet_log_position() != ruby_log_pos) ||
+-        (ruby_ep_ready && ruby_acm_echo_head != ruby_acm_echo_tail)) {
++        (ruby_ep_ready && (ruby_acm_echo_head != ruby_acm_echo_tail ||
++        agate_ecm_tx_pending()))) {
+         ruby_qmu_push_req = 1;
+         ruby_qmu_primer_kicks++;
+         ruby_usb_irq_kick();
+diff --git a/bsd/dev/ruby_usb_qmu.c b/bsd/dev/ruby_usb_qmu.c
+index 22c3d58..a376399 100644
+--- a/bsd/dev/ruby_usb_qmu.c
++++ b/bsd/dev/ruby_usb_qmu.c
+@@ -19,6 +19,7 @@
+ #include "ruby_usb_ep.h"
+ #include "ruby_usb_io.h"
+ #include "ruby_usb_qmu.h"
++#include "agate_ecm.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Boot-tunable ring sizes still defined in ruby_usb.c. */
+@@ -1545,7 +1546,8 @@ ruby_ep2_rx_drain(vm_offset_t mac)
+     }
+     /* 0231: hand the echo bytes to the TX ring right away; the QMU workloop
+      * owns both ends, so this is the same-thread producer -> consumer step. */
+-    if (ruby_echo_en && ruby_acm_echo_head != ruby_acm_echo_tail)
++    if (ruby_echo_en && (ruby_acm_echo_head != ruby_acm_echo_tail ||
++        agate_ecm_tx_pending()))
+         ruby_ep2_push_log(mac);
+ }
+ 
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 46571e1..f3024fd 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -904,6 +904,9 @@ bsd_init(void)
+ 	/* Single ruby USB probe call site: UFS and ramdisk roots both reach here. */
+ 	extern void ruby_usb_probe(void);
+ 	ruby_usb_probe();
++	/* agate: CDC-ECM ue0 on the ruby USB data plane (ruby_enum=3) */
++	extern void agate_ecm_start(void);
++	agate_ecm_start();
+ #endif
+ 
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
