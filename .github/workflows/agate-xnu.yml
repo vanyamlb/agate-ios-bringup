@@ -5,7 +5,7 @@ permissions:
   contents: read
 jobs:
   paint-pilot:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
