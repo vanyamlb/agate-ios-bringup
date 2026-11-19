@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+index cacd81b..1682abe 100644
+--- a/bsd/dev/agate_conninfra/agate_conninfra.c
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -175,6 +175,37 @@ ac_ldo(const char *name, uint16_t con0)
+ 	}
+ }
+ 
++/*
++ * The Wi-Fi's own supplies (conninfra mt6893_pmic.c consys_plt_pmic_wifi_power_ctrl, not RC mode):
++ * VCN33_1 and VCN33_2 at 3.3 V -- the RF front end. Without them the digital A-die, the firmware and
++ * even its calibration run, and the PHY hears nothing (agate: MDRDY 0 on all 41 channels).
++ * HW_OP_EN[0] = 1, SW_LP (CON0[1]) = 0, VOSEL [11:8] = 0xd (3.3 V: vcn33_*_wifi_voltages), and the
++ * Wi-Fi enable EN_1 (MULTI_SW[15]); the output is read back from DA_VCN33_*_B_EN (MON[0]).
++ */
++static void
++ac_vcn33(const char *name, uint16_t con0, uint16_t mon, uint16_t op_en_set, uint16_t multi_sw, uint16_t ana)
++{
++	uint16_t v = 0, m = 0;
++
++	pw_read(mon, &m);
++	pr_info("PMIC %s MON=0x%04x before\n", name, m);
++	pw_write(op_en_set, 1u << 0);
++	if (pw_read(con0, &v) == 0) {
++		pw_write(con0, (uint16_t)(v & ~(1u << 1)));
++	}
++	if (pw_read(ana, &v) == 0) {
++		pw_write(ana, (uint16_t)((v & ~0x0f0fu) | (0xd << 8)));
++	}
++	if (pw_read(multi_sw, &v) == 0) {
++		pw_write(multi_sw, (uint16_t)(v | (1u << 15)));
++	}
++	delay(2000);
++	pw_read(ana, &v);
++	pw_read(mon, &m);
++	pr_info("PMIC %s ANA_CON0=0x%04x (VOSEL %u) MON=0x%04x -> %s\n", name, v, (v >> 8) & 0xf, m,
++	    (m & 1) ? "ON at 3.3 V" : "STILL OFF");
++}
++
+ /* ---- the sequence ---- */
+ 
+ #define STEP(name, call) do { \
+@@ -1104,6 +1135,9 @@ agate_conninfra_a2a(int step)
+ 		}
+ 	}
+ 	ac_ldo("VCN13", VCN13_CON0);
++	/* the Wi-Fi's 3.3 V supplies (consys_hw_wifi_power_ctl when the Wi-Fi is turned on) */
++	ac_vcn33("VCN33_1", 0x1be2, 0x1be6, 0x1bea, 0x1bf4, 0x1f98);
++	ac_vcn33("VCN33_2", 0x1c08, 0x1c0c, 0x1c10, 0x1c1a, 0x1f9c);
+ 	/* POS part 2 */
+ 	consys_set_if_pinmux_mt6893(1);
+ 	STEP("conninfra_on_power", consys_conninfra_on_power_ctrl_mt6893(1));
