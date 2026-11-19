@@ -595,13 +595,34 @@ static void touch_probe(struct con *c)
 
 /* ---- kicker (runs on an A78 core until reset) ---- */
 
+/* Mailbox (kernel patch 0094, agatefbkick=1): the page below the panel
+ * buffer. Word 0 = 'KICK' once the kernel sends frames itself, word 1 =
+ * its kick sequence. While it changes, the kicker stays quiet (no heartbeat,
+ * no DSI_START under a kernel copy); after 2 s without kernel kicks it takes
+ * over again, so a panic screen still reaches the panel. */
+#define KICK_MBOX 0x7cdfb000UL
+#define KICK_MAGIC 0x4b49434bu
+
 void kicker_main(void)
 {
 	const struct surf s = { NEW_FB, NEW_PITCH };
-	u32 n = 0;
+	u32 n = 0, seen = 0;
+	u64 changed = 0;
 
 	for (;;) {
-		rect(&s, 1000, 60, 48, 48, (n & 16) ? COL_OK : 0xff0000ffu);
+		if (rd32(KICK_MBOX) == KICK_MAGIC) {
+			u32 seq = rd32(KICK_MBOX + 4);
+			if (seq != seen || changed == 0) {
+				seen = seq;
+				changed = cntpct();
+			}
+			if (cntpct() - changed < cntfrq() * 2) {
+				delay_ms(33);
+				continue;
+			}
+		} else {
+			rect(&s, 1000, 60, 48, 48, (n & 16) ? COL_OK : 0xff0000ffu);
+		}
 		__asm__ volatile("dsb sy" ::: "memory");
 		kick();
 		delay_ms(33);
@@ -734,6 +755,8 @@ void shim_main(u64 dtb)
 
 	/* Frame kicker on an A78 core (MPIDR 0x700 first). */
 	for (u64 cpu = 0x700; cpu >= 0x400; cpu -= 0x100) {
+		wr32(KICK_MBOX, 0);     /* a warm reboot keeps DRAM: clear the mailbox */
+		wr32(KICK_MBOX + 4, 0);
 		r = psci_cpu_on(cpu, (u64)kicker_entry, 0);
 		if (r == 0) {
 			kick_cpu = cpu;
