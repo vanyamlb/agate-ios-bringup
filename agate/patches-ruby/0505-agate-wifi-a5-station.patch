@@ -3585,6 +3585,19 @@ index 0000000..aa4a3a6
 +	}
 +}
 +#endif /* SWEET */
+diff --git a/iokit/conf/Makefile.template b/iokit/conf/Makefile.template
+index cbb66f5..08911e8 100644
+--- a/iokit/conf/Makefile.template
++++ b/iokit/conf/Makefile.template
+@@ -65,7 +65,7 @@ COMP_SUBDIRS = \
+ # -Wno-cast-align
+ # agate: IONetworkingFamily built in (iokit/sweet_ionet), compiled like its kext.
+ AGATE_IONET_ROOT = $(SRCROOT)/iokit/sweet_ionet
+-AGATE_IONET_OBJS = AgateECMEthernet.cpo IOEthernetController.cpo IOEthernetInterface.cpo IOKernelDebugger.cpo IOMbufMemoryCursor.cpo IONetworkController.cpo IONetworkData.cpo IONetworkInterface.cpo IONetworkMedium.cpo IONetworkStack.cpo IONetworkUserClient.cpo IOOutputQueue.cpo IOPacketQueue.cpo
++AGATE_IONET_OBJS = AgateECMEthernet.cpo AgateWLAN.cpo IOEthernetController.cpo IOEthernetInterface.cpo IOKernelDebugger.cpo IOMbufMemoryCursor.cpo IONetworkController.cpo IONetworkData.cpo IONetworkInterface.cpo IONetworkMedium.cpo IONetworkStack.cpo IONetworkUserClient.cpo IOOutputQueue.cpo IOPacketQueue.cpo
+ $(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CFLAGS_ADD += -D__PRIVATE_SPI__ -include libkern/c++/OSMetaClass.h -I$(AGATE_IONET_ROOT)/include -I$(AGATE_IONET_ROOT) -idirafter $(SRCROOT)/bsd))
+ $(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CXXWARNFLAGS_ADD += -w -Wno-error))
+ 
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 index 4ad72ae..8ea35ad 100644
 --- a/iokit/conf/files.arm64
