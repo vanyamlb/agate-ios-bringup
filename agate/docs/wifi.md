@@ -74,6 +74,16 @@ A3b: CONN_ON_MISC=00000003 -> N9 Wi-Fi FIRMWARE IS RUNNING
 Init commands: CONNAC2X TXD (DW0 bytes | PKT_FT 2, DW1 HF 1) + `INIT_HIF_TX_HEADER`
 (`PQ_ID 0x8000`, CID, `0xA0`, seq); the answer is 24 bytes of RXD then `INIT_WIFI_EVENT`.
 
+**A4/A5 (2026-11-19, patches 0504-0506, `agatewifi=8`).** The radio scans and hears networks.
+On the way: `INIT_CMD_ID_PHY_ACTION` between the patch and the RAM code (RF calibration with
+NVRAM tags 7-9; gen4m sends it on conninfra chips, `CFG_SUPPORT_PRE_ON_PHY_ACTION=1`), and the
+missing piece: **VCN33_1/VCN33_2 at 3.3 V** (conninfra `consys_plt_pmic_wifi_power_ctrl`). Without
+them firmware, A-die and even the calibration answer, and the PHY hears nothing: `EVENT_SCAN_DONE`
+showed MDRDY 0 on all 41 channels. With them: 245 packets, 7 networks on 2.4 and 5 GHz in one
+scan. Beacons come to the host as SW frames (`0x3801`) on WFDMA1 RX 0. The station
+(HakiOS's `redwood_sta`/`redwood_apple80211`/`redwood_wpa`, APSL 2.0) sits behind `en0`, an
+`IO80211Controller` of the built-in IONetworkingFamily (`AgateWLAN.cpp`); USB networking is `en1`.
+
 ## Material collected (not in the repository: the owner's own phone data)
 
 `agate-data/wifi-fw/` on the build machine, read from the running Android with root:
