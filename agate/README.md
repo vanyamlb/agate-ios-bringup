@@ -201,3 +201,22 @@ IOKit-quiet timeout (something stays busy), IONetworkStack attaches it, the
 Mac's Internet Sharing (Wi-Fi -> "ruby USB P2") hands out 192.168.2.2 by
 DHCP, and Safari loads HTTPS sites. Slow so far (polled USB, 16 x 512 B RX
 ring, CPU rendering). Kernel run 44481462857.
+
+## Network speed-ups and Wi-Fi milestone A1 (2026-11-19)
+
+- 0498: the kernel asks IONetworkStack to name the ECM interface `en0` as
+  soon as it is registered (configd's InterfaceNamer only named it after
+  its 240 s IOKit-quiet timeout); `ruby_rxbuf=2048 ruby_txgpd=2048`: one
+  whole Ethernet frame per GPD. 0500: RX "frame mode" takes every
+  completed GPD of the ring (the QMU completes them out of order; the
+  in-order walk stranded frames for seconds). Ping 8000 B 0 % loss,
+  500-ping flood 0 % loss at 2.5 ms; DHCP from the Mac ~12 s after USB.
+- `mkadt_agate.py --gamut sRGB`: the iPhone X /product says P3, so WebKit
+  rendered pages into 10-bit `w30r` surfaces the CPU compositor does not
+  show (white pages).
+- **Wi-Fi A1 (0499, `agatewifi=2`)**: MediaTek's own MT6893 conninfra power
+  sequence (conninfra/platform/mt6893/mt6893_pos.c: SPM_CONN_PWR_CON,
+  TOPRGU, AXI protect, GALS) run from XNU, conn_infra woken, and
+  `CONN_HW_VER = 0x20010101`, `CFG_ID = 3`: **the MT6893 connectivity
+  subsystem is alive under XNU**. Next: A2, its firmware (`soc3_0_*`, from
+  the phone's own vendor partition) and the EMI region.

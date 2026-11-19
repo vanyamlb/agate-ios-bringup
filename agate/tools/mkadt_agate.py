@@ -43,6 +43,7 @@ def main():
     ap.add_argument('out')
     ap.add_argument('--dump', action='store_true')
     ap.add_argument('--ufs', action='store_true', help='add /sweet-ufs (UFS host)')
+    ap.add_argument('--gamut', help="override /product artwork-display-gamut (e.g. sRGB)")
     ap.add_argument('--big', type=int, default=0, choices=range(4),
                     help='also list N Cortex-A78 cores (MPIDR 0x400..); 0x700 runs the shim kicker')
     ap.add_argument('--d22ap', help='iPhone X device tree (DeviceTree.d22ap.im4p payload, '
@@ -155,6 +156,11 @@ def main():
             if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
                 # as ios-topaz: drop syscfg placeholders (flag set) and node bookkeeping
                 props = [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+                if a.gamut:
+                    # the CPU compositor only shows 8-bit BGRA: a P3 panel makes
+                    # WebKit and others render 10-bit 'w30r' surfaces (white pages)
+                    props = [(k, cstr(a.gamut) if k == 'artwork-display-gamut' else v)
+                             for k, v in props]
                 product = [node('product', [ph()] + props)]
         if not product:
             sys.exit(f'{a.d22ap}: no /product node')
