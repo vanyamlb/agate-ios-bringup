@@ -1,0 +1,305 @@
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+index 52f8143..d927a42 100644
+--- a/bsd/dev/agate_conninfra/agate_conninfra.c
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -295,6 +295,290 @@ ac_wm_start(void)
+ 	return v == 0x1d1e ? 0 : -1;
+ }
+ 
++/* ---- A3b: ROM patch + N9 RAM code (gen4m soc3_0, CFG_DOWNLOAD_DYN_MEMORY_MAP) ----
++ * Images come from the AGFW blob the shim left in the Image (kind 2 entries at
++ * Image + 0x1800000, Image loaded by LK at 0x40080000): each is written to its
++ * WF MCU address through the AP2WF window (CONN_CFG_AP2WF_REMAP_1 = target,
++ * data at 0x18500000), then INIT_CMD 0x40 (DYN_MEM_MAP_PATCH_FINISH) and 0x41
++ * (DYN_MEM_MAP_FW_FINISH) go to the WM over host WFDMA1 TX ring 17 and the
++ * answers come back on WFDMA1 RX ring 0. Rings and buffers live in Android's
++ * wifi-reserve-memory (0xbd000000, below 4 GiB: u4DmaMask = 32), mapped
++ * uncached. Register map: gen4m soc3_0.c / cmm_asic_connac2x.h (AXI bus 0 =
++ * AP 0x18000000). */
++#define AGFW_PA        0x41880000ULL
++#define WFD_DMA0       0x18024000ULL
++#define WFD_DMA1       0x18025000ULL
++#define WFD_HIF_WRAP   0x18027000ULL
++#define DMA_POOL_PA    0xbd000000ULL
++#define DMA_POOL_SIZE  0x40000
++#define RING_N         16
++#define TXR_OFF        0x0000      /* TX ring 17 descriptors */
++#define RXR_OFF        0x1000      /* RX ring 0 (DMA1) descriptors */
++#define TXB_OFF        0x2000      /* TX buffers, 0x200 each */
++#define RXB_OFF        0x8000      /* RX buffers, 0x800 each */
++#define RXB_SIZE       0x800
++
++struct agfw_ent { uint32_t kind, dest, len, off; char name[16]; };
++
++static vm_offset_t wd0, wd1, wwrap, pool;
++static uint32_t ac_txidx, ac_rxidx;
++static uint8_t ac_seq;
++
++static void
++ac_wfdma_dump(const char *why)
++{
++	pr_info("WFDMA %s: G0=%08x G1=%08x T17 b=%08x n=%u c=%u d=%u R0 b=%08x n=%u c=%u d=%u int=%08x\n",
++	    why, readl(wd0 + 0x208), readl(wd1 + 0x208),
++	    readl(wd1 + 0x410), readl(wd1 + 0x414), readl(wd1 + 0x418), readl(wd1 + 0x41c),
++	    readl(wd1 + 0x500), readl(wd1 + 0x504), readl(wd1 + 0x508), readl(wd1 + 0x50c),
++	    readl(wwrap + 0x10));  /* CONNAC2X_WPDMA_EXT_INT_STA */
++}
++
++static void
++ac_wfdma_ctl(vm_offset_t d, int dma1, int enable)
++{
++	uint32_t g = readl(d + 0x208);
++	int i;
++
++	if (enable) {
++		g = (g & ~0x30u) | (3u << 4);           /* pdma_bt_size = 3 */
++		g |= (1u << 6) | (1u << 12) | (1u << 30) | (1u << 28) |
++		    (1u << 15) | (1u << 21);             /* wb_ddone, LE, clk_gate_dis,
++		                                          * omit_tx_info, chain_en, pfet2 */
++		if (dma1) {
++			g |= 1u << 27;                       /* omit_rx_info */
++		}
++		writel(g, d + 0x208);
++		return;
++	}
++	g &= ~((1u << 0) | (1u << 2) | (1u << 15) | (1u << 28) | (1u << 27) | (1u << 21));
++	writel(g, d + 0x208);
++	for (i = 0; i < 100 && (readl(d + 0x208) & 0xa); i++) {
++		delay(1000);
++	}
++	writel(0xffffffff, d + 0x20c);              /* RST_DTX_PTR */
++	writel(0xffffffff, d + 0x280);              /* RST_DRX_PTR */
++}
++
++static int
++ac_wfdma_init(void)
++{
++	vm_offset_t csr = conn_reg_mt6893.reg_base_addr[CONN_HOST_CSR_TOP_BASE_INDEX].vir_addr;
++	uint32_t i, v, a;
++
++	wd0 = ml_io_map(WFD_DMA0, 0x1000);
++	wd1 = ml_io_map(WFD_DMA1, 0x1000);
++	wwrap = ml_io_map(WFD_HIF_WRAP, 0x1000);
++	pool = ml_io_map(DMA_POOL_PA, DMA_POOL_SIZE);
++	if (!wd0 || !wd1 || !wwrap || !pool) {
++		return -1;
++	}
++	/* driver own: CONNAC2X_BN0_LPCTL (0x18060010) HOST_CLR_OWN, wait OWNER_SYNC = 0 */
++	writel(1u << 1, csr + 0x10);
++	for (i = 0; i < 100 && (readl(csr + 0x10) & (1u << 2)); i++) {
++		delay(1000);
++	}
++	pr_info("A3b: driver own %s (LPCTL=%08x)\n", i < 100 ? "ok" : "FAILED", readl(csr + 0x10));
++	ac_wfdma_dump("before");
++
++	ac_wfdma_ctl(wd0, 0, 0);
++	ac_wfdma_ctl(wd1, 1, 0);
++	/* host interrupts off: polled */
++	writel(0xffffffff, wd0 + 0x22c);            /* HOST_INT_ENA_CLR */
++	writel(0xffffffff, wd1 + 0x22c);
++
++	for (i = 0; i < DMA_POOL_SIZE; i += 4) {
++		writel(0, pool + i);
++	}
++	for (i = 0; i < RING_N; i++) {              /* TX: free cells have DMADONE */
++		writel(1u << 31, pool + TXR_OFF + i * 16 + 4);
++	}
++	for (i = 0; i < RING_N; i++) {              /* RX: buffer, size, not done */
++		writel((uint32_t)(DMA_POOL_PA + RXB_OFF + i * RXB_SIZE), pool + RXR_OFF + i * 16);
++		writel((uint32_t)RXB_SIZE << 16, pool + RXR_OFF + i * 16 + 4);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	writel((uint32_t)(DMA_POOL_PA + TXR_OFF), wd1 + 0x410);   /* TX ring 17 */
++	writel(RING_N, wd1 + 0x414);
++	writel(0, wd1 + 0x418);
++	writel((uint32_t)(DMA_POOL_PA + RXR_OFF), wd1 + 0x500);   /* RX ring 0 */
++	writel(RING_N, wd1 + 0x504);
++	writel(RING_N - 1, wd1 + 0x508);
++	ac_txidx = 0;
++	ac_rxidx = 0;
++
++	/* soc3_0asicConnac2xWfdmaManualPrefetch */
++	writel(readl(wd0 + 0x208) & ~(1u << 15), wd0 + 0x208);
++	writel(readl(wd1 + 0x208) & ~(1u << 15), wd1 + 0x208);
++	v = 0x4;
++	for (a = 0x680; a <= 0x69c; a += 4, v += 0x00400000) {
++		writel(v, wd0 + a);                     /* DMA0 RX ring 0..7 */
++	}
++	for (a = 0x680; a <= 0x688; a += 4, v += 0x00400000) {
++		writel(v, wd1 + a);                     /* DMA1 RX ring 0..2 */
++	}
++	for (a = 0x600; a <= 0x60c; a += 4, v += 0x00400000) {
++		writel(v, wd1 + a);                     /* DMA1 TX ring 0..3 */
++	}
++	for (a = 0x620; a <= 0x62c; a += 4, v += 0x00400000) {
++		writel(v, wd1 + a);                     /* DMA1 TX ring 8..11 */
++	}
++	for (a = 0x640; a <= 0x64c; a += 4, v += 0x00400000) {
++		writel(v, wd1 + a);                     /* DMA1 TX ring 16..19 */
++	}
++	writel(0xffffffff, wd0 + 0x20c);
++	writel(0xffffffff, wd1 + 0x20c);
++	writel(0xffffffff, wd0 + 0x280);
++	writel(0xffffffff, wd1 + 0x280);
++	writel(readl(wwrap + 0x500) | 0x800, wwrap + 0x500);  /* WFDMA_AXI0_R2A_CTRL_0: BID check bypass */
++
++	ac_wfdma_ctl(wd0, 0, 1);
++	ac_wfdma_ctl(wd1, 1, 1);
++	/* TX/RX DMA enable on WFDMA1 only (cmd + event); WFDMA0 carries data
++	 * rings this step does not set up */
++	writel(readl(wd1 + 0x208) | 0x5, wd1 + 0x208);
++	ac_wfdma_dump("ready");
++	return 0;
++}
++
++/* INIT_CMD: [CONNAC2X TXD 32 B][INIT_HIF_TX_HEADER 32 B][payload] on TX ring 17 */
++static int
++ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
++{
++	uint32_t len = 64 + plen, i, w;
++	vm_offset_t buf = pool + TXB_OFF + ac_txidx * 0x200;
++	vm_offset_t td = pool + TXR_OFF + ac_txidx * 16;
++	uint8_t seq = ++ac_seq;
++	const uint8_t *p = payload;
++
++	for (i = 0; i < 0x200; i += 4) {
++		writel(0, buf + i);
++	}
++	writel(len | (2u << 23), buf + 0);           /* TX bytes, PKT_FT = CMD */
++	writel(1u << 16, buf + 4);                   /* HF = command */
++	writel((len - 32) | (0x8000u << 16), buf + 32);    /* u2TxByteCount, u2PQ_ID */
++	writel(cid | (0xa0u << 8) | ((uint32_t)seq << 24), buf + 36);  /* CID, 0xA0, seq */
++	for (i = 0; i < plen; i += 4) {
++		w = 0;
++		for (uint32_t k = 0; k < 4 && i + k < plen; k++) {
++			w |= (uint32_t)p[i + k] << (8 * k);
++		}
++		writel(w, buf + 64 + i);
++	}
++	writel((uint32_t)(DMA_POOL_PA + TXB_OFF + ac_txidx * 0x200), td + 0);
++	writel(0, td + 8);
++	writel(0, td + 12);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	writel((len << 16) | (1u << 30), td + 4);    /* SDLen0, LastSec0, DMADONE = 0 */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ac_txidx = (ac_txidx + 1) % RING_N;
++	writel(ac_txidx, wd1 + 0x418);               /* CIDX */
++	pr_info("A3b: TX CMD 0x%02x seq %u len %u\n", cid, seq, len);
++
++	for (i = 0; i < 2000; i++) {                 /* answer on DMA1 RX ring 0 */
++		vm_offset_t rd = pool + RXR_OFF + ac_rxidx * 16;
++		uint32_t d1 = readl(rd + 4);
++		if (d1 & (1u << 31)) {
++			vm_offset_t rb = pool + RXB_OFF + ac_rxidx * RXB_SIZE;
++			uint32_t rlen = (d1 >> 16) & 0x3fff;
++			uint32_t ev0 = readl(rb + 24), ev1 = readl(rb + 28), ev2 = readl(rb + 32);
++			pr_info("A3b: RX %u B after %u ms: %08x %08x %08x %08x %08x %08x | %08x %08x %08x\n",
++			    rlen, i, readl(rb), readl(rb + 4), readl(rb + 8), readl(rb + 12),
++			    readl(rb + 16), readl(rb + 20), ev0, ev1, ev2);
++			writel((uint32_t)RXB_SIZE << 16, rd + 4);   /* give back */
++			__asm__ volatile ("dsb sy" ::: "memory");
++			writel(ac_rxidx, wd1 + 0x508);
++			ac_rxidx = (ac_rxidx + 1) % RING_N;
++			/* INIT_WIFI_EVENT {len, pkt type, EID, seq} + {status, cid} */
++			uint8_t eid = ev1 & 0xff, eseq = (ev1 >> 8) & 0xff;
++			*status = ev2 & 0xff;
++			pr_info("A3b: event EID %u seq %u status %u cid 0x%02x\n",
++			    eid, eseq, *status, (ev2 >> 8) & 0xff);
++			return (eid == 1 && eseq == seq) ? 0 : -2;
++		}
++		delay(1000);
++	}
++	ac_wfdma_dump("no answer");
++	return -1;
++}
++
++static void
++ac_dynmem_write(uint32_t wfaddr, vm_offset_t src, uint32_t len)
++{
++	vm_offset_t cfg = conn_reg_mt6893.reg_base_addr[CONN_INFRA_CFG_BASE_INDEX].vir_addr;
++	vm_offset_t win = ml_io_map(0x18500000, 0x10000);
++	uint32_t i;
++
++	writel(wfaddr, cfg + 0x120);                 /* CONN_CFG_AP2WF_REMAP_1 */
++	(void)readl(cfg + 0x120);
++	for (i = 0; i < len; i += 4) {
++		writel(readl(src + i), win + i);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pr_info("A3b: %u B to WF %08x, readback %08x/%08x\n", len, wfaddr,
++	    readl(win), readl(src));
++}
++
++static int
++ac_fw_download(void)
++{
++	vm_offset_t hdr = ml_io_map(AGFW_PA, 0x1000);
++	vm_offset_t blob, sync;
++	uint32_t n, total, i, ready = 0;
++	uint8_t st = 0xff;
++	int r, nram = 0;
++
++	if (!hdr || readl(hdr) != 0x57464741u) {
++		pr_err("A3b: no AGFW blob at %llx\n", AGFW_PA);
++		return -1;
++	}
++	n = readl(hdr + 8);
++	total = readl(hdr + 12);
++	blob = ml_io_map(AGFW_PA, (total + 0xfff) & ~0xfffu);
++	sync = ml_io_map(0x18060000, 0x1000);
++	if (!blob || !sync || n > 16) {
++		return -1;
++	}
++	if (ac_wfdma_init()) {
++		return -1;
++	}
++	const volatile struct agfw_ent *e = (const volatile struct agfw_ent *)(blob + 16);
++	for (i = 0; i < n; i++) {                    /* 1. ROM patch */
++		if (e[i].kind == 2 && e[i].name[0] == 'p') {
++			ac_dynmem_write(e[i].dest, blob + e[i].off, e[i].len);
++		}
++	}
++	uint32_t patch_finish = 0;                   /* INIT_CMD_PATCH_FINISH {check_crc = 0} */
++	r = ac_init_cmd(0x40, &patch_finish, 4, &st);
++	pr_info("A3b: PATCH_FINISH -> %d status %u\n", r, st);
++	if (r || st) {
++		return -1;
++	}
++	for (i = 0; i < n; i++) {                    /* 2. N9 RAM code, plain regions */
++		if (e[i].kind == 2 && e[i].name[0] == 'r') {
++			ac_dynmem_write(e[i].dest, blob + e[i].off, e[i].len);
++			nram++;
++		}
++	}
++	uint32_t wifi_start[2] = { 0, 0 };           /* INIT_CMD_WIFI_START {override, address} */
++	r = ac_init_cmd(0x41, wifi_start, 8, &st);
++	pr_info("A3b: FW_FINISH (%d regions) -> %d status %u\n", nram, r, st);
++	if (r || st) {
++		return -1;
++	}
++	for (i = 0; i < 200; i++) {                  /* CONN_ON_MISC ready bits [1:0] */
++		ready = readl(sync + 0xf0);
++		if ((ready & 3) == 3) {
++			break;
++		}
++		delay(10000);
++	}
++	pr_info("A3b: CONN_ON_MISC=%08x after %u ms -> %s\n", ready, i * 10,
++	    (ready & 3) == 3 ? "N9 Wi-Fi FIRMWARE IS RUNNING" : "firmware not ready");
++	ac_wfdma_dump("after");
++	return (ready & 3) == 3 ? 0 : -1;
++}
++
+ int
+ agate_conninfra_a2a(int step)
+ {
+@@ -343,6 +627,9 @@ agate_conninfra_a2a(int step)
+ 	if (step >= 5) {
+ 		STEP("wm_start", ac_wm_start());
+ 	}
++	if (step >= 6) {
++		STEP("fw_download", ac_fw_download());
++	}
+ 	return 0;
+ }
+ #endif

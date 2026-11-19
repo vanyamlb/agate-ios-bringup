@@ -9,11 +9,17 @@ Entries (all little endian):
   header  "AGFW", u32 version=1, u32 count, u32 total_size
   entry   u32 kind, u32 dest, u32 len, u32 data_off, char name[16]
           kind 1: the shim copies len bytes to EMI base + dest
-          kind 2: kept in place in the Image for the kernel (dest unused)
-As gen4m's soc3_0 power-on download (ENUM_WLAN_POWER_ON_DOWNLOAD_EMI):
-the MCU and Wi-Fi "ROM EMI" images go to (u4PatchAddr & 0xFFFFFF) without
-their 48-byte ROM_EMI_HEADER, and their 16-byte build dates to
-WMMCU_MCU_ROM_EMI_DATE_ADDR / WMMCU_WIFI_ROM_EMI_DATE_ADDR.
+          kind 2: left in the Image; the kernel writes it to WF MCU address
+                  dest through the AP2WF dynamic memory map window, in order
+                  (first "patch", then the "ram*" regions)
+As gen4m's soc3_0 download (CFG_DOWNLOAD_DYN_MEMORY_MAP=1, ROM_PATCH_NO_SEM_CTRL):
+- the MCU and Wi-Fi "ROM EMI" images go to (u4PatchAddr & 0xFFFFFF) without
+  their 48-byte ROM_EMI_HEADER, their 16-byte build dates to
+  WMMCU_MCU_ROM_EMI_DATE_ADDR / WMMCU_WIFI_ROM_EMI_DATE_ADDR;
+- the ROM patch (PATCH_FORMAT_T, 30-byte header) to SOC3_0_PATCH_START_ADDR
+  0x00100000, its date to WMMCU_ROM_PATCH_DATE_ADDR;
+- WIFI_RAM_CODE regions from the connac tailer: DOWNLOAD_CONFIG_EMI (bit 7)
+  regions into the EMI, plain ones over the dynamic memory map.
 """
 import struct
 import sys
@@ -22,6 +28,8 @@ from pathlib import Path
 ROM_EMI_HDR = 48
 EMI_MASK = 0xFFFFFF
 EMI_SIZE = 0x450000
+PATCH_DATE = 0xF027F0D0
+PATCH_ADDR = 0x00100000
 MCU_DATE = 0xF027F0E0
 WIFI_DATE = 0xF027F0F0
 
@@ -47,11 +55,36 @@ def main():
 
     rom_emi("soc3_0_ram_wmmcu_1a_1_hdr.bin", MCU_DATE, "wmmcu")
     rom_emi("soc3_0_ram_wifi_1a_1_hdr.bin", WIFI_DATE, "wifi-rom")
-    for fname, tag in (("soc3_0_patch_wmmcu_1a_1_hdr.bin", "patch"),
-                       ("WIFI_RAM_CODE_soc3_0_1a_1.bin", "ramcode")):
-        raw = (d / fname).read_bytes()
-        entries.append((2, 0, raw, tag))
-        print(f"{fname}: {len(raw)} B kept for the kernel")
+    raw = (d / "soc3_0_patch_wmmcu_1a_1_hdr.bin").read_bytes()
+    if raw[16:20] != b"ALPS" or struct.unpack_from("<I", raw, 24)[0] == 0xFFFFFFFF:
+        raise SystemExit("patch: not a V1 PATCH_FORMAT_T")
+    entries.append((2, PATCH_ADDR, raw[30:], "patch"))
+    entries.append((1, PATCH_DATE & EMI_MASK, raw[:16], "patch-date"))
+    print(f"patch: {len(raw) - 30} B to WF {PATCH_ADDR:#x}, date {raw[:16]!r}")
+
+    raw = (d / "WIFI_RAM_CODE_soc3_0_1a_1.bin").read_bytes()
+    nreg = raw[-36 + 2]
+    base = len(raw) - 36 - nreg * 40
+    off = 0
+    for i in range(nreg):
+        _crc, _real, _blk, _r, addr, ln, feat = struct.unpack_from("<III4sIIB", raw, base + i * 40)
+        body = raw[off:off + ln]
+        off += ln
+        if feat & 0x40:                       # FW_FEATURE_NOT_DOWNLOAD
+            continue
+        if feat & 0x01:                       # encrypted: needs PDA scatter
+            raise SystemExit(f"ram region {i}: encrypted, not supported")
+        if feat & 0x80:                       # DOWNLOAD_CONFIG_EMI
+            dest = addr & EMI_MASK
+            if dest + ln > EMI_SIZE:
+                raise SystemExit(f"ram region {i}: beyond EMI")
+            entries.append((1, dest, body, f"ram{i}-emi"))
+            print(f"ram region {i}: {ln:#x} B to EMI+{dest:#x}")
+        else:
+            entries.append((2, addr, body, f"ram{i}"))
+            print(f"ram region {i}: {ln:#x} B to WF {addr:#x} (dyn mem map)")
+    if off > base:
+        raise SystemExit("ram code: regions overlap the tailer")
 
     head = 16 + 32 * len(entries)
     off = (head + 63) & ~63
