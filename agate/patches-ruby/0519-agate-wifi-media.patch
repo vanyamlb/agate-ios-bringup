@@ -1,0 +1,78 @@
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+index b449938..97ba3b4 100644
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -31,9 +31,14 @@
+ 
+ #define SIOCSA80211     0x802869c8u
+ #define SIOCGA80211     0xc02869c9u
++#define SIOCGIFMEDIA64  0xc02c6938u     /* _IOWR('i', 56, struct ifmediareq64): 44 bytes */
++#define SIOCGIFMEDIA32  0xc0286938u     /* _IOWR('i', 56, struct ifmediareq32): 40 bytes */
++
++static volatile bool gAgateWLANLinked;
+ 
+ extern "C" {
+ void proc_selfname(char *buf, int size);
++int copyout(const void *kaddr, user_addr_t udaddr, size_t len);
+ int  agate_mtkwifi_transmit(const uint8_t *frame, uint32_t length);
+ errno_t redwood_apple80211_ioctl(u_long command, void *data);
+ kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -107,6 +112,42 @@ AgateWLANInterface::performCommand(IONetworkController *ctr, unsigned long cmd,
+ 
+ 	if (cmd == SIOCSA80211 || cmd == SIOCGA80211) {
+ 		r = redwood_apple80211_ioctl(cmd, arg1);
++	} else if ((cmd == SIOCGIFMEDIA64 || cmd == SIOCGIFMEDIA32) && arg1 != NULL) {
++		/*
++		 * The media of a radio (as HakiOS's redwood_net.c answers): IEEE 802.11, active when a network is
++		 * joined. wifid asks this first and left the interface alone on IONetworkingFamily's answer
++		 * (no current medium: not a Wi-Fi interface to it).
++		 * struct ifmediareq{64,32}: name[16], current, mask, status, active, count, then the list pointer.
++		 */
++		uint8_t *req = (uint8_t *)arg1;
++		const int media = IFM_IEEE80211 | IFM_AUTO;
++		int32_t v, count;
++		user_addr_t list;
++
++		memcpy(&count, req + 32, 4);
++		if (cmd == SIOCGIFMEDIA64) {
++			uint64_t l;
++			memcpy(&l, req + 36, 8);
++			list = (user_addr_t)l;
++		} else {
++			uint32_t l;
++			memcpy(&l, req + 36, 4);
++			list = (user_addr_t)l;
++		}
++		v = media;
++		memcpy(req + 16, &v, 4);                    /* ifm_current */
++		v = 0;
++		memcpy(req + 20, &v, 4);                    /* ifm_mask */
++		v = IFM_AVALID | (gAgateWLANLinked ? IFM_ACTIVE : 0);
++		memcpy(req + 24, &v, 4);                    /* ifm_status */
++		v = media;
++		memcpy(req + 28, &v, 4);                    /* ifm_active */
++		r = 0;
++		if (list != 0 && count > 0) {
++			r = copyout(&media, list, sizeof(media));
++		}
++		v = 1;
++		memcpy(req + 32, &v, 4);                    /* ifm_count */
+ 	} else {
+ 		r = IOEthernetInterface::performCommand(ctr, cmd, arg0, arg1);
+ 	}
+@@ -219,6 +260,7 @@ AgateWLAN::start(IOService *provider)
+ 		return false;
+ 	}
+ 	media->release();
++	setCurrentMedium(fMedium);
+ 	setProperty("IOModel", "MT6893 CONNAC2 Wi-Fi");
+ 	setProperty("IOVendor", "MediaTek");
+ 	setProperty("IOBuiltin", true);
+@@ -297,6 +339,7 @@ void
+ AgateWLAN::link(bool up)
+ {
+ 	fLinked = up;
++	gAgateWLANLinked = up;
+ 	if (fEnabled) {
+ 		setLinkStatus(kIONetworkLinkValid | (up ? kIONetworkLinkActive : 0),
+ 		    up ? fMedium : NULL, up ? 54000000 : 0);
