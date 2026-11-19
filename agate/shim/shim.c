@@ -391,9 +391,9 @@ static void touch_probe(struct con *c)
 		static const u8 scan[3] = { 0xA0, 0x00, 0x01 };
 		tg_spi(scan, 3, 0, 0);
 	}
-	con_line(c, "ACTIVE SCAN ON - TOUCH THE SCREEN (15 S)", COL_OK);
+	con_line(c, "ACTIVE SCAN ON - TOUCH THE SCREEN NOW (30 S)", COL_OK);
 	u32 yline = c->y;
-	u64 end = cntpct() + cntfrq() * 15;
+	u64 end = cntpct() + cntfrq() * 30;
 	while (cntpct() < end) {
 		for (int n = 0; n < 32; n++) {
 			tg_read(0x87, 0, 0, e, 8);
@@ -406,12 +406,24 @@ static void touch_probe(struct con *c)
 			say(c, "EVENTS ", events, 4);
 			say(c, "TOUCHES ", touches, 4);
 			say_hex(c, "LAST", e, 8);
+			if (e[0] == 0x13 || e[0] == 0x23 || e[0] == 0x33) {
+				char l[LLEN];
+				l[0] = 0;
+				cat(l, "FINGER ");
+				cathex(l, e[1] >> 4, 1);
+				cat(l, " X ");
+				cathex(l, (u32)(e[3] << 8 | e[2]) / 10u, 4);
+				cat(l, " Y ");
+				cathex(l, (u32)(e[5] << 8 | e[4]) / 10u, 4);
+				con_line(c, l, COL_OK);
+				c->y -= CELL_H;
+			}
 			if ((e[7] & 0x1f) == 0)
 				break;
 		}
 		delay_ms(8);
 	}
-	c->y = yline + 3 * CELL_H;
+	c->y = yline + 4 * CELL_H;
 	con_line(c, "TOUCH PROBE DONE", COL_OK);
 }
 
