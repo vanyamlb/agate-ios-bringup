@@ -53,6 +53,14 @@ if text.count(decl) != 1:
     raise SystemExit(f'IONetworkingFamily source changed: {cur}')
 cur.write_text(text.replace(decl, '#include <IOKit/assert.h>\n#include <sys/param.h>\n'
                             '#include <sys/mbuf.h>\n__BEGIN_DECLS\nstruct mbuf * m_getpackets('))
+# bpf.h has no __BEGIN_DECLS in the kernel's own view: bpfattach() must keep
+# C linkage (its dependencies are already included by then).
+eth = Path(sys.argv[1]) / 'IOEthernetInterface.cpp'
+text = eth.read_text()
+if text.count('#include <net/bpf.h>\n') != 1:
+    raise SystemExit(f'IONetworkingFamily source changed: {eth}')
+eth.write_text(text.replace('#include <net/bpf.h>\n',
+                            'extern "C" {\n#include <net/bpf.h>\n}\n'))
 print(f'unwrapped {n} extern "C" include blocks')
 if n < 5:
     raise SystemExit('IONetworkingFamily source changed: expected >= 5 include blocks')
