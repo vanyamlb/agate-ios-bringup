@@ -84,6 +84,20 @@ scan. Beacons come to the host as SW frames (`0x3801`) on WFDMA1 RX 0. The stati
 (HakiOS's `redwood_sta`/`redwood_apple80211`/`redwood_wpa`, APSL 2.0) sits behind `en0`, an
 `IO80211Controller` of the built-in IONetworkingFamily (`AgateWLAN.cpp`); USB networking is `en1`.
 
+**Settings → Wi-Fi works (2026-11-19, patches 0507-0519).** The toggle is live and the networks the
+radio hears are listed: wifid asks CARD_CAPABILITIES, POWER, SUPPORTED_CHANNELS, SCAN_REQ, SCAN_RESULT of
+`redwood_apple80211.c`. What wifid needed, each found with the kernel's IOKit trace (`sweetiolog=wifid`,
+extended in 0511/0513) and an ioctl log on en0:
+
+- a device tree node named `wlan` (launchd's `_LimitLoadToDeviceTree` for com.apple.wifid,
+  `io_device_tree_entry_exists_with_name`), its properties all data (an OSString crashed backboardd);
+- `/chosen mac-address-wifi0`, `local-mac-address` on the controller and the interface;
+- `region-info` on the device tree root (`ZD/A`): read when Settings opens Wi-Fi;
+- the controller named `wlan` (wifid's `IONameMatch`), `IOInterfaceName` en0 on the interface;
+- **`SIOCGIFMEDIA` answered as a radio** (`IFM_IEEE80211|IFM_AUTO`, as HakiOS's redwood_net.c):
+  IONetworkingFamily's answer had no current medium, and wifid left the interface alone - the
+  greyed-out toggle.
+
 ## Material collected (not in the repository: the owner's own phone data)
 
 `agate-data/wifi-fw/` on the build machine, read from the running Android with root:
