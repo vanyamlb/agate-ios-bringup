@@ -30,14 +30,14 @@ index 976cc25..4b10ba7 100644
  bsd/dev/ruby_probe.c			standard
 diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
 new file mode 100644
-index 0000000..16a229b
+index 0000000..eb20fae
 --- /dev/null
 +++ b/bsd/dev/agate_conninfra/agate_conninfra.c
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,292 @@
 +/*
 + * agate (Xiaomi 11T, MT6893): Wi-Fi milestone A2a - the whole conninfra
 + * first power-on of MediaTek's consys_hw_pwr_on(), driven from XNU:
-+ *   PMIC (VCN18/VCN13 on the MT6359P, through the pwrap WACS2 interface),
++ *   PMIC (VCN18/VCN13 on the MT6359P, through the pwrap SWINF_2 (ARB_V3) interface),
 + *   pinmux, MTCMOS + AXI bus, chip id, EMI remap, D-die, SPI master,
 + *   A-die (MT6635 over the conn RF SPI, with its efuse), AFE WBG calibration,
 + *   sub-system PLLs (BPLL/WPLL: the Wi-Fi bus clock), low-power setting.
@@ -137,14 +137,17 @@ index 0000000..16a229b
 +	return 0;
 +}
 +
-+/* ---- MT6359P over the MT6885/6893 pwrap, WACS2 (pwrap_hal_6885.h) ---- */
++/* ---- MT6359P over the MT6885/6893 pwrap: ARB_V3, SWINF_2 (the device
++ * kernel's mtk-pmic-wrap.c, mt6885_regs / PWRAP_CAP_ARB_V3) ---- */
 +
 +#define PW_PA           0x10026000UL
-+#define PW_WACS2_CMD    0xc20
-+#define PW_WACS2_RDATA  0xc24
-+#define PW_WACS2_VLDCLR 0xc28
-+#define PW_FSM(v)       (((v) >> 16) & 7u)
-+#define PW_INIT(v)      (((v) >> 21) & 1u)
++#define PW_ACC          0xc80
++#define PW_WDATA        0xc84
++#define PW_RDATA        0xc94
++#define PW_VLDCLR       0xca4
++#define PW_STA          0xca8
++#define PW_FSM(v)       (((v) >> 1) & 7u)
++#define PW_INIT(v)      (((v) >> 15) & 1u)
 +#define PW_FSM_IDLE     0
 +#define PW_FSM_WFVLDCLR 6
 +
@@ -154,7 +157,7 @@ index 0000000..16a229b
 +pw_wait(uint32_t fsm)
 +{
 +	for (int i = 0; i < 100000; i++) {
-+		if (PW_FSM(readl(ac_pw + PW_WACS2_RDATA)) == fsm) {
++		if (PW_FSM(readl(ac_pw + PW_STA)) == fsm) {
 +			return 0;
 +		}
 +	}
@@ -164,25 +167,26 @@ index 0000000..16a229b
 +static int
 +pw_read(uint16_t adr, uint16_t *val)
 +{
-+	if (!PW_INIT(readl(ac_pw + PW_WACS2_RDATA)) || pw_wait(PW_FSM_IDLE)) {
++	if (!PW_INIT(readl(ac_pw + PW_STA)) || pw_wait(PW_FSM_IDLE)) {
 +		return -1;
 +	}
-+	writel((uint32_t)adr << 16, ac_pw + PW_WACS2_CMD);
++	writel(adr, ac_pw + PW_ACC);
 +	if (pw_wait(PW_FSM_WFVLDCLR)) {
 +		return -1;
 +	}
-+	*val = (uint16_t)(readl(ac_pw + PW_WACS2_RDATA) & 0xffff);
-+	writel(1, ac_pw + PW_WACS2_VLDCLR);
++	*val = (uint16_t)(readl(ac_pw + PW_RDATA) & 0xffff);
++	writel(1, ac_pw + PW_VLDCLR);
 +	return 0;
 +}
 +
 +static int
 +pw_write(uint16_t adr, uint16_t val)
 +{
-+	if (!PW_INIT(readl(ac_pw + PW_WACS2_RDATA)) || pw_wait(PW_FSM_IDLE)) {
++	if (!PW_INIT(readl(ac_pw + PW_STA)) || pw_wait(PW_FSM_IDLE)) {
 +		return -1;
 +	}
-+	writel((1u << 31) | ((uint32_t)adr << 16) | val, ac_pw + PW_WACS2_CMD);
++	writel(val, ac_pw + PW_WDATA);
++	writel((1u << 29) | adr, ac_pw + PW_ACC);
 +	return pw_wait(PW_FSM_IDLE);
 +}
 +
@@ -195,8 +199,7 @@ index 0000000..16a229b
 +{
 +	uint16_t v = 0;
 +	if (pw_read(con0, &v)) {
-+		pr_err("PMIC %s CON0 read failed: WACS2_EN=%08x INIT_DONE2=%08x RDATA=%08x\n",
-+		    name, readl(ac_pw + 0x90), readl(ac_pw + 0x94), readl(ac_pw + PW_WACS2_RDATA));
++		pr_err("PMIC %s CON0 read failed: SWINF_2 STA=%08x\n", name, readl(ac_pw + PW_STA));
 +		return;
 +	}
 +	pr_info("PMIC %s CON0=0x%04x%s\n", name, v, (v & LDO_EN) ? " (on)" : "");
@@ -289,6 +292,19 @@ index 0000000..16a229b
 +	}
 +	/* POS part 1: PMIC (the clock buffer is HW-controlled on this SoC) */
 +	ac_ldo("VCN18", VCN18_CON0);
++	{
++		/* VCN13 at 1.3 V as MediaTek's regulator_set_voltage(1300000):
++		 * MT6359 VCN13 VOSEL [11:8] in 0x202e, 0xd = 1.3 V, VOCAL [3:0] = 0 */
++		uint16_t v = 0;
++		if (pw_read(0x202e, &v) == 0) {
++			pr_info("PMIC VCN13 ANA_CON0=0x%04x (VOSEL %u VOCAL %u)\n", v, (v >> 8) & 0xf, v & 0xf);
++			if (((v >> 8) & 0xf) != 0xd || (v & 0xf) != 0) {
++				pw_write(0x202e, (uint16_t)((v & ~0x0f0fu) | (0xd << 8)));
++				pw_read(0x202e, &v);
++				pr_info("PMIC VCN13 ANA_CON0=0x%04x after 1.3 V\n", v);
++			}
++		}
++	}
 +	ac_ldo("VCN13", VCN13_CON0);
 +	/* POS part 2 */
 +	consys_set_if_pinmux_mt6893(1);
