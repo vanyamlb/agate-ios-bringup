@@ -134,3 +134,15 @@ lock screen with the clock (date "31 December": no RTC). 4 A55 cores; no
 touch yet (ST FTS on SPI6 needs its own driver). Android, its data and slot b
 are untouched; the Android part of `super` hashes the same before and after
 each root write.
+
+## Result: iOS home screen on the Xiaomi 11T (2026-11-19)
+
+With ruby's 0084 synthetic swipe kept in the patchset and a later window
+(`sweetautoswipe=150000 sweetautoswiperetry=30000 sweetautoswipeattempts=8`,
+`config/xnu9-autoswipe-late.cmdline`: on 4 A55 cores the lock screen comes
+later than on ruby's 6), the swipe unlocks to the iOS 16.7.16 home screen.
+Seen on screen: kernel text, the Xiaomi logo (LK's picture in the lower layer
+OVL0_2L L0 at 0x7b020000 shows through iOS's first transparent frame), the
+Apple logo, the lock screen, the home screen.
+
+Next: clear the lower layer in the shim; a polled ST FTS touch driver on SPI6.
