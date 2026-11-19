@@ -146,3 +146,20 @@ OVL0_2L L0 at 0x7b020000 shows through iOS's first transparent frame), the
 Apple logo, the lock screen, the home screen.
 
 Next: clear the lower layer in the shim; a polled ST FTS touch driver on SPI6.
+
+## Result: touch and 7 cores (2026-11-19)
+
+The ST FTS answered over SPI (id `36 40`, scan command acknowledged) but
+reported no touches: its analog supply AVDD = VMCH = **MT6360 LDO5** was off.
+The shim now powers it before XNU starts (`agatevmch=1`): bit-banged I2C5
+(SCL GPIO202, SDA GPIO203, slave `0x64`, CRC8 poly `0x07`), LDO5 VOUT
+(`0x0F`) = `0x50` (3.3 V), EN_CTRL2 (`0x0B`) |= `0x40`; the pins go back to
+I2C mode afterwards. With that, kernel patch 0093 (polled FTS on SPI6) drives
+SweetHID and touch works on the iOS home screen.
+
+`mkadt_agate.py --big 3` adds the A78 cores at MPIDR `0x400`-`0x600`
+(`0x700` runs the shim's frame kicker); every CPU node keeps
+`qcom,kryo470` in `compatible` (SweetCPU matches on it, without it the boot
+panics with "CPU registration timeout"). `config/xnu12-touch-big.cmdline`:
+`cpus=7`, `agatetouch=1`, `agatevmch=1`. The UI is a little faster (still
+CPU rendering: there is no GPU driver).

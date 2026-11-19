@@ -335,6 +335,170 @@ static int cmdline_has(const char *cl, const char *w)
 	return 0;
 }
 
+/* ---- MT6360 LDO block (I2C5, slave 0x64, CRC8) by GPIO bit-bang ----
+ * SCL5 = GPIO202, SDA5 = GPIO203 (FUNC 1). Open drain: low = DIR out with
+ * DO 0, high = DIR in (board pull-ups). LDO5 (VMCH, touch AVDD): EN_CTRL2
+ * 0x0B (bit 6 enable, bit 2 status), CTRL3 0x0F VOUT (0x50 = 3.3 V). */
+#define IC_SCL 202u
+#define IC_SDA 203u
+
+static void ic_lo(u32 p) { tg_out(p, 0); tg_dir(p, 1); }
+static void ic_hi(u32 p) { tg_dir(p, 0); }
+static void ic_dly(void) { delay_us(5); }
+
+static void ic_start(void)
+{
+	ic_hi(IC_SDA); ic_hi(IC_SCL); ic_dly();
+	ic_lo(IC_SDA); ic_dly();
+	ic_lo(IC_SCL); ic_dly();
+}
+
+static void ic_stop(void)
+{
+	ic_lo(IC_SDA); ic_dly();
+	ic_hi(IC_SCL); ic_dly();
+	ic_hi(IC_SDA); ic_dly();
+}
+
+static int ic_wr(u8 b)
+{
+	for (int i = 7; i >= 0; i--) {
+		if ((b >> i) & 1) ic_hi(IC_SDA); else ic_lo(IC_SDA);
+		ic_dly();
+		ic_hi(IC_SCL); ic_dly();
+		for (int t = 0; t < 1000 && !tg_in(IC_SCL); t++)
+			delay_us(1);
+		ic_lo(IC_SCL);
+	}
+	ic_hi(IC_SDA); ic_dly();
+	ic_hi(IC_SCL); ic_dly();
+	int ack = !tg_in(IC_SDA);
+	ic_lo(IC_SCL); ic_dly();
+	return ack;
+}
+
+static u8 ic_rd(int ack)
+{
+	u8 b = 0;
+	ic_hi(IC_SDA);
+	for (int i = 0; i < 8; i++) {
+		ic_dly();
+		ic_hi(IC_SCL); ic_dly();
+		b = (u8)((b << 1) | tg_in(IC_SDA));
+		ic_lo(IC_SCL);
+	}
+	if (ack) ic_lo(IC_SDA); else ic_hi(IC_SDA);
+	ic_dly();
+	ic_hi(IC_SCL); ic_dly();
+	ic_lo(IC_SCL);
+	ic_hi(IC_SDA);
+	return b;
+}
+
+static u8 crc8_07(const u8 *p, u32 n)
+{
+	u8 c = 0;
+	for (u32 i = 0; i < n; i++) {
+		c ^= p[i];
+		for (int b = 0; b < 8; b++)
+			c = (u8)((c & 0x80) ? (c << 1) ^ 0x07 : c << 1);
+	}
+	return c;
+}
+
+/* returns value 0..255, or 0x100 + step on error (0x1nn no ack, 0x2nn bad crc) */
+static u32 pm_read(u8 addr, u8 reg, int crc)
+{
+	u8 d, k;
+	ic_start();
+	if (!ic_wr((u8)(addr << 1))) { ic_stop(); return 0x101; }
+	if (!ic_wr(reg & 0x3f)) { ic_stop(); return 0x102; }
+	ic_start();
+	if (!ic_wr((u8)(addr << 1 | 1))) { ic_stop(); return 0x103; }
+	if (!crc) {
+		d = ic_rd(0);
+		ic_stop();
+		return d;
+	}
+	d = ic_rd(1);
+	k = ic_rd(0);
+	ic_stop();
+	u8 buf[3] = { (u8)(addr << 1 | 1), (u8)(reg & 0x3f), d };
+	if (crc8_07(buf, 3) != k)
+		return 0x200 | k;
+	return d;
+}
+
+static int pm_write(u8 addr, u8 reg, u8 v)
+{
+	u8 buf[3] = { (u8)(addr << 1), (u8)(reg & 0x3f), v };
+	u8 k = crc8_07(buf, 3);
+	int ok = 1;
+	ic_start();
+	ok &= ic_wr(buf[0]);
+	ok &= ic_wr(buf[1]);
+	ok &= ic_wr(v);
+	ok &= ic_wr(k);
+	ok &= ic_wr(0);
+	ic_stop();
+	return ok;
+}
+
+static void say_regs(struct con *c, const char *k, const u32 *v, u32 n)
+{
+	char l[LLEN];
+	l[0] = 0;
+	cat(l, k);
+	for (u32 i = 0; i < n; i++) {
+		cat(l, " ");
+		cathex(l, v[i], v[i] > 0xff ? 3 : 2);
+	}
+	con_line(c, l, COL_FG);
+}
+
+/* Read LDO5, turn it on at 3.3 V if it is off. Returns 1 if it was enabled now. */
+static int vmch_on(struct con *c)
+{
+	u32 r[6], id;
+	int changed = 0;
+
+	ic_hi(IC_SCL); ic_hi(IC_SDA);
+	tg_gpio(IC_SCL); tg_gpio(IC_SDA);
+	delay_us(50);
+	say(c, "I2C5 IDLE SCL/SDA ", (u32)(tg_in(IC_SCL) << 4 | tg_in(IC_SDA)), 2);
+	/* 9 clocks to free a stuck bus */
+	for (int i = 0; i < 9 && !tg_in(IC_SDA); i++) {
+		ic_lo(IC_SCL); ic_dly(); ic_hi(IC_SCL); ic_dly();
+	}
+	ic_stop();
+	id = pm_read(0x34, 0x00, 0);
+	say(c, "MT6360 PMU ID (WANT 5X) ", id, 3);
+	for (u32 i = 0; i < 6; i++)
+		r[i] = pm_read(0x64, (u8)(0x0A + i), 1);
+	say_regs(c, "LDO5 0A-0F", r, 6);
+	if (r[1] < 0x100 && r[5] < 0x100 && (!(r[1] & 0x40) || !(r[1] & 0x04))) {
+		if ((r[5] & 0x7f) != 0x50)
+			pm_write(0x64, 0x0F, (u8)((r[5] & 0x80) | 0x50));
+		pm_write(0x64, 0x0B, (u8)(r[1] | 0x40));
+		delay_ms(5);
+		for (u32 i = 0; i < 6; i++)
+			r[i] = pm_read(0x64, (u8)(0x0A + i), 1);
+		say_regs(c, "LDO5 AFTER", r, 6);
+		changed = 1;
+	}
+	con_line(c, (r[1] < 0x100 && (r[1] & 0x04)) ? "VMCH (AVDD) ON" : "VMCH STATE UNKNOWN/OFF",
+		 (r[1] < 0x100 && (r[1] & 0x04)) ? COL_OK : COL_ERR);
+	/* hand the pins back to the I2C controller */
+	ic_hi(IC_SCL); ic_hi(IC_SDA);
+	{
+		u32 sh = (IC_SCL % 8u) * 4u, sh2 = (IC_SDA % 8u) * 4u;
+		u32 m = rd32(TG_MODE(IC_SCL));
+		m = (m & ~(0xfu << sh) & ~(0xfu << sh2)) | (1u << sh) | (1u << sh2);
+		wr32(TG_MODE(IC_SCL), m);
+	}
+	return changed;
+}
+
 static void touch_probe(struct con *c)
 {
 	u8 e[8], id[4];
@@ -342,6 +506,8 @@ static void touch_probe(struct con *c)
 	u32 events = 0, touches = 0;
 
 	con_line(c, "TOUCH PROBE: ST FTS ON SPI6 (GPIO BIT-BANG)", COL_OK);
+	vmch_on(c);
+	kick();
 	say(c, "PINS BEFORE MODE ", tg_pins(0), 7);
 	say(c, "  DIR/OUT ", tg_pins(1), 7);
 	say(c, "  IN ", tg_pins(2), 7);
@@ -582,6 +748,8 @@ void shim_main(u64 dtb)
 	say(&c, "KICKER ON CPU ", kick_cpu, 3);
 	if (cmdline_has(p->cmdline, "agateshimtouch=1"))
 		touch_probe(&c);
+	else if (cmdline_has(p->cmdline, "agatevmch=1"))
+		vmch_on(&c);   /* touch AVDD for the kernel FTS driver (0093) */
 
 	for (u32 i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];

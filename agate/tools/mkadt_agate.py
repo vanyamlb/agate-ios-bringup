@@ -32,6 +32,7 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 4352
 UFS, UFS_SIZE = 0x11270000, 0x4000   # ufshci@11270000, reg 0x2300 rounded to a 16K page
 
 A55_MPIDRS = (0x000, 0x100, 0x200, 0x300)
+A78_MPIDRS = (0x400, 0x500, 0x600)   # 0x700 stays with the shim's frame kicker
 SWEET_ECID = 0x4147415445000001  # 'AGATE' + 1, synthetic
 BOOT_MANIFEST_HASH = hashlib.sha384(b'agate boot manifest').digest()
 
@@ -42,6 +43,8 @@ def main():
     ap.add_argument('out')
     ap.add_argument('--dump', action='store_true')
     ap.add_argument('--ufs', action='store_true', help='add /sweet-ufs (UFS host)')
+    ap.add_argument('--big', type=int, default=0, choices=range(4),
+                    help='also list N Cortex-A78 cores (MPIDR 0x400..); 0x700 runs the shim kicker')
     ap.add_argument('--d22ap', help='iPhone X device tree (DeviceTree.d22ap.im4p payload, '
                     'decompressed): its /product node feeds MobileGestalt')
     a = ap.parse_args()
@@ -81,11 +84,13 @@ def main():
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
     cpu_nodes = []
-    for i, mpidr in enumerate(A55_MPIDRS):
+    for i, mpidr in enumerate(A55_MPIDRS + A78_MPIDRS[:a.big]):
+        big = mpidr in A78_MPIDRS
         cpu_nodes.append(node(f'cpu{i}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('arm,cortex-a55') + cstr('qcom,kryo470') + cstr('ARM,v8')),
+            # SweetCPU matches 'qcom,kryo470' (IONameMatch): every core needs it
+            ('compatible', (cstr('arm,cortex-a78') if big else cstr('arm,cortex-a55')) + cstr('qcom,kryo470') + cstr('ARM,v8')),
             ('reg', u32(mpidr)),
             ('cpu-id', u32(i)),
             ('cluster-id', u32(0)),
@@ -96,7 +101,7 @@ def main():
             ('l3-cache-id', u32(0)),
             ('state', cstr('running' if i == 0 else 'stopped')),
             ('timebase-frequency', u32(TIMEBASE)),
-            ('clock-frequency', u32(2000000000)),
+            ('clock-frequency', u32(2600000000 if big else 2000000000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(TIMEBASE)),
