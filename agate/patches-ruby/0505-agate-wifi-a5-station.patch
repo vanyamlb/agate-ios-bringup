@@ -27,10 +27,49 @@ index 4b10ba7..c190d32 100644
  bsd/dev/ruby_raw.c			standard
  bsd/dev/ruby_probe.c			standard
 diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
-index 8c791ea..2715a51 100644
+index 8c791ea..cacd81b 100644
 --- a/bsd/dev/agate_conninfra/agate_conninfra.c
 +++ b/bsd/dev/agate_conninfra/agate_conninfra.c
-@@ -517,6 +517,49 @@ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
+@@ -454,8 +454,16 @@ ac_wfdma_init(void)
+ }
+ 
+ /* INIT_CMD: [CONNAC2X TXD 32 B][INIT_HIF_TX_HEADER 32 B][payload] on TX ring 17 */
++static int ac_init_cmd_eid(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status, uint8_t want_eid, uint32_t wait_ms);
++
+ static int
+ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
++{
++	return ac_init_cmd_eid(cid, payload, plen, status, 1, 2000);
++}
++
++static int
++ac_init_cmd_eid(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status, uint8_t want_eid, uint32_t wait_ms)
+ {
+ 	uint32_t len = 64 + plen, i, w;
+ 	vm_offset_t buf = pool + TXB_OFF + ac_txidx * TXB_SIZE;
+@@ -487,7 +495,7 @@ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
+ 	writel(ac_txidx, wd1 + 0x418);               /* CIDX */
+ 	pr_info("A3b: TX CMD 0x%02x seq %u len %u\n", cid, seq, len);
+ 
+-	for (i = 0; i < 2000; i++) {                 /* answer on DMA1 RX ring 0 */
++	for (i = 0; i < wait_ms; i++) {              /* answer on DMA1 RX ring 0 */
+ 		vm_offset_t rd = pool + RXR_OFF + ac_rxidx * 16;
+ 		uint32_t d1 = readl(rd + 4);
+ 		if (d1 & (1u << 31)) {
+@@ -506,7 +514,11 @@ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
+ 			*status = ev2 & 0xff;
+ 			pr_info("A3b: event EID %u seq %u status %u cid 0x%02x\n",
+ 			    eid, eseq, *status, (ev2 >> 8) & 0xff);
+-			return (eid == 1 && eseq == seq) ? 0 : -2;
++			if (want_eid != 1) {
++				pr_info("A3b: event body %08x %08x %08x %08x %08x %08x\n", readl(rb + 32), readl(rb + 36),
++				    readl(rb + 40), readl(rb + 44), readl(rb + 48), readl(rb + 52));
++			}
++			return (eid == want_eid && (want_eid != 1 || eseq == seq)) ? 0 : -2;
+ 		}
+ 		delay(1000);
+ 	}
+@@ -517,6 +529,49 @@ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
  /* ---- A4a: firmware commands, NVRAM, BSS activate, scan ---- */
  static uint8_t ac_mac[6];
  
@@ -80,7 +119,7 @@ index 8c791ea..2715a51 100644
  /* CONNAC2X_WIFI_CMD: TXD + {len, pq, CID, 0xA0, set/query, seq, ...}; returns seq */
  static uint8_t
  ac_cmd(uint8_t cid, int set, const void *payload, uint32_t plen)
-@@ -530,6 +573,9 @@ ac_cmd(uint8_t cid, int set, const void *payload, uint32_t plen)
+@@ -530,6 +585,9 @@ ac_cmd(uint8_t cid, int set, const void *payload, uint32_t plen)
  	if (seq == 0) {
  		seq = ++ac_seq;
  	}
@@ -90,7 +129,7 @@ index 8c791ea..2715a51 100644
  	for (i = 0; i < 64; i += 4) {
  		writel(0, buf + i);
  	}
-@@ -679,6 +725,91 @@ ac_pump(uint8_t want_seq, uint8_t want_eid)
+@@ -679,6 +737,91 @@ ac_pump(uint8_t want_seq, uint8_t want_eid)
  	return hit;
  }
  
@@ -182,7 +221,7 @@ index 8c791ea..2715a51 100644
  static int
  ac_wait(uint8_t seq, uint8_t eid, uint32_t ms)
  {
-@@ -744,6 +875,18 @@ ac_scan(vm_offset_t blob, const volatile struct agfw_ent *e, uint32_t n)
+@@ -744,6 +887,18 @@ ac_scan(vm_offset_t blob, const volatile struct agfw_ent *e, uint32_t n)
  	}
  	pr_info("A4a: NVRAM %u fragments sent\n", nfrag);
  
@@ -201,6 +240,71 @@ index 8c791ea..2715a51 100644
  	/* 3. activate the AIS BSS (nicActivateNetworkEx) */
  	uint8_t act[12] = { 0, 1, 0 /* AIS */, 0, 0, 0, 0, 0, 0, 0, 4 /* BMC WTBL */, 0 };
  	memcpy(act + 4, ac_mac, 6);
+@@ -832,6 +987,64 @@ ac_fw_download(void)
+ 	if (r || st) {
+ 		return -1;
+ 	}
++	{
++		/*
++		 * 1b. INIT_CMD_ID_PHY_ACTION (pre_cal.c wlanSendPhyAction, CFG_SUPPORT_PRE_ON_PHY_ACTION=1 on
++		 * conninfra chips; wlanDownloadFW sends it between the patch and the RAM code): RF calibration
++		 * (FORCE_CAL_REQ: no backup in EMI yet), NVRAM tags 7..9 (2.4 GHz common, 5 GHz common, system)
++		 * padded to 4, and this phone's FEM data -- none: "No ConnFem context" in Android's dmesg.
++		 * HAL_PHY_ACTION_TLV_HEADER {0x556789AA, tags, version 1, length} + TLVs {tag, length, data}.
++		 */
++		static uint8_t pa[512];
++		uint32_t nvoff = 0, nvlen = 0, at = 8, d0 = 0, d1 = 0;
++		for (i = 0; i < n; i++) {
++			if (e[i].kind == 3 && e[i].name[0] == 'n') {
++				nvoff = e[i].off;
++				nvlen = e[i].len;
++			}
++		}
++#define NVB2(o) ((uint8_t)((readl(blob + ((nvoff + (o)) & ~3u)) >> (8 * ((nvoff + (o)) & 3))) & 0xff))
++		for (uint32_t off = 256; nvlen && off + 3 <= nvlen;) {
++			uint32_t t = NVB2(off), l = NVB2(off + 1) | (NVB2(off + 2) << 8);
++			if (t == 0 && l == 0 && off > 256) {
++				break;
++			}
++			if (t == 7) {
++				d0 = off;
++			}
++			if (t == 10 && d0) {
++				d1 = off;
++				break;
++			}
++			off += 3 + l;
++		}
++		memset(pa, 0, sizeof(pa));
++		uint32_t dlen = d1 > d0 ? d1 - d0 : 0;
++		uint32_t dpad = (dlen + 3) & ~3u;
++		if (dlen == 0 || dpad > 300) {
++			pr_err("A3b: PHY_ACTION: NVRAM tags 7..9 not found\n");
++		} else {
++			pa[at] = 1; pa[at + 2] = 4;                  /* TAG_CAL, 4 bytes */
++			pa[at + 4] = 0x01;                           /* HAL_PHY_ACTION_CAL_FORCE_CAL_REQ */
++			at += 8;
++			pa[at] = 0; pa[at + 2] = dpad & 0xff; pa[at + 3] = dpad >> 8;     /* TAG_NVRAM */
++			for (uint32_t k = 0; k < dlen; k++) {
++				pa[at + 4 + k] = NVB2(d0 + k);
++			}
++			at += 4 + dpad;
++			pa[at] = 2; pa[at + 2] = 104;               /* TAG_COM_FEM: id 0, no pins */
++			at += 4 + 104;
++			pa[at] = 3; pa[at + 2] = 40;                /* TAG_LAA: none */
++			at += 4 + 40;
++			pa[0] = 0xaa; pa[1] = 0x89; pa[2] = 0x67; pa[3] = 0x55;
++			pa[4] = 4;                                   /* tags */
++			pa[5] = 1;                                   /* HAL_PHY_ACTION_VERSION */
++			pa[6] = (at - 8) & 0xff; pa[7] = (at - 8) >> 8;
++			r = ac_init_cmd_eid(0x08, pa, at, &st, 5 /* INIT_EVENT_ID_PHY_ACTION */, 6000);
++			pr_info("A3b: PHY_ACTION (calibration, %u bytes of NVRAM) -> %d\n", dlen, r);
++		}
++#undef NVB2
++	}
+ 	for (i = 0; i < n; i++) {                    /* 2. N9 RAM code, plain regions */
+ 		if (e[i].kind == 2 && e[i].name[0] == 'r') {
+ 			ac_dynmem_write(e[i].dest, blob + e[i].off, e[i].len);
 diff --git a/bsd/dev/agate_wifi.c b/bsd/dev/agate_wifi.c
 index 751b562..9455586 100644
 --- a/bsd/dev/agate_wifi.c
@@ -237,10 +341,10 @@ index 751b562..9455586 100644
  		printf("AGATE WIFI: step %d armed\n", aw_step);
 diff --git a/bsd/dev/agate_wlan/agate_mtkwifi.c b/bsd/dev/agate_wlan/agate_mtkwifi.c
 new file mode 100644
-index 0000000..9a0a696
+index 0000000..dff7a4c
 --- /dev/null
 +++ b/bsd/dev/agate_wlan/agate_mtkwifi.c
-@@ -0,0 +1,1118 @@
+@@ -0,0 +1,1124 @@
 +/*
 + * agate (Xiaomi 11T, MT6893): the station -- scan, join (open or WPA2 with a passphrase), frames --
 + * on the running N9 firmware (bsd/dev/agate_conninfra/agate_conninfra.c, agatewifi >= 8), behind the
@@ -728,7 +832,7 @@ index 0000000..9a0a696
 +static bool
 +wf_scan(void)
 +{
-+	static uint8_t scan[1188], done[64];
++	static uint8_t scan[1188], done[512];
 +	static uint8_t scan_seq;
 +	const uint32_t began = wf_ms();
 +	int got;
@@ -751,9 +855,15 @@ index 0000000..9a0a696
 +	if (!wf_net.joined) {
 +		wf_bss_active(false);
 +	}
-+	printf("agate wifi: scan %u %s in %u ms: %u networks heard, %u frames (done: %02x %02x %02x %02x %02x %02x %02x %02x)\n",
-+	    scan_seq, got >= 0 ? "done" : "NOT DONE", wf_ms() - began, wf_heard_count, wf_frames, done[0], done[1], done[2],
-+	    done[3], done[4], done[5], done[6], done[7]);
++	{
++		uint32_t bcn = 0, b24 = 0, b5 = 0;
++		memcpy(&bcn, done + 8, 4);
++		memcpy(&b24, done + 340, 4);
++		memcpy(&b5, done + 344, 4);
++		printf("agate wifi: scan %u %s in %u ms: %u networks heard, %u frames; the firmware: %u channels, %u beacons "
++		    "(2.4 GHz %u, 5 GHz %u)\n", scan_seq, got >= 0 ? "done" : "NOT DONE", wf_ms() - began, wf_heard_count, wf_frames,
++		    done[4], bcn, b24, b5);
++	}
 +	if (scan_seq <= 2) {
 +		agate_wf_dump("after scan");
 +	}
