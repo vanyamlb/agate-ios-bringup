@@ -19,6 +19,7 @@ on:
     branches: [main]
     paths:
       - "agate/ci/**"
+      - "agate/patches/**"
       - "agate/shim/**"
       - "agate/tools/mkadt_agate.py"
       - "agate/config/**"
