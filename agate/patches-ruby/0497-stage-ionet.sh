@@ -31,6 +31,33 @@ cp "$ionet_tmp"/*.cpp "$ionet_tmp"/*.h "$ionet_tmp/APPLE_LICENSE" "$target/"
 # The sources include their public headers as <IOKit/network/...>.
 cp "$ionet_tmp"/*.h "$target/include/IOKit/network/"
 
+# Built into the kernel, <sys/mbuf.h>, <net/if.h>, ... pull in C++ templates
+# (kern/startup.h), which may not sit inside extern "C": unwrap the blocks
+# that only hold #include lines (the kext sees the C-only KPI headers).
+python3 - "$target" <<'PY'
+import re, sys
+from pathlib import Path
+blk = re.compile(r'extern "C" \{\n((?:[ \t]*(?:#include[^\n]*|#define[^\n]*|//[^\n]*)?\n)+)\}[ \t]*\n')
+n = 0
+for f in sorted(Path(sys.argv[1]).glob('*.cpp')):
+    text = f.read_text()
+    new, k = blk.subn(lambda m: m.group(1), text)
+    if k:
+        f.write_text(new)
+        n += k
+cur = Path(sys.argv[1]) / 'IOMbufMemoryCursor.cpp'
+text = cur.read_text()
+decl = ('__BEGIN_DECLS\n#include <IOKit/assert.h>\n\n#include <sys/param.h>\n'
+        '#include <sys/mbuf.h>\nstruct mbuf * m_getpackets(')
+if text.count(decl) != 1:
+    raise SystemExit(f'IONetworkingFamily source changed: {cur}')
+cur.write_text(text.replace(decl, '#include <IOKit/assert.h>\n#include <sys/param.h>\n'
+                            '#include <sys/mbuf.h>\n__BEGIN_DECLS\nstruct mbuf * m_getpackets('))
+print(f'unwrapped {n} extern "C" include blocks')
+if n < 5:
+    raise SystemExit('IONetworkingFamily source changed: expected >= 5 include blocks')
+PY
+
 # Kernel builds use -nostdinc; IONetworkController.cpp needs the SDK's macros.
 ionet_sdk=$(xcrun --sdk macosx --show-sdk-path)
 cp "$ionet_sdk/usr/include/TargetConditionals.h" "$target/"

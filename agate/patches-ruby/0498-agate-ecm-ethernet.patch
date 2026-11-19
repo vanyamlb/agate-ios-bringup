@@ -141,10 +141,10 @@ index b14109a..1601d95 100644
  void agate_ecm_link_poll(vm_offset_t mac);
 diff --git a/iokit/Kernel/arm/AgateECMEthernet.cpp b/iokit/Kernel/arm/AgateECMEthernet.cpp
 new file mode 100644
-index 0000000..c9e6018
+index 0000000..01c8364
 --- /dev/null
 +++ b/iokit/Kernel/arm/AgateECMEthernet.cpp
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,195 @@
 +/*
 + * agate (Xiaomi 11T): the USB CDC-ECM link (bsd/dev/agate_ecm.c) as a real
 + * IOEthernetController from the built-in IONetworkingFamily (0497), so the
@@ -162,6 +162,7 @@ index 0000000..c9e6018
 +#include <IOKit/network/IOEthernetController.h>
 +#include <IOKit/network/IOEthernetInterface.h>
 +#include <IOKit/network/IONetworkMedium.h>
++#include <IOKit/network/IOOutputQueue.h>
 +#include <sys/kpi_mbuf.h>
 +
 +extern "C" int agate_ecm_queue_frame(const uint8_t *frame, uint32_t len);
@@ -340,18 +341,20 @@ index 0000000..c9e6018
 +}
 +#endif /* SWEET */
 diff --git a/iokit/conf/Makefile.template b/iokit/conf/Makefile.template
-index fa7c402..3e2e1ab 100644
+index fa7c402..cbb66f5 100644
 --- a/iokit/conf/Makefile.template
 +++ b/iokit/conf/Makefile.template
-@@ -65,7 +65,7 @@ COMP_SUBDIRS = \
+@@ -65,8 +65,8 @@ COMP_SUBDIRS = \
  # -Wno-cast-align
  # agate: IONetworkingFamily built in (iokit/sweet_ionet), compiled like its kext.
  AGATE_IONET_ROOT = $(SRCROOT)/iokit/sweet_ionet
 -AGATE_IONET_OBJS = IOEthernetController.cpo IOEthernetInterface.cpo IOKernelDebugger.cpo IOMbufMemoryCursor.cpo IONetworkController.cpo IONetworkData.cpo IONetworkInterface.cpo IONetworkMedium.cpo IONetworkStack.cpo IONetworkUserClient.cpo IOOutputQueue.cpo IOPacketQueue.cpo
+-$(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CFLAGS_ADD += -D__PRIVATE_SPI__ -I$(AGATE_IONET_ROOT)/include -I$(AGATE_IONET_ROOT)))
 +AGATE_IONET_OBJS = AgateECMEthernet.cpo IOEthernetController.cpo IOEthernetInterface.cpo IOKernelDebugger.cpo IOMbufMemoryCursor.cpo IONetworkController.cpo IONetworkData.cpo IONetworkInterface.cpo IONetworkMedium.cpo IONetworkStack.cpo IONetworkUserClient.cpo IOOutputQueue.cpo IOPacketQueue.cpo
- $(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CFLAGS_ADD += -D__PRIVATE_SPI__ -I$(AGATE_IONET_ROOT)/include -I$(AGATE_IONET_ROOT)))
++$(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CFLAGS_ADD += -D__PRIVATE_SPI__ -include libkern/c++/OSMetaClass.h -I$(AGATE_IONET_ROOT)/include -I$(AGATE_IONET_ROOT) -idirafter $(SRCROOT)/bsd))
  $(foreach o,$(AGATE_IONET_OBJS),$(eval $(o)_CXXWARNFLAGS_ADD += -w -Wno-error))
  
+ IODataQueue.cpo_CXXWARNFLAGS_ADD += -Wno-cast-align
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 index 924fdb1..4ad72ae 100644
 --- a/iokit/conf/files.arm64
