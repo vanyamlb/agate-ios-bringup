@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/agate_wlan/agate_mtkwifi.c b/bsd/dev/agate_wlan/agate_mtkwifi.c
+--- a/bsd/dev/agate_wlan/agate_mtkwifi.c
++++ b/bsd/dev/agate_wlan/agate_mtkwifi.c
+@@ -1044,8 +1044,11 @@
+ wf_op_state(struct redwood_sta_state *state)
+ {
+ 	bzero(state, sizeof(*state));
+-	state->phase = wf_net.joined ? REDWOOD_STA_JOINED : wf_phase == REDWOOD_STA_JOINED ? REDWOOD_STA_IDLE : wf_phase;
+-	if (wf_net.joined) {
++	/* joined permits the WPA EAPOL exchange. linked means the keys are ready. */
++	const bool linked = wf_net.linked;
++
++	state->phase = linked ? REDWOOD_STA_JOINED : wf_phase == REDWOOD_STA_JOINED ? REDWOOD_STA_IDLE : wf_phase;
++	if (linked) {
+ 		state->bss = wf_net.bss;
+ 	}
+ 	state->last_error = wf_last_error;
+diff --git a/bsd/dev/agate_wlan/redwood_apple80211.c b/bsd/dev/agate_wlan/redwood_apple80211.c
+--- a/bsd/dev/agate_wlan/redwood_apple80211.c
++++ b/bsd/dev/agate_wlan/redwood_apple80211.c
+@@ -730,9 +730,13 @@
+ 	proc_selfname(who, sizeof(who));
+ 	error = is_set ? set(request, what, sizeof(what)) : get(request);
+ 	note(request, is_set, error);
+-	/* (a request that is repeated for ever is said a few hundred times) */
+-	if (said < 800) {
+-		said++;
++	/* Preserve configd's association probes even after wifid consumes the trace budget. */
++	const bool config_probe = !is_set && (request->req_type == 1 || request->req_type == 103) &&
++	    strcmp(who, "configd") == 0;
++	if (config_probe || said < 800) {
++		if (!config_probe) {
++			said++;
++		}
+ 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+ 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
+ 		    EOPNOTSUPP ? "REFUSED\n" : "");
