@@ -43,7 +43,7 @@ static int render(id<MTLDevice> device)
     NSString *shader = @"#include <metal_stdlib>\n"
         "using namespace metal;\n"
         "vertex float4 vs(uint id [[vertex_id]]) {\n"
-        "  const float2 positions[3] = { {-0.8,-0.8}, {0.8,-0.8}, {0,0.8} };\n"
+        "  const float2 positions[3] = { float2(-0.8,-0.8), float2(0.8,-0.8), float2(0,0.8) };\n"
         "  return float4(positions[id], 0, 1);\n"
         "}\n"
         "fragment float4 fs() { return float4(1, 0, 0, 1); }\n";
@@ -128,7 +128,7 @@ int main(void)
         }
         Class deviceClass = [bundle classNamed:@"VMDevice"];
         id<AgateMetalDeviceFactory> factory = (id)[deviceClass alloc];
-        id<MTLDevice> device = [factory initWithAcceleratorPort:MACH_PORT_NULL];
+        id<MTLDevice> device = (id)[factory initWithAcceleratorPort:MACH_PORT_NULL];
         if (!device) {
             return fail(@"the RAM-volume plug-in could not open the G77");
         }
