@@ -1,0 +1,67 @@
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+index aa4a3a6..fbcccd3 100644
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -18,6 +18,7 @@
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOLib.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/network/IOEthernetController.h>
+ #include <IOKit/network/IOEthernetInterface.h>
+@@ -282,10 +283,54 @@ AgateWLAN::input(const uint8_t *data, uint32_t len)
+ 	fNetif->inputPacket(m, len, 0);
+ }
+ 
++/*
++ * launchd starts wifid only when the device tree has a node named "wlan" or "marconi-wifi"
++ * (com.apple.wifid.plist _LimitLoadToDeviceTree; launchd asks io_device_tree_entry_exists_with_name,
++ * which is IODTFindMatchingEntries over the whole IODeviceTree plane by name). The iPhone's is
++ * /arm-io/uart4/wlan; ours is made here, before launchd reads its plists, with the phone's address.
++ */
++static void
++agate_wlan_dt_node(const uint8_t *mac)
++{
++	IORegistryEntry *parent = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
++	IORegistryEntry *node;
++
++	if (parent == NULL) {
++		parent = IORegistryEntry::fromPath("/", gIODTPlane);
++	}
++	if (parent == NULL) {
++		IOLog("AGATE WLAN: no device tree to put /wlan in\n");
++		return;
++	}
++	node = new IORegistryEntry;
++	if (node != NULL && node->init()) {
++		static const char name[] = "wlan";
++		OSData *d = OSData::withBytes(name, sizeof(name));
++		node->setName(name);
++		if (d != NULL) {
++			node->setProperty("name", d);
++			d->release();
++		}
++		d = OSData::withBytes(mac, 6);
++		if (d != NULL) {
++			node->setProperty("local-mac-address", d);
++			d->release();
++		}
++		node->setProperty("device_type", "wlan");
++		if (node->attachToParent(parent, gIODTPlane)) {
++			IOLog("AGATE WLAN: device tree node /arm-io/wlan made (launchd starts wifid for it)\n");
++		}
++		node->release();
++	}
++	parent->release();
++}
++
+ extern "C" int
+ agate_wlan_create(const uint8_t *mac)
+ {
+ 	AgateWLAN *w = new AgateWLAN;
++
++	agate_wlan_dt_node(mac);
+ 	IOService *prov = IOService::getResourceService();
+ 
+ 	if (w == NULL || !w->init(NULL)) {
