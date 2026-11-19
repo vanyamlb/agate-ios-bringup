@@ -55,6 +55,25 @@ reset (`0x18000018[0]` = 0), WM CPU out of reset (`0x18000010[0]` = 1), ROM read
 at `0x184c1604`. Next (A3b): WFDMA rings, ROM patch (`soc3_0_patch_wmmcu`) and N9 RAM code
 (`WIFI_RAM_CODE_soc3_0_1a_1.bin`, kept in the blob as kind-2 entries) over the connac2 MCU protocol.
 
+**A3b (2026-11-19, patch 0503, `agatewifi=6`).** The N9 Wi-Fi firmware runs under XNU. As
+gen4m soc3_0 does (`CFG_DOWNLOAD_DYN_MEMORY_MAP=1`, `CFG_ROM_PATCH_NO_SEM_CTRL=1`): driver own
+(`0x18060010` HOST_CLR_OWN), host WFDMA1 TX ring 17 (commands) and RX ring 0 (events) in
+Android's `wifi-reserve-memory` at `0xbd000000` (below 4 GiB, uncached), manual prefetch as
+`soc3_0asicConnac2xWfdmaManualPrefetch`; the ROM patch (30-byte `PATCH_FORMAT_T` header) is
+written to WF `0x00100000` through the AP2WF window (`CONN_CFG_AP2WF_REMAP_1` = target, data at
+`0x18500000`), then `INIT_CMD 0x40`; the plain RAM code regions the same way, the two EMI regions
+(bit 7) by the shim, then `INIT_CMD 0x41`:
+
+```
+A3b: TX CMD 0x40 seq 1 len 68 -> event EID 1 seq 1 status 0      (3 ms)
+A3b: 5712/5120/29408 B to WF 00104000/00201c00/00404000
+A3b: TX CMD 0x41 seq 2 len 72 -> event EID 1 seq 2 status 0      (18 ms)
+A3b: CONN_ON_MISC=00000003 -> N9 Wi-Fi FIRMWARE IS RUNNING
+```
+
+Init commands: CONNAC2X TXD (DW0 bytes | PKT_FT 2, DW1 HF 1) + `INIT_HIF_TX_HEADER`
+(`PQ_ID 0x8000`, CID, `0xA0`, seq); the answer is 24 bytes of RXD then `INIT_WIFI_EVENT`.
+
 ## Material collected (not in the repository: the owner's own phone data)
 
 `agate-data/wifi-fw/` on the build machine, read from the running Android with root:
