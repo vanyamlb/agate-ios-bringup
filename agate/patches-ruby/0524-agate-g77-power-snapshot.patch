@@ -1,0 +1,94 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -125,6 +125,7 @@
+ bsd/dev/ruby_usb_io.c			standard
+ bsd/dev/agate_ecm.c			standard
+ bsd/dev/agate_wifi.c			standard
++bsd/dev/agate_gpu.c			standard
+ bsd/dev/agate_conninfra/agate_conninfra.c	standard
+ bsd/dev/agate_conninfra/mtk/mt6893_pos.c	standard
+ bsd/dev/agate_wlan/agate_mtkwifi.c	standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -910,6 +910,9 @@
+ 	/* agate: Wi-Fi bring-up probe (agatewifi=N) */
+ 	extern void agate_wifi_start(void);
+ 	agate_wifi_start();
++	/* agate: optional read-only Mali power and clock snapshot */
++	extern void agate_gpu_probe(void);
++	agate_gpu_probe();
+ #endif
+ 
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
+diff --git a/bsd/dev/agate_gpu.c b/bsd/dev/agate_gpu.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/agate_gpu.c
+@@ -0,0 +1,65 @@
++/*
++ * Xiaomi 11T (agate, MT6893): snapshot of the Mali-G77 dependencies.
++ * Boot-arg agategpu=1 reads the always-on controllers without changing them.
++ * Register layout cross-checked with the agate FDT and the MT6893 X6739
++ * reference (hakios_mali_mt6893.h, commit 9eeec2d2e12f).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define AGATE_GPU_TOPCKGEN_PA    0x10000000UL
++#define AGATE_GPU_INFRACFG_PA    0x10001000UL
++#define AGATE_GPU_SPM_PA         0x10006000UL
++#define AGATE_GPU_MFG_SEL        0x0060
++#define AGATE_GPU_MFG_SEL_SHIFT  8
++#define AGATE_GPU_MFG_SEL_MASK   3u
++#define AGATE_GPU_MFG_SEL_GATE   (1u << 15)
++#define AGATE_GPU_SPM_STATUS     0x016c
++#define AGATE_GPU_SPM_STATUS_2   0x0170
++#define AGATE_GPU_MFG_DOMAINS    0x01fcu     /* MFG0 through MFG6 */
++
++static uint32_t
++agate_gpu_read(vm_offset_t base, uint32_t offset)
++{
++	return *(volatile uint32_t *)(base + offset);
++}
++
++void
++agate_gpu_probe(void)
++{
++	int step = 0;
++	vm_offset_t clocks, infra, spm;
++	uint32_t clock, status, status2;
++	uint32_t prot0, prot1, prot2, prot3;
++
++	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || step != 1) {
++		return;
++	}
++
++	clocks = ml_io_map(AGATE_GPU_TOPCKGEN_PA, 0x1000);
++	infra = ml_io_map(AGATE_GPU_INFRACFG_PA, 0x1000);
++	spm = ml_io_map(AGATE_GPU_SPM_PA, 0x1000);
++	if (clocks == 0 || infra == 0 || spm == 0) {
++		printf("AGATE GPU: always-on register map failed\n");
++		return;
++	}
++
++	clock = agate_gpu_read(clocks, AGATE_GPU_MFG_SEL);
++	status = agate_gpu_read(spm, AGATE_GPU_SPM_STATUS);
++	status2 = agate_gpu_read(spm, AGATE_GPU_SPM_STATUS_2);
++	prot0 = agate_gpu_read(infra, 0x0228) & ((1u << 21) | (1u << 22));
++	prot1 = agate_gpu_read(infra, 0x0724) & ((1u << 5) | (1u << 6) | (1u << 7));
++	prot2 = agate_gpu_read(infra, 0x0bc4) & ((1u << 17) | (1u << 19));
++	prot3 = agate_gpu_read(infra, 0x0258) & ((1u << 19) | (1u << 20) | (1u << 21));
++
++	printf("AGATE GPU: read-only MFG clock %#x parent %u gated %u, power %#x/%#x (both %#x of %#x)\n",
++	    clock, (clock >> AGATE_GPU_MFG_SEL_SHIFT) & AGATE_GPU_MFG_SEL_MASK,
++	    (unsigned)((clock & AGATE_GPU_MFG_SEL_GATE) != 0), status, status2,
++	    status & status2 & AGATE_GPU_MFG_DOMAINS, AGATE_GPU_MFG_DOMAINS);
++	printf("AGATE GPU: bus protection ACKs %#x %#x %#x %#x\n", prot0, prot1, prot2, prot3);
++}
++#endif
