@@ -227,6 +227,194 @@ static void fail(struct con *c, const char *why)
 	}
 }
 
+/* ---- touch probe (payload cmdline contains "agateshimtouch=1") ----
+ *
+ * Same bring-up as kernel patch 0093, bare metal: SPI mode 0 bit-banged on
+ * the SPI6 pins in GPIO mode (CLK 0, CS 1, MISO 2, MOSI 3), DVDD GPIO27,
+ * reset GPIO20; reads the ST FTS (FTM5 SALIXP, id 36 40). Results stay on the
+ * screen (the kicker refreshes it), then the boot continues. Only the touch
+ * pins are written. */
+#define TG_PA 0x10005000UL
+#define TG_DIR(p) (TG_PA + 0x000u + ((p) / 32u) * 0x10u)
+#define TG_DO(p) (TG_PA + 0x100u + ((p) / 32u) * 0x10u)
+#define TG_DI(p) (TG_PA + 0x200u + ((p) / 32u) * 0x10u)
+#define TG_MODE(p) (TG_PA + 0x300u + ((p) / 8u) * 0x10u)
+
+static void delay_us(u32 us)
+{
+	u64 end = cntpct() + cntfrq() / 1000000 * us + 1;
+	while (cntpct() < end)
+		;
+}
+
+static void tg_out(u32 p, int v) { wr32(TG_DO(p) + (v ? 4u : 8u), 1u << (p % 32u)); }
+static void tg_dir(u32 p, int o) { wr32(TG_DIR(p) + (o ? 4u : 8u), 1u << (p % 32u)); }
+static int tg_in(u32 p) { return (rd32(TG_DI(p)) >> (p % 32u)) & 1; }
+static void tg_gpio(u32 p)
+{
+	u32 sh = (p % 8u) * 4u;
+	wr32(TG_MODE(p), rd32(TG_MODE(p)) & ~(0xfu << sh));
+}
+
+static u32 tg_pins(int which)
+{
+	static const u32 pins[7] = { 0, 1, 2, 3, 20, 21, 27 };
+	u32 w = 0;
+	for (u32 i = 0; i < 7; i++) {
+		u32 p = pins[i], v;
+		if (which == 0)
+			v = (rd32(TG_MODE(p)) >> ((p % 8u) * 4u)) & 0xfu;
+		else if (which == 1)
+			v = ((rd32(TG_DIR(p)) >> (p % 32u)) & 1u) | (((rd32(TG_DO(p)) >> (p % 32u)) & 1u) << 1);
+		else
+			v = (u32)tg_in(p);
+		w |= v << (i * 4u);
+	}
+	return w;
+}
+
+static void tg_spi(const u8 *tx, u32 ntx, u8 *rx, u32 nrx)
+{
+	tg_out(1, 0);
+	delay_us(2);
+	for (u32 i = 0; i < ntx + nrx; i++) {
+		u8 out = i < ntx ? tx[i] : 0, in = 0;
+		for (int b = 7; b >= 0; b--) {
+			tg_out(3, (out >> b) & 1);
+			delay_us(1);
+			tg_out(0, 1);
+			in = (u8)((in << 1) | tg_in(2));
+			delay_us(1);
+			tg_out(0, 0);
+		}
+		if (i >= ntx)
+			rx[i - ntx] = in;
+	}
+	tg_out(3, 0);
+	delay_us(2);
+	tg_out(1, 1);
+	delay_us(20);
+}
+
+static void tg_read(u8 cmd, int has_addr, u32 addr, u8 *buf, u32 len)
+{
+	u8 tx[5] = { cmd, (u8)(addr >> 24), (u8)(addr >> 16), (u8)(addr >> 8), (u8)addr };
+	u8 rx[9];
+	tg_spi(tx, has_addr ? 5 : 1, rx, len + 1);
+	for (u32 i = 0; i < len; i++)
+		buf[i] = rx[i + 1];
+}
+
+static void tg_regw(u32 addr, u8 v)
+{
+	u8 tx[6] = { 0xFA, (u8)(addr >> 24), (u8)(addr >> 16), (u8)(addr >> 8), (u8)addr, v };
+	tg_spi(tx, 6, 0, 0);
+}
+
+static void say_hex(struct con *c, const char *k, const u8 *b, u32 n)
+{
+	char l[LLEN];
+	l[0] = 0;
+	cat(l, k);
+	for (u32 i = 0; i < n; i++) {
+		cat(l, " ");
+		cathex(l, b[i], 2);
+	}
+	con_line(c, l, COL_FG);
+}
+
+static int cmdline_has(const char *cl, const char *w)
+{
+	for (u32 i = 0; cl[i] && i < 600; i++) {
+		u32 j = 0;
+		while (w[j] && cl[i + j] == w[j])
+			j++;
+		if (!w[j])
+			return 1;
+	}
+	return 0;
+}
+
+static void touch_probe(struct con *c)
+{
+	u8 e[8], id[4];
+	int ready = 0;
+	u32 events = 0, touches = 0;
+
+	con_line(c, "TOUCH PROBE: ST FTS ON SPI6 (GPIO BIT-BANG)", COL_OK);
+	say(c, "PINS BEFORE MODE ", tg_pins(0), 7);
+	say(c, "  DIR/OUT ", tg_pins(1), 7);
+	say(c, "  IN ", tg_pins(2), 7);
+	tg_out(0, 0); tg_out(1, 1); tg_out(3, 0);
+	tg_dir(0, 1); tg_dir(1, 1); tg_dir(3, 1); tg_dir(2, 0); tg_dir(21, 0);
+	for (u32 p = 0; p <= 3; p++)
+		tg_gpio(p);
+	tg_gpio(21);
+	tg_out(27, 1); tg_dir(27, 1); tg_gpio(27);
+	tg_out(20, 0); tg_dir(20, 1); tg_gpio(20);
+	delay_ms(10);
+	tg_out(20, 1);
+	say(c, "PINS AFTER  MODE ", tg_pins(0), 7);
+	say(c, "  DIR/OUT ", tg_pins(1), 7);
+	say(c, "  IN ", tg_pins(2), 7);
+	kick();
+
+	for (int i = 0; i < 50 && !ready; i++) {
+		delay_ms(20);
+		tg_read(0x87, 0, 0, e, 8);
+		if (i == 0)
+			say_hex(c, "FIFO FIRST", e, 8);
+		if (e[0] != 0 && e[0] != 0xff && i != 0)
+			say_hex(c, "FIFO", e, 8);
+		ready = e[0] == 0x03;
+	}
+	say(c, "CONTROLLER READY ", (u32)ready, 1);
+	if (!ready) {
+		tg_regw(0x20000032, 0x10);
+		tg_regw(0x20000034, 0x02);
+		tg_regw(0x2000003E, 0x07);
+		tg_regw(0x2000003D, 0x30);
+		tg_regw(0x2000002D, 0x02);
+		delay_ms(10);
+		con_line(c, "SPI4 MODE SET", COL_FG);
+	}
+	tg_read(0xFB, 1, 0x20000000, id, 2);
+	tg_read(0xFB, 1, 0x20000004, id + 2, 2);
+	say_hex(c, "CHIP ID / FW (WANT 36 40)", id, 4);
+	kick();
+	if (id[0] != 0x36 || id[1] != 0x40) {
+		con_line(c, "NO ST FTS ANSWER - AVDD/VMCH OFF?", COL_ERR);
+		delay_ms(15000);
+		return;
+	}
+	{
+		static const u8 scan[3] = { 0xA0, 0x00, 0x01 };
+		tg_spi(scan, 3, 0, 0);
+	}
+	con_line(c, "ACTIVE SCAN ON - TOUCH THE SCREEN (15 S)", COL_OK);
+	u32 yline = c->y;
+	u64 end = cntpct() + cntfrq() * 15;
+	while (cntpct() < end) {
+		for (int n = 0; n < 32; n++) {
+			tg_read(0x87, 0, 0, e, 8);
+			if (e[0] == 0 || e[0] == 0xff)
+				break;
+			events++;
+			if (e[0] == 0x13)
+				touches++;
+			c->y = yline;
+			say(c, "EVENTS ", events, 4);
+			say(c, "TOUCHES ", touches, 4);
+			say_hex(c, "LAST", e, 8);
+			if ((e[7] & 0x1f) == 0)
+				break;
+		}
+		delay_ms(8);
+	}
+	c->y = yline + 3 * CELL_H;
+	con_line(c, "TOUCH PROBE DONE", COL_OK);
+}
+
 /* ---- kicker (runs on an A78 core until reset) ---- */
 
 void kicker_main(void)
@@ -380,6 +568,8 @@ void shim_main(u64 dtb)
 	}
 	delay_ms(100); /* from here on only the kicker triggers frames */
 	say(&c, "KICKER ON CPU ", kick_cpu, 3);
+	if (cmdline_has(p->cmdline, "agateshimtouch=1"))
+		touch_probe(&c);
 
 	for (u32 i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
