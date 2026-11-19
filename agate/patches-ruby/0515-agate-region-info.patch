@@ -1,0 +1,30 @@
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+index 65b50bc..a21d51d 100644
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -393,6 +393,25 @@ agate_wlan_dt_node(const uint8_t *mac)
+ 	}
+ 	parent->release();
+ 
++	/* iBoot copies the region from syscfg (Regn, 0x20 bytes, zero padded) into the device tree's root,
++	 * the IOPlatformExpertDevice: wifid reads region-info there for the Wi-Fi country, and with
++	 * none Settings showed Wi-Fi greyed out. ZD/A: an EU region (the phone is in the EU). */
++	IORegistryEntry *root = IORegistryEntry::fromPath("/", gIODTPlane);
++	if (root != NULL) {
++		OSObject *have = root->copyProperty("region-info");
++		if (have == NULL) {
++			uint8_t region[0x20] = { 'Z', 'D', '/', 'A' };
++			OSData *d = OSData::withBytes(region, sizeof(region));
++			if (d != NULL) {
++				root->setProperty("region-info", d);
++				d->release();
++				IOLog("AGATE WLAN: region-info ZD/A set on %s\n", root->getName());
++			}
++		}
++		OSSafeReleaseNULL(have);
++		root->release();
++	}
++
+ 	/* iBoot puts the Wi-Fi address in /chosen: wifid reads mac-address-wifi0 there as soon as its
+ 	 * IO80211InterfaceRole notification hands it the interface, and went no further without it */
+ 	IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
