@@ -1,0 +1,181 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1d7400a..e3ac73d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -70,6 +71,20 @@ enum {
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
++
++/*
++ * agate (Xiaomi 11T): DSI0 runs the panel in command mode, so a frame only
++ * reaches the panel when mutex0 is enabled and DSI_START toggles. The shim's
++ * kicker (an A78 core, MMU off) does that at ~30 Hz on its own; with
++ * boot-arg agatefbkick=1 the kernel kicks right after each copy instead and
++ * tells the kicker through a mailbox in the framebuffer mblock (magic, then
++ * a sequence number that changes on every kernel kick; the kicker resumes
++ * after ~2 s without kernel kicks, so panics stay visible).
++ */
++#define AGATE_DSI0_PA                   0x1400e000ULL
++#define AGATE_MUTEX_PA                  0x14117000ULL
++#define AGATE_MBOX_PA                   0x7cdfb000ULL   /* page below the panel buffer */
++#define AGATE_MBOX_MAGIC                0x4b49434bu     /* 'KICK' */
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -117,6 +132,18 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* agate (0094): frame-consistent present, kernel-driven DSI frames */
++	IOLock       *fPresentLock;   /* one panel copy at a time */
++	uint64_t      fMinPresentAbs; /* 1 / sweetfb_hz in abs time */
++	uint64_t      fLastPresentAbs;
++	uint64_t      fLastSwapAbs;
++	volatile uint32_t *fDsi;      /* DSI0, mutex: command-mode panel kicks */
++	volatile uint32_t *fMutex;
++	volatile uint32_t *fMbox;     /* shim kicker mailbox */
++	uint32_t      fKickSeq;
++	void presentLocked(const uint8_t *rec);
++	void panelWait(void);
++	void panelKick(void);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -196,6 +223,16 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	fPresentLock = IOLockAlloc();
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / (hz == 0 || hz > 60 ? 60 : hz) - NSEC_PER_MSEC, &fMinPresentAbs);
++	int kick = 0;
++	if (PE_parse_boot_argn("agatefbkick", &kick, sizeof(kick)) && kick != 0) {
++		fDsi = (volatile uint32_t *)ml_io_map(AGATE_DSI0_PA, 0x1000);
++		fMutex = (volatile uint32_t *)ml_io_map(AGATE_MUTEX_PA, 0x1000);
++		fMbox = (volatile uint32_t *)ml_io_map(AGATE_MBOX_PA, 0x1000);
++		IOLog("SWEET FB: agate kernel-driven DSI frames (dsi %p mutex %p mbox %p)\n",
++		    (void *)fDsi, (void *)fMutex, (void *)fMbox);
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -239,17 +276,24 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++			if (fb->fPresentLock != NULL) {
++				IOLockLock(fb->fPresentLock);
++				fb->panelKick();
++				IOLockUnlock(fb->fPresentLock);
++			}
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	bool flush = fb->fDirty && now - fb->fLastSwapAbs >= fb->fMinPresentAbs &&
++	    now - fb->fLastPresentAbs >= fb->fMinPresentAbs;
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
++			fb->fLastPresentAbs = now;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+@@ -301,17 +345,84 @@ static uint64_t sweet_fb_swap_count;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	uint64_t now = mach_absolute_time();
++	bool due;
++
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true;
++	fLastSwapAbs = now;
++	due = !fPowerOff && now - fLastPresentAbs >= fMinPresentAbs;
++	fDirty = !due;
++	if (due) {
++		fLastPresentAbs = now;
++	}
+ 	IOLockUnlock(fLock);
++	/*
++	 * agate (0094): copy now, while the surface still holds exactly this
++	 * frame. Copying it later from the vsync timer read surfaces that the
++	 * renderer had already started to redraw (black/white flashes, torn
++	 * scrolling). Swaps between copies are dropped; the timer shows the
++	 * last one once the screen goes idle.
++	 */
++	if (due) {
++		present(rec);
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
++void
++AppleCLCD::panelWait(void)
++{
++	if (fDsi == NULL) {
++		return;
++	}
++	/* DSI_INTSTA bit 31: busy. Do not write the buffer under a transfer. */
++	for (int i = 0; i < 400 && (fDsi[0x0c / 4] & 0x80000000u); i++) {
++		IODelay(100);
++	}
++}
++
++void
++AppleCLCD::panelKick(void)
++{
++	if (fDsi == NULL || fMutex == NULL) {
++		return;
++	}
++	if (fMbox != NULL) {
++		fMbox[0] = AGATE_MBOX_MAGIC;
++		fMbox[1] = ++fKickSeq;
++	}
++	__asm__ __volatile__("dsb sy" ::: "memory");
++	fMutex[0x20 / 4] = 1;           /* mutex0 EN */
++	fDsi[0] = 0;                    /* DSI_START 0 -> 1 */
++	fDsi[0] = 1;
++	__asm__ __volatile__("dsb sy" ::: "memory");
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
++{
++	if (fPresentLock == NULL) {
++		presentLocked(rec);
++		return;
++	}
++	IOLockLock(fPresentLock);
++	if (fMbox != NULL) {
++		/* stop the shim kicker before the copy starts */
++		fMbox[0] = AGATE_MBOX_MAGIC;
++		fMbox[1] = ++fKickSeq;
++		__asm__ __volatile__("dsb sy" ::: "memory");
++	}
++	panelWait();
++	presentLocked(rec);
++	panelKick();
++	IOLockUnlock(fPresentLock);
++}
++
++void
++AppleCLCD::presentLocked(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 

@@ -19,6 +19,21 @@ ALLOW_PUBLIC_UPSTREAM=1 \
 PATCHSET_SHA256=d87e666ff903ad8dc214773495feac827558ab53bf5b8fd3edfc30734c19ff71 \
 	sh "$ROOT/ci/prepare-baseline.sh" "$DEST"
 
+# AGATE_BASE=ruby keeps the whole ruby set (0001-0334: USB, PMIC, EINT, ...;
+# every ruby driver is boot-arg gated) and takes agate/patches-ruby/, the
+# agate patches rebased onto it.
+AGATE_BASE=${AGATE_BASE:-sweet}
+if [ "$AGATE_BASE" = ruby ]; then
+	cp "$ROOT"/agate/patches-ruby/*.patch "$DEST/xnu/patches/"
+	python3 "$ROOT/ci/normalize_lf.py" "$DEST/xnu/patches"
+	count=$(ls "$DEST"/xnu/patches | wc -l | tr -d ' ')
+	expected=$((305 + $(ls "$ROOT"/agate/patches-ruby/*.patch | wc -l)))
+	echo "agate-on-ruby patchset files: $count"
+	[ "$count" = "$expected" ] || { echo "expected $expected files" >&2; exit 1; }
+	python3 "$ROOT/ci/patchset_hash.py" "$DEST/xnu/patches"
+	exit 0
+fi
+
 for f in "$DEST"/xnu/patches/*.patch; do
 	n=$(basename "$f" | cut -c1-4)
 	# 0084: ruby's synthetic bottom-edge swipe (software only, boot-arg gated)

@@ -15,6 +15,9 @@ on:
       kernel_run:
         description: reuse agate-kernel from this run id (skips the kernel build)
         default: ""
+      base:
+        description: "patch base: sweet (baseline + ruby 0080-0084) or ruby (whole ruby set incl. USB)"
+        default: "sweet"
   push:
     branches: [main]
     paths:
@@ -26,7 +29,7 @@ on:
       - ".github/workflows/agate-xnu.yml"
 
 concurrency:
-  group: agate-xnu-${{ github.ref }}-${{ inputs.runner || 'macos-15-intel' }}
+  group: agate-xnu-${{ github.ref }}-${{ inputs.runner || 'macos-15-intel' }}-${{ inputs.base || 'sweet' }}
   cancel-in-progress: true
 
 permissions:
@@ -58,7 +61,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Prepare agate patchset
-        run: sh agate/ci/prepare-agate.sh base
+        run: AGATE_BASE="${{ inputs.base || 'sweet' }}" sh agate/ci/prepare-agate.sh base
 
       - name: Fetch build script
         run: |

@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/ruby_usb.c b/bsd/dev/ruby_usb.c
+index e92dd55..3e08c11 100644
+--- a/bsd/dev/ruby_usb.c
++++ b/bsd/dev/ruby_usb.c
+@@ -2534,16 +2534,28 @@ ruby_usb_probe(void)
+     v &= ~(ACR3_PUPD_BIST_EN | ACR3_EN_PU_DP);
+     ruby_wr32(phy, PHY_U2_ACR3, v);
+ 
+-    /* PS5169 enable on GPIO121. */
+-    v = ruby_rd32(gpio, GPIO_PINMUX_121);
+-    v &= ~(0xfu << 4);
+-    ruby_wr32(gpio, GPIO_PINMUX_121, v);
+-    v = ruby_rd32(gpio, GPIO_DIR3);
+-    v |= GPIO121_BIT;
+-    ruby_wr32(gpio, GPIO_DIR3, v);
+-    v = ruby_rd32(gpio, GPIO_DO3);
+-    v |= GPIO121_BIT;
+-    ruby_wr32(gpio, GPIO_DO3, v);
++    /*
++     * PS5169 enable on GPIO121 (ruby board). agate: GPIO121 is an I2C SDA
++     * line (mode 1) and USB 2.0 does not pass a redriver, so boot-arg
++     * rubyps5169=0 leaves the pin alone.
++     */
++    {
++        int ps5169 = 1;
++        PE_parse_boot_argn("rubyps5169", &ps5169, sizeof(ps5169));
++        if (ps5169) {
++            v = ruby_rd32(gpio, GPIO_PINMUX_121);
++            v &= ~(0xfu << 4);
++            ruby_wr32(gpio, GPIO_PINMUX_121, v);
++            v = ruby_rd32(gpio, GPIO_DIR3);
++            v |= GPIO121_BIT;
++            ruby_wr32(gpio, GPIO_DIR3, v);
++            v = ruby_rd32(gpio, GPIO_DO3);
++            v |= GPIO121_BIT;
++            ruby_wr32(gpio, GPIO_DO3, v);
++        } else {
++            printf("RUBY USB: PS5169/GPIO121 skipped (rubyps5169=0)\n");
++        }
++    }
+ 
+     /* MAC: high-speed, force VBUS, device config; soft-connect stays off. */
+     ruby_wr32(mac, LV1IECR - MTU3_PA, ~0u);
