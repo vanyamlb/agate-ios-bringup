@@ -1,0 +1,70 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 163fce1..0780e93 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2307,6 +2307,10 @@ is_io_server_version(
+ 	return kIOReturnSuccess;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++static bool sweet_iolog(char *name, size_t len);
++#endif
++
+ /* Routine io_object_get_class */
+ kern_return_t
+ is_io_object_get_class(
+@@ -2443,6 +2447,16 @@ is_io_object_conforms_to(
+ 	}
+ 
+ 	*conforms = (NULL != object->metaCast( className ));
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/* agate: what a traced daemon checks an object against */
++		char sname[32];
++		if (sweet_iolog(sname, sizeof(sname))) {
++			IOLog("IOK %s: conforms %s to %.64s -> %d\n", sname, object->getMetaClass()->getClassName(),
++			    className, *conforms ? 1 : 0);
++		}
++	}
++#endif
+ 
+ 	return kIOReturnSuccess;
+ }
+@@ -2489,6 +2503,17 @@ is_io_iterator_next(
+ 	} else {
+ 		ret = kIOReturnNoDevice;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/* agate: what a traced daemon's iterators (and notifications) hand it */
++		char sname[32];
++		if (sweet_iolog(sname, sizeof(sname))) {
++			IORegistryEntry * re = obj ? OSDynamicCast(IORegistryEntry, obj) : NULL;
++			IOLog("IOK %s: next -> %s %s\n", sname, obj ? obj->getMetaClass()->getClassName() : "end",
++			    re ? re->getName() : "");
++		}
++	}
++#endif
+ 
+ 	return ret;
+ }
+@@ -3956,6 +3981,19 @@ is_io_registry_entry_get_property_bin_buf(
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/* agate: which properties a traced daemon reads, and whether the entry has them */
++		char sname[32];
++		if (sweet_iolog(sname, sizeof(sname))) {
++			OSObject * have = entry->copyProperty(property_name);
++			IOLog("IOK %s: prop %.48s of %s %s -> %s%s\n", sname, property_name, entry->getMetaClass()->getClassName(),
++			    entry->getName(), have ? have->getMetaClass()->getClassName() : "none",
++			    (kIORegistryIterateRecursively & options) ? " (recursive)" : "");
++			OSSafeReleaseNULL(have);
++		}
++	}
++#endif
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+ 		return kIOReturnNotPermitted;
