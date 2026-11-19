@@ -78,18 +78,14 @@ static BOOL checkGPUConnection(mach_port_t service)
     return valid;
 }
 
-static int render(id<MTLDevice> device)
+static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString *label,
+                          NSString *vertexFunction, BOOL explicitState)
 {
+    enum { side = 16 };
     NSError *error = nil;
-    NSURL *shader = [NSURL fileURLWithPath:@"/Developer/triangle.metallib"];
-    dprintf(consoleFD, "AGATE METAL: loading the precompiled shader library\n");
-    id<MTLLibrary> library = [device newLibraryWithURL:shader error:&error];
-    if (!library) {
-        return fail(error.localizedDescription ?: @"precompiled shader library");
-    }
-
     MTLRenderPipelineDescriptor *options = [MTLRenderPipelineDescriptor new];
-    options.vertexFunction = [library newFunctionWithName:@"vs"];
+    options.label = label;
+    options.vertexFunction = [library newFunctionWithName:vertexFunction];
     options.fragmentFunction = [library newFunctionWithName:@"fs"];
     if (!options.vertexFunction || !options.fragmentFunction) {
         return fail(@"missing triangle shader functions");
@@ -99,14 +95,14 @@ static int render(id<MTLDevice> device)
     layout.layouts[0].stride = 2 * sizeof(float);
     options.vertexDescriptor = layout;
     options.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-    dprintf(consoleFD, "AGATE METAL: creating the render pipeline\n");
+    dprintf(consoleFD, "AGATE METAL: creating the render pipeline for %s\n", label.UTF8String);
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:options error:&error];
     if (!pipeline) {
         return fail(error.localizedDescription ?: @"render pipeline");
     }
 
     MTLTextureDescriptor *textureOptions = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16 height:16 mipmapped:NO];
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:side height:side mipmapped:NO];
     textureOptions.storageMode = MTLStorageModeShared;
     textureOptions.usage = MTLTextureUsageRenderTarget;
     id<MTLTexture> target = [device newTextureWithDescriptor:textureOptions];
@@ -114,6 +110,16 @@ static int render(id<MTLDevice> device)
     id<MTLCommandBuffer> commands = [queue commandBuffer];
     if (!target || !commands) {
         return fail(@"texture or command buffer allocation");
+    }
+    commands.label = label;
+
+    const float vertices[][2] = {{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.0f, 0.8f}};
+    id<MTLBuffer> vertexBuffer = nil;
+    if (explicitState) {
+        vertexBuffer = [device newBufferWithBytes:vertices length:sizeof(vertices) options:MTLResourceStorageModeShared];
+        if (!vertexBuffer) {
+            return fail(@"vertex buffer allocation");
+        }
     }
 
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -126,8 +132,14 @@ static int render(id<MTLDevice> device)
         return fail(@"render encoder");
     }
     [encoder setRenderPipelineState:pipeline];
-    const float vertices[][2] = {{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.0f, 0.8f}};
-    [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
+    if (explicitState) {
+        [encoder setViewport:(MTLViewport){0, 0, side, side, 0, 1}];
+        [encoder setScissorRect:(MTLScissorRect){0, 0, side, side}];
+        [encoder setCullMode:MTLCullModeNone];
+        [encoder setVertexBuffer:vertexBuffer offset:0 atIndex:0];
+    } else {
+        [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
+    }
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
 
@@ -135,7 +147,7 @@ static int render(id<MTLDevice> device)
     [commands addCompletedHandler:^(__unused id<MTLCommandBuffer> buffer) {
         dispatch_semaphore_signal(completion);
     }];
-    dprintf(consoleFD, "AGATE METAL: submitting the off-screen render\n");
+    dprintf(consoleFD, "AGATE METAL: submitting the off-screen render for %s\n", label.UTF8String);
     [commands commit];
     if (dispatch_semaphore_wait(completion, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC))) {
         return fail(@"render completion timed out");
@@ -143,15 +155,38 @@ static int render(id<MTLDevice> device)
     if (commands.status != MTLCommandBufferStatusCompleted) {
         return fail(commands.error.localizedDescription ?: @"GPU command buffer failed");
     }
-    uint8_t center[4] = {}, corner[4] = {};
-    [target getBytes:center bytesPerRow:4 fromRegion:MTLRegionMake2D(8, 8, 1, 1) mipmapLevel:0];
-    [target getBytes:corner bytesPerRow:4 fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+    uint8_t pixels[side][side][4] = {};
+    [target getBytes:pixels bytesPerRow:sizeof(pixels[0]) fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0];
+    const uint8_t *center = pixels[side / 2][side / 2], *corner = pixels[0][0];
     const uint8_t red[] = {255, 0, 0, 255}, blue[] = {0, 0, 255, 255};
+    unsigned redPixels = 0, bluePixels = 0;
+    for (unsigned y = 0; y < side; y++) {
+        for (unsigned x = 0; x < side; x++) {
+            redPixels += memcmp(pixels[y][x], red, sizeof(red)) == 0;
+            bluePixels += memcmp(pixels[y][x], blue, sizeof(blue)) == 0;
+        }
+    }
     BOOL passed = memcmp(center, red, sizeof(red)) == 0 && memcmp(corner, blue, sizeof(blue)) == 0;
-    dprintf(consoleFD, "AGATE METAL: %s pixel readback, center=(%u,%u,%u,%u) corner=(%u,%u,%u,%u)\n",
-        passed ? "PASS" : "FAIL", center[0], center[1], center[2], center[3],
-        corner[0], corner[1], corner[2], corner[3]);
+    dprintf(consoleFD, "AGATE METAL: %s %s pixel readback, center=(%u,%u,%u,%u) corner=(%u,%u,%u,%u) red=%u blue=%u\n",
+        label.UTF8String, passed ? "PASS" : "FAIL", center[0], center[1], center[2], center[3],
+        corner[0], corner[1], corner[2], corner[3], redPixels, bluePixels);
     return passed ? 0 : 1;
+}
+
+static int render(id<MTLDevice> device)
+{
+    NSError *error = nil;
+    NSURL *shader = [NSURL fileURLWithPath:@"/Developer/triangle.metallib"];
+    dprintf(consoleFD, "AGATE METAL: loading the precompiled shader library\n");
+    id<MTLLibrary> library = [device newLibraryWithURL:shader error:&error];
+    if (!library) {
+        return fail(error.localizedDescription ?: @"precompiled shader library");
+    }
+
+    int baseline = renderTriangle(device, library, @"baseline", @"vs", NO);
+    int position = renderTriangle(device, library, @"explicit-position", @"vs_with_position", NO);
+    int vertexBuffer = renderTriangle(device, library, @"vertex-buffer", @"vs_with_position", YES);
+    return baseline && position && vertexBuffer;
 }
 
 int main(void)
@@ -176,6 +211,7 @@ int main(void)
         }
         setenv("VMG_NO_AIR_CACHE", "1", 1);
         setenv("VMG_NO_SHM_STATS", "1", 1);
+        setenv("VMG_TRACE_FRAME", "0", 1);
         setenv("VMG_DRIVER", "panfrost", 1);
         setenv("VGPU_BACKEND", "iokit", 1);
         setenv("VGPU_NO_TRAP", "1", 1);

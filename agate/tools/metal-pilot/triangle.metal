@@ -10,6 +10,15 @@ vertex float4 vs(Vertex input [[stage_in]])
     return float4(input.position, 0, 1);
 }
 
+struct RasterVertex {
+    float4 position [[position]];
+};
+
+vertex RasterVertex vs_with_position(Vertex input [[stage_in]])
+{
+    return {float4(input.position, 0, 1)};
+}
+
 fragment float4 fs()
 {
     return float4(1, 0, 0, 1);
