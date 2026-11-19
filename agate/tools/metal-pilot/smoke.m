@@ -81,22 +81,23 @@ static BOOL checkGPUConnection(mach_port_t service)
 static int render(id<MTLDevice> device)
 {
     NSError *error = nil;
-    NSString *shader = @"#include <metal_stdlib>\n"
-        "using namespace metal;\n"
-        "vertex float4 vs(uint id [[vertex_id]]) {\n"
-        "  const float2 positions[3] = { float2(-0.8,-0.8), float2(0.8,-0.8), float2(0,0.8) };\n"
-        "  return float4(positions[id], 0, 1);\n"
-        "}\n"
-        "fragment float4 fs() { return float4(1, 0, 0, 1); }\n";
-    dprintf(consoleFD, "AGATE METAL: compiling the shader\n");
-    id<MTLLibrary> library = [device newLibraryWithSource:shader options:nil error:&error];
+    NSURL *shader = [NSURL fileURLWithPath:@"/Developer/triangle.metallib"];
+    dprintf(consoleFD, "AGATE METAL: loading the precompiled shader library\n");
+    id<MTLLibrary> library = [device newLibraryWithURL:shader error:&error];
     if (!library) {
-        return fail(error.localizedDescription ?: @"MSL compilation");
+        return fail(error.localizedDescription ?: @"precompiled shader library");
     }
 
     MTLRenderPipelineDescriptor *options = [MTLRenderPipelineDescriptor new];
     options.vertexFunction = [library newFunctionWithName:@"vs"];
     options.fragmentFunction = [library newFunctionWithName:@"fs"];
+    if (!options.vertexFunction || !options.fragmentFunction) {
+        return fail(@"missing triangle shader functions");
+    }
+    MTLVertexDescriptor *layout = [MTLVertexDescriptor vertexDescriptor];
+    layout.attributes[0].format = MTLVertexFormatFloat2;
+    layout.layouts[0].stride = 2 * sizeof(float);
+    options.vertexDescriptor = layout;
     options.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     dprintf(consoleFD, "AGATE METAL: creating the render pipeline\n");
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:options error:&error];
@@ -125,6 +126,8 @@ static int render(id<MTLDevice> device)
         return fail(@"render encoder");
     }
     [encoder setRenderPipelineState:pipeline];
+    const float vertices[][2] = {{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.0f, 0.8f}};
+    [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
 

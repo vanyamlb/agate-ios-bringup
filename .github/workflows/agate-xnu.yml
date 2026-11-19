@@ -15,6 +15,17 @@ jobs:
           mkdir -p pilot uapi
           curl -fsSL --retry 3 https://raw.githubusercontent.com/Nik300/viva-gpu/9ebe5e46f74f6d75fce1d76b2ea4ea603cb63637/uapi/viva_gpu_uapi.h -o uapi/viva_gpu_uapi.h
           printf '%s\n' 'b63438d24ff6c18000ef148b585d404f8e800f857c5f12ea746d5c208d5318d1  uapi/viva_gpu_uapi.h' | shasum -a 256 -c -
+          if test -d /Applications/Xcode_16.4.app/Contents/Developer; then
+            export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+          if ! xcrun --sdk iphoneos metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun --sdk iphoneos metal -target air64-apple-ios16.0 -std=ios-metal2.4 -c \
+            agate/tools/metal-pilot/triangle.metal -o triangle.air
+          xcrun --sdk iphoneos metal -target air64-apple-ios16.0 triangle.air -o pilot/triangle.metallib
+          test "$(head -c 4 pilot/triangle.metallib)" = MTLB
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           CC="$(xcrun --sdk iphoneos -f clang)"
           "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror \
@@ -27,7 +38,7 @@ jobs:
             codesign --verify --strict "$f"
             test "$(lipo -archs "$f")" = arm64
           done
-          shasum -a 256 metal-init metal-smoke > SHA256SUMS
+          shasum -a 256 metal-init metal-smoke triangle.metallib > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: agate-metal-pilot
