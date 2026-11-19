@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+index eb20fae..52f8143 100644
+--- a/bsd/dev/agate_conninfra/agate_conninfra.c
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -242,6 +242,59 @@ ac_wfsys_on(void)
+ 	return ver == 0x20010000 ? 0 : -1;
+ }
+ 
++/* A3a: start the WM MCU on the ROM images the shim placed in the conn EMI
++ * (pack_xnu.py --fw-blob, mkfwblob.py). gen4m soc3_0.c: AP2WF remap, clear the
++ * WF dynamic-base words, reset the WFSYS semaphore, release the WM CPU, then the
++ * ROM writes 0x1D1E to 0x184C1604 when it is ready for the patch download. */
++static void
++ac_emi_peek(const char *what, uint32_t off)
++{
++	vm_offset_t e = ml_io_map(0x8fb00000ULL + off, 0x1000);
++	if (!e) {
++		return;
++	}
++	pr_info("EMI+%06x (%s): %08x %08x %08x %08x\n", off, what,
++	    readl(e), readl(e + 4), readl(e + 8), readl(e + 12));
++}
++
++static int
++ac_wm_start(void)
++{
++	vm_offset_t rgu = conn_reg_mt6893.reg_base_addr[CONN_INFRA_RGU_BASE_INDEX].vir_addr;
++	vm_offset_t cfg = conn_reg_mt6893.reg_base_addr[CONN_INFRA_CFG_BASE_INDEX].vir_addr;
++	vm_offset_t dyn = ml_io_map(0x18500000, 0x1000);
++	vm_offset_t rom = ml_io_map(0x184c1000, 0x1000);
++	uint32_t v = 0;
++	int i;
++
++	if (!dyn || !rom) {
++		return -1;
++	}
++	ac_emi_peek("wmmcu", 0x230000);
++	ac_emi_peek("wifi-rom", 0x2b0000);
++	ac_emi_peek("dates", 0x27f0e0);
++	writel(0x89040000u, cfg + 0x120);                       /* CONN_CFG_AP2WF_REMAP_1 */
++	writel(0, dyn + 0x1dc);
++	writel(0, dyn + 0x1e0);
++	writel(readl(rgu + 0x18) & ~1u, rgu + 0x18);            /* WFSYS semaphore reset */
++	pr_info("A3a: remap=%08x, releasing WM CPU (rgu+0x10=%08x)\n",
++	    readl(cfg + 0x120), readl(rgu + 0x10));
++	writel(readl(rgu + 0x10) | 1u, rgu + 0x10);             /* WM CPU out of reset */
++	for (i = 0; i < 200; i++) {
++		v = readl(rom + 0x604);
++		if (v == 0x1d1e) {
++			break;
++		}
++		if (i % 20 == 0) {
++			pr_info("A3a: ROM state %08x\n", v);
++		}
++		delay(5000);
++	}
++	pr_info("A3a: ROM state %08x after %d ms -> %s\n", v, i * 5,
++	    v == 0x1d1e ? "WM MCU ROM is UP, ready for the patch" : "no ROM ready code");
++	return v == 0x1d1e ? 0 : -1;
++}
++
+ int
+ agate_conninfra_a2a(int step)
+ {
+@@ -287,6 +340,9 @@ agate_conninfra_a2a(int step)
+ 	if (step >= 4) {
+ 		STEP("wfsys_on", ac_wfsys_on());
+ 	}
++	if (step >= 5) {
++		STEP("wm_start", ac_wm_start());
++	}
+ 	return 0;
+ }
+ #endif

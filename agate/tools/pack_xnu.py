@@ -22,17 +22,21 @@ import zlib
 SHIM_OFF = 0x1000
 SHIM_MAX = 0xa000
 PAYLOAD_OFF = 0x20000
+FW_OFF = 0x1800000          # optional AGFW blob (mkfwblob.py), copied by the shim
 TARGET_EXTRA = 30000
 FILL_SEED = 0xA6A7E
 
 
-def build_raw(raw, shim, payload, fill_len):
+def build_raw(raw, shim, payload, fill_len, fw=b""):
     mod = bytearray(len(raw))
     mod[0:0x40] = raw[0:0x40]
     mod[0:4] = struct.pack("<I", 0x14000000 | (SHIM_OFF // 4))
     mod[SHIM_OFF:SHIM_OFF + len(shim)] = shim
     end = PAYLOAD_OFF + len(payload)
     mod[PAYLOAD_OFF:end] = payload
+    if fw:
+        mod[FW_OFF:FW_OFF + len(fw)] = fw
+        end = FW_OFF + len(fw)
     fill_len = max(0, min(fill_len, len(mod) - end))
     mod[end:end + fill_len] = random.Random(FILL_SEED).randbytes(fill_len)
     co = zlib.compressobj(9, zlib.DEFLATED, -15)
@@ -46,6 +50,7 @@ def main():
     ap.add_argument("--payload", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--expect-base-sha", help="refuse other base images")
+    ap.add_argument("--fw-blob", help="AGFW Wi-Fi firmware blob (mkfwblob.py) at Image+FW_OFF")
     args = ap.parse_args()
 
     if args.out == args.base:
@@ -53,6 +58,11 @@ def main():
     base = open(args.base, "rb").read()
     shim = open(args.shim, "rb").read()
     payload = open(args.payload, "rb").read()
+    fw = open(args.fw_blob, "rb").read() if args.fw_blob else b""
+    if fw and fw[:4] != b"AGFW":
+        raise SystemExit("--fw-blob is not an AGFW blob")
+    if fw and PAYLOAD_OFF + len(payload) > FW_OFF:
+        raise SystemExit("payload overlaps the firmware blob")
     base_sha = hashlib.sha256(base).hexdigest()
     if args.expect_base_sha and not base_sha.startswith(args.expect_base_sha):
         raise SystemExit(f"base sha256 {base_sha} does not match")
@@ -76,7 +86,7 @@ def main():
 
     budget = kernel_size - 20
     fill = 0
-    mod, deflate = build_raw(raw, shim, payload, 0)
+    mod, deflate = build_raw(raw, shim, payload, 0, fw)
     if len(deflate) > budget:
         raise SystemExit(f"payload too large: deflate {len(deflate)} > {budget}")
     # Random bytes grow the deflate stream ~1:1; a few secant steps suffice.
@@ -85,9 +95,9 @@ def main():
         if 0 <= extra_len <= 0xFFFF:
             break
         fill = max(0, fill + extra_len - TARGET_EXTRA)
-        if fill > len(raw) - end:
+        if fill > len(raw) - (FW_OFF + len(fw) if fw else end):
             raise SystemExit("not enough room for filler")
-        mod, deflate = build_raw(raw, shim, payload, fill)
+        mod, deflate = build_raw(raw, shim, payload, fill, fw)
     else:
         raise SystemExit(f"cannot fit gzip stream: extra={budget - len(deflate)}")
 
@@ -109,6 +119,8 @@ def main():
     assert struct.unpack_from("<I", check, 0)[0] == 0x14000000 | (SHIM_OFF // 4)
     assert check[SHIM_OFF:SHIM_OFF + len(shim)] == shim
     assert check[PAYLOAD_OFF:end] == payload
+    if fw:
+        assert check[FW_OFF:FW_OFF + len(fw)] == fw
 
     with open(args.out, "wb") as f:
         f.write(img)

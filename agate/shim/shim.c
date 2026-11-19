@@ -593,6 +593,51 @@ static void touch_probe(struct con *c)
 	con_line(c, "TOUCH PROBE DONE", COL_OK);
 }
 
+/* ---- Wi-Fi firmware into the conninfra EMI (pack_xnu.py --fw-blob) ----
+ * An "AGFW" blob (tools/mkfwblob.py) at Image + 0x1800000: kind-1 entries
+ * are copied to the conn EMI region the kernel remaps the WM MCU to
+ * (0x8fb00000, 4.5 MiB, Android's consys-reserve-memory, outside XNU's RAM);
+ * kind-2 entries stay in the Image for the kernel. Word copies only (the MMU
+ * is off: device memory, no unaligned access). */
+#define AGFW_OFF 0x1800000UL
+#define CONN_EMI 0x8fb00000UL
+#define CONN_EMI_SIZE 0x450000UL
+
+struct agfw_ent { u32 kind, dest, len, off; char name[16]; };
+
+static void wifi_fw_place(struct con *c)
+{
+	u64 img = (u64)_start - 0x1000;
+	const u32 *h = (const u32 *)(img + AGFW_OFF);
+	u32 n, copied = 0;
+
+	if (h[0] != 0x57464741u)        /* "AGFW" */
+		return;
+	n = h[2];
+	if (n > 16) {
+		con_line(c, "AGFW: BAD ENTRY COUNT", COL_ERR);
+		return;
+	}
+	const struct agfw_ent *e = (const struct agfw_ent *)(img + AGFW_OFF + 16);
+	for (u32 i = 0; i < n; i++) {
+		if (e[i].kind != 1)
+			continue;
+		if ((e[i].dest & 3) || e[i].dest + e[i].len > CONN_EMI_SIZE ||
+		    (e[i].off & 3)) {
+			con_line(c, "AGFW: BAD ENTRY", COL_ERR);
+			continue;
+		}
+		volatile u32 *d = (volatile u32 *)(CONN_EMI + e[i].dest);
+		const volatile u32 *sw = (const volatile u32 *)(img + AGFW_OFF + e[i].off);
+		u32 w = (e[i].len + 3) / 4;
+		for (u32 k = 0; k < w; k++)
+			d[k] = sw[k];
+		copied++;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	say(c, "AGFW: WIFI FW ENTRIES INTO EMI ", copied, 2);
+}
+
 /* ---- kicker (runs on an A78 core until reset) ---- */
 
 /* Mailbox (kernel patch 0094, agatefbkick=1): the page below the panel
@@ -773,6 +818,7 @@ void shim_main(u64 dtb)
 		touch_probe(&c);
 	else if (cmdline_has(p->cmdline, "agatevmch=1"))
 		vmch_on(&c);   /* touch AVDD for the kernel FTS driver (0093) */
+	wifi_fw_place(&c);
 
 	for (u32 i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
