@@ -1,0 +1,121 @@
+diff --git a/bsd/dev/agate_wlan/agate_mtkwifi.c b/bsd/dev/agate_wlan/agate_mtkwifi.c
+--- a/bsd/dev/agate_wlan/agate_mtkwifi.c
++++ b/bsd/dev/agate_wlan/agate_mtkwifi.c
+@@ -736,33 +736,16 @@
+ }
+ 
+ static int
+-wf_join(const struct redwood_sta_join *what)
++wf_join_bss(const struct redwood_sta_join *what, const struct redwood_sta_bss *best, bool *auth_unanswered)
+ {
+ 	static uint8_t body[320];
+ 	const uint32_t began = wf_ms();
+-	const struct redwood_sta_bss *best = NULL;
+ 	const uint8_t *rsn_ie, *tim;
+-	uint32_t got = 0, at;
++	uint32_t got, at;
+ 	uint16_t status = 0xffff, capability;
+-	bool zero_bssid = (what->bssid[0] | what->bssid[1] | what->bssid[2] | what->bssid[3] | what->bssid[4] | what->bssid[5]) == 0;
+-
+-	for (unsigned pass = 0; pass < 2 && best == NULL; pass++) {
+-		if (pass == 1 && !wf_scan()) {
+-			break;
+-		}
+-		for (unsigned i = 0; i < wf_heard_count; i++) {
+-			const struct redwood_sta_bss *b = &wf_heard[i];
+-
+-			if (b->ssid_length == what->ssid_length && memcmp(b->ssid, what->ssid, b->ssid_length) == 0 &&
+-			    (zero_bssid || memcmp(b->bssid, what->bssid, 6) == 0) && (best == NULL || b->rssi > best->rssi)) {
+-				best = b;
+-			}
+-		}
+-	}
+-	if (best == NULL) {
+-		printf("agate wifi: join: the network asked for is not heard\n");
+-		return ENOENT;
+-	}
++	bool auth_received = false;
++
++	*auth_unanswered = false;
+ 	bzero(&wf_net, sizeof(wf_net));
+ 	wf_net.bss = *best;
+ 	memcpy(wf_net.bssid, best->bssid, 6);
+@@ -810,13 +793,16 @@
+ 		const uint8_t auth[6] = { 0, 0, 1, 0, 0, 0 };
+ 
+ 		(void)wf_tx_mgmt(11, auth, sizeof(auth));
+-		if ((got = wf_wait_mgmt(11, 300)) >= 30 && wf_mgmt.frame[26] == 2) {
++		got = wf_wait_mgmt(11, 300);
++		auth_received |= got != 0;
++		if (got >= 30 && wf_mgmt.frame[26] == 2) {
+ 			status = (uint16_t)(wf_mgmt.frame[28] | wf_mgmt.frame[29] << 8);
+ 		}
+ 	}
+ 	printf("agate wifi [%u ms]: authentication %s (status %u; %u frames from it, %u frames in all)\n", wf_ms(),
+-	    status == 0 ? "accepted" : got == 0 ? "NOT ANSWERED" : "REFUSED", status, wf_mgmt_heard, wf_frames);
++	    status == 0 ? "accepted" : !auth_received ? "NOT ANSWERED" : "REFUSED", status, wf_mgmt_heard, wf_frames);
+ 	if (status != 0) {
++		*auth_unanswered = !auth_received;
+ 		goto failed;
+ 	}
+ 
+@@ -905,6 +891,59 @@
+ 	return wf_net.secure && wf_net.eapol_said != 0 ? EAUTH : ETIMEDOUT;
+ }
+ 
++static const struct redwood_sta_bss *
++wf_join_candidate(const struct redwood_sta_join *what, bool any_bssid, const uint8_t *excluded_bssid)
++{
++	const struct redwood_sta_bss *best = NULL;
++	const bool secure = what->security == REDWOOD_STA_WPA2_PSK;
++
++	for (unsigned i = 0; i < wf_heard_count; i++) {
++		const struct redwood_sta_bss *b = &wf_heard[i];
++
++		if (b->ssid_length != what->ssid_length || memcmp(b->ssid, what->ssid, b->ssid_length) != 0 ||
++		    (!any_bssid && memcmp(b->bssid, what->bssid, sizeof(b->bssid)) != 0)) {
++			continue;
++		}
++		if (excluded_bssid != NULL &&
++		    (memcmp(b->bssid, excluded_bssid, sizeof(b->bssid)) == 0 || secure != (wf_element(b, 48) != NULL))) {
++			continue;
++		}
++		if (best == NULL || b->rssi > best->rssi) {
++			best = b;
++		}
++	}
++	return best;
++}
++
++static int
++wf_join(const struct redwood_sta_join *what)
++{
++	const uint8_t zero_bssid[6] = { 0 };
++	const bool any_bssid = memcmp(what->bssid, zero_bssid, sizeof(zero_bssid)) == 0;
++	const struct redwood_sta_bss *candidate = wf_join_candidate(what, any_bssid, NULL);
++	bool auth_unanswered;
++	int error;
++
++	if (candidate == NULL && wf_scan()) {
++		candidate = wf_join_candidate(what, any_bssid, NULL);
++	}
++	if (candidate == NULL) {
++		printf("agate wifi: join: the network asked for is not heard\n");
++		return ENOENT;
++	}
++
++	error = wf_join_bss(what, candidate, &auth_unanswered);
++	if (auth_unanswered && any_bssid) {
++		/* Only retry when there was no authentication response and the caller allowed any BSSID. */
++		candidate = wf_join_candidate(what, true, wf_net.bssid);
++		if (candidate != NULL) {
++			printf("agate wifi: authentication timed out, trying another access point for this network\n");
++			return wf_join_bss(what, candidate, &auth_unanswered);
++		}
++	}
++	return error;
++}
++
+ static void
+ wf_leave(void)
+ {
