@@ -30,10 +30,10 @@ index 976cc25..4b10ba7 100644
  bsd/dev/ruby_probe.c			standard
 diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
 new file mode 100644
-index 0000000..0c958d1
+index 0000000..16a229b
 --- /dev/null
 +++ b/bsd/dev/agate_conninfra/agate_conninfra.c
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,276 @@
 +/*
 + * agate (Xiaomi 11T, MT6893): Wi-Fi milestone A2a - the whole conninfra
 + * first power-on of MediaTek's consys_hw_pwr_on(), driven from XNU:
@@ -195,7 +195,8 @@ index 0000000..0c958d1
 +{
 +	uint16_t v = 0;
 +	if (pw_read(con0, &v)) {
-+		pr_err("PMIC %s CON0 read failed\n", name);
++		pr_err("PMIC %s CON0 read failed: WACS2_EN=%08x INIT_DONE2=%08x RDATA=%08x\n",
++		    name, readl(ac_pw + 0x90), readl(ac_pw + 0x94), readl(ac_pw + PW_WACS2_RDATA));
 +		return;
 +	}
 +	pr_info("PMIC %s CON0=0x%04x%s\n", name, v, (v & LDO_EN) ? " (on)" : "");
@@ -311,10 +312,10 @@ index 0000000..0c958d1
 +#endif
 diff --git a/bsd/dev/agate_conninfra/compat/agate_conninfra_compat.h b/bsd/dev/agate_conninfra/compat/agate_conninfra_compat.h
 new file mode 100644
-index 0000000..62a6e31
+index 0000000..85f87c4
 --- /dev/null
 +++ b/bsd/dev/agate_conninfra/compat/agate_conninfra_compat.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,58 @@
 +/*
 + * agate: the Linux environment MediaTek's MT6893 conninfra platform code
 + * (mtk/mt6893_pos.c, staged by 0501-stage-conninfra.sh) expects, on XNU.
@@ -355,7 +356,19 @@ index 0000000..62a6e31
 +#define mb()                __asm__ volatile ("dsb sy" ::: "memory")
 +#define ioremap(pa, sz)     ((void *)ml_io_map((vm_offset_t)(pa), (vm_size_t)(sz)))
 +#define iounmap(p)          do { (void)(p); } while (0)
-+#define memset_io(p, v, n)  memset((void *)(p), (v), (n))
++/* device memory: no DC ZVA / unaligned stores (memset faulted on the sysram) */
++static inline void
++agate_memset_io(volatile void *p, int v, unsigned long n)
++{
++	volatile uint32_t *w = (volatile uint32_t *)p;
++	uint32_t b = (uint8_t)v;
++	b |= b << 8; b |= b << 16;
++	for (unsigned long i = 0; i < n / 4; i++) {
++		w[i] = b;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++#define memset_io(p, v, n)  agate_memset_io((volatile void *)(p), (v), (n))
 +
 +#ifndef BITS_PER_LONG
 +#define BITS_PER_LONG 64
