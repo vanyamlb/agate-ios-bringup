@@ -12,12 +12,14 @@ jobs:
       - name: Compile and sign the iOS pilot
         run: |
           set -eu
-          mkdir -p pilot
+          mkdir -p pilot uapi
+          curl -fsSL --retry 3 https://raw.githubusercontent.com/Nik300/viva-gpu/9ebe5e46f74f6d75fce1d76b2ea4ea603cb63637/uapi/viva_gpu_uapi.h -o uapi/viva_gpu_uapi.h
+          printf '%s\n' 'b63438d24ff6c18000ef148b585d404f8e800f857c5f12ea746d5c208d5318d1  uapi/viva_gpu_uapi.h' | shasum -a 256 -c -
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           CC="$(xcrun --sdk iphoneos -f clang)"
           "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror \
             agate/tools/metal-pilot/init.c -o pilot/metal-init
-          "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror -fobjc-arc \
+          "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror -fobjc-arc -Iuapi \
             agate/tools/metal-pilot/smoke.m -framework Foundation -framework Metal -framework IOKit -o pilot/metal-smoke
           cd pilot
           for f in metal-init metal-smoke; do
