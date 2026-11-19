@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/agate_gpu.c b/bsd/dev/agate_gpu.c
+--- a/bsd/dev/agate_gpu.c
++++ b/bsd/dev/agate_gpu.c
+@@ -68,6 +68,7 @@
+ #define AGATE_MT6315_BUCK_EN      0x1440
+ #define AGATE_MT6315_BUCK1_VOSEL  0x1449
+ #define AGATE_MT6315_BUCK1_DBG    0x1499
++#define AGATE_MT6315_BUCK1_QI     0x149d   /* DA_VBUCK1_EN, Linux get_status() bit 0 */
+ #define AGATE_MT6359_SWCID        0x000a
+ #define AGATE_MT6359P_ID          0x5920
+ #define AGATE_VSRAM_OTHERS_EN     0x1f08   /* common to MT6359 and MT6359P */
+@@ -179,7 +180,7 @@
+ 		printf("AGATE GPU: PMIF not ready (init %#x inf %#x arb %#x issue %#x)\n", init, inf, arb, issue);
+ 		return;
+ 	}
+-	uint8_t hi, lo, enabled, selector, readback;
++	uint8_t hi, lo, enabled, selector, readback, actual_on;
+ 
+ 	agate_pmif_trace(pmif, master, "before MT6315 read");
+ 	if (!agate_mt6315_read(pmif, AGATE_MT6315_SWCID_HI, &hi) ||
+@@ -196,12 +197,13 @@
+ 	printf("AGATE GPU: MT6315 SID 7 replied with SWCID %#x\n", id);
+ 	if (!agate_mt6315_read(pmif, AGATE_MT6315_BUCK_EN, &enabled) ||
+ 	    !agate_mt6315_read(pmif, AGATE_MT6315_BUCK1_VOSEL, &selector) ||
+-	    !agate_mt6315_read(pmif, AGATE_MT6315_BUCK1_DBG, &readback)) {
++	    !agate_mt6315_read(pmif, AGATE_MT6315_BUCK1_DBG, &readback) ||
++	    !agate_mt6315_read(pmif, AGATE_MT6315_BUCK1_QI, &actual_on)) {
+ 		agate_pmif_trace(pmif, master, "after VGPU read failure");
+ 		return;
+ 	}
+-	printf("AGATE GPU: MT6315 SID 7 id %#x VGPU enable request %u selector %#x readback %#x\n",
+-	    id, enabled & 1u, (unsigned)selector, (unsigned)readback);
++	printf("AGATE GPU: MT6315 SID 7 id %#x VGPU enable request %u monitor on %u selector %#x readback %#x\n",
++	    id, enabled & 1u, actual_on & 1u, (unsigned)selector, (unsigned)readback);
+ }
+ 
+ /* The Wi-Fi conninfra bring-up owns pwrap at this point and passes its existing reader. */
