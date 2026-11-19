@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/agate_wlan/agate_mtkwifi.c b/bsd/dev/agate_wlan/agate_mtkwifi.c
+index 171ff79..f13b242 100644
+--- a/bsd/dev/agate_wlan/agate_mtkwifi.c
++++ b/bsd/dev/agate_wlan/agate_mtkwifi.c
+@@ -1048,6 +1048,10 @@ agate_mtkwifi_transmit(const uint8_t *frame, uint32_t length)
+ 	bool sent;
+ 
+ 	if (!wf_up || !wf_net.linked || length < 14 || length > REDWOOD_NET_FRAME_MAX) {
++		static unsigned said;
++		if (said++ < 6) {
++			printf("agate wifi: transmit refused: up %d linked %d length %u\n", wf_up, wf_net.linked, length);
++		}
+ 		return -1;
+ 	}
+ 	lck_mtx_lock(&wf_lock);
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+index aaf7033..889cd6b 100644
+--- a/iokit/Kernel/arm/AgateWLAN.cpp
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -320,6 +320,7 @@ AgateWLAN::nameThread(void *arg, wait_result_t wr __unused)
+ IOReturn
+ AgateWLAN::enable(IONetworkInterface *netif __unused)
+ {
++	IOLog("AGATE WLAN: enabled (link %s)\n", fLinked ? "up" : "down");
+ 	fEnabled = true;
+ 	setLinkStatus(kIONetworkLinkValid | (fLinked ? kIONetworkLinkActive : 0),
+ 	    fLinked ? fMedium : NULL, fLinked ? 54000000 : 0);
+@@ -329,6 +330,7 @@ AgateWLAN::enable(IONetworkInterface *netif __unused)
+ IOReturn
+ AgateWLAN::disable(IONetworkInterface *netif __unused)
+ {
++	IOLog("AGATE WLAN: disabled\n");
+ 	fEnabled = false;
+ 	setLinkStatus(kIONetworkLinkValid, NULL, 0);
+ 	return kIOReturnSuccess;
+@@ -351,10 +353,17 @@ AgateWLAN::outputPacket(mbuf_t m, void *param __unused)
+ {
+ 	uint8_t frame[1600];
+ 	size_t len = mbuf_pkthdr_len(m);
++	static unsigned said;
++	int r = -100;
+ 
+ 	if (fEnabled && fLinked && len >= 14 && len <= 1514 &&
+ 	    mbuf_copydata(m, 0, len, frame) == 0) {
+-		(void)agate_mtkwifi_transmit(frame, (uint32_t)len);
++		r = agate_mtkwifi_transmit(frame, (uint32_t)len);
++	}
++	if (said < 12) {
++		said++;
++		IOLog("AGATE WLAN: out %u bytes, type %02x%02x, enabled %d linked %d -> %d\n", (unsigned)len,
++		    len >= 14 ? frame[12] : 0, len >= 14 ? frame[13] : 0, fEnabled, fLinked, r);
+ 	}
+ 	freePacket(m);
+ 	return kIOReturnOutputSuccess;
