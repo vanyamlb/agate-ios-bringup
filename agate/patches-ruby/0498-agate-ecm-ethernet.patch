@@ -1,17 +1,18 @@
 diff --git a/bsd/dev/agate_ecm.c b/bsd/dev/agate_ecm.c
-index 344b9ff..7735d02 100644
+index 344b9ff..63ff9f7 100644
 --- a/bsd/dev/agate_ecm.c
 +++ b/bsd/dev/agate_ecm.c
-@@ -42,6 +42,8 @@
+@@ -42,6 +42,9 @@
  #define ECM_TXQ_BYTES   (64u * 1024u)
  
  extern int ruby_enum_profile;
++extern uint32_t ruby_rx_buf_size;
 +extern int agate_ecm_ioeth_create(void);
 +extern void agate_ecm_ioeth_input(const uint8_t *data, uint32_t len);
  
  /* phone side MAC (the host's MAC is the iMACAddress string, 02005E77EE01) */
  static const uint8_t ecm_phone_mac[ETHER_ADDR_LEN] = {
-@@ -50,6 +52,7 @@ static const uint8_t ecm_phone_mac[ETHER_ADDR_LEN] = {
+@@ -50,6 +53,7 @@ static const uint8_t ecm_phone_mac[ETHER_ADDR_LEN] = {
  
  static struct {
  	ifnet_t ifp;
@@ -19,7 +20,22 @@ index 344b9ff..7735d02 100644
  	lck_grp_t *grp;
  	lck_spin_t *lock;
  	int on;
-@@ -200,7 +203,16 @@ agate_ecm_rx(const uint8_t *data, uint32_t len)
+@@ -193,14 +197,29 @@ agate_ecm_rx(const uint8_t *data, uint32_t len)
+ 		memcpy(ecm.rx + ecm.rx_len, data, len);
+ 		ecm.rx_len += len;
+ 	}
+-	if (len == ECM_MPS) {
+-		return;                 /* the transfer continues */
++	/*
++	 * A GPD that came back full means the transfer continues in the next
++	 * one. With ruby_rxbuf=2048 a whole frame fits one GPD (the QMU joins
++	 * packets until the short one), so every completion is a frame end;
++	 * with the default 512 a full 512-byte chunk continues.
++	 */
++	if (len != 0 && len == (ruby_rx_buf_size ? ruby_rx_buf_size : ECM_MPS)) {
++		return;
+ 	}
+ 	uint32_t flen = ecm.rx_len;
  	int bad = ecm.rx_bad;
  	ecm.rx_len = 0;
  	ecm.rx_bad = 0;
@@ -37,7 +53,7 @@ index 344b9ff..7735d02 100644
  		ecm.rx_drops++;
  		return;
  	}
-@@ -233,11 +245,40 @@ agate_ecm_rx(const uint8_t *data, uint32_t len)
+@@ -233,11 +252,40 @@ agate_ecm_rx(const uint8_t *data, uint32_t len)
  	ifnet_input(ecm.ifp, m, &stats);
  }
  
@@ -79,7 +95,7 @@ index 344b9ff..7735d02 100644
  
  	if (len < ETHER_HDR_LEN || len > ECM_FRAME_MAX) {
  		mbuf_freem(m);
-@@ -246,23 +287,11 @@ ecm_if_output(ifnet_t ifp, mbuf_t m)
+@@ -246,23 +294,11 @@ ecm_if_output(ifnet_t ifp, mbuf_t m)
  	}
  	mbuf_copydata(m, 0, len, frame);
  	mbuf_freem(m);
@@ -106,7 +122,7 @@ index 344b9ff..7735d02 100644
  	return 0;
  }
  
-@@ -299,6 +328,20 @@ agate_ecm_start(void)
+@@ -299,6 +335,20 @@ agate_ecm_start(void)
  	ecm.grp = lck_grp_alloc_init("agate_ecm", LCK_GRP_ATTR_NULL);
  	ecm.lock = lck_spin_alloc_init(ecm.grp, LCK_ATTR_NULL);
  
@@ -141,10 +157,10 @@ index b14109a..1601d95 100644
  void agate_ecm_link_poll(vm_offset_t mac);
 diff --git a/iokit/Kernel/arm/AgateECMEthernet.cpp b/iokit/Kernel/arm/AgateECMEthernet.cpp
 new file mode 100644
-index 0000000..01c8364
+index 0000000..83874fa
 --- /dev/null
 +++ b/iokit/Kernel/arm/AgateECMEthernet.cpp
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,257 @@
 +/*
 + * agate (Xiaomi 11T): the USB CDC-ECM link (bsd/dev/agate_ecm.c) as a real
 + * IOEthernetController from the built-in IONetworkingFamily (0497), so the
@@ -165,7 +181,13 @@ index 0000000..01c8364
 +#include <IOKit/network/IOOutputQueue.h>
 +#include <sys/kpi_mbuf.h>
 +
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++
 +extern "C" int agate_ecm_queue_frame(const uint8_t *frame, uint32_t len);
++extern "C" kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern "C" void thread_deallocate(thread_t);
 +
 +class AgateECMEthernet : public IOEthernetController {
 +	OSDeclareDefaultStructors(AgateECMEthernet);
@@ -188,6 +210,7 @@ index 0000000..01c8364
 +	IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
 +	IOReturn setMulticastList(IOEthernetAddress *addrs, UInt32 count) APPLE_KEXT_OVERRIDE;
 +	void input(const uint8_t *data, uint32_t len);
++	static void nameThread(void *arg, wait_result_t wr);
 +};
 +
 +OSDefineMetaClassAndStructors(AgateECMEthernet, IOEthernetController);
@@ -232,7 +255,62 @@ index 0000000..01c8364
 +	}
 +	fNetif->registerService();
 +	IOLog("AGATE ETH: IOEthernetController up, interface registered\n");
++
++	/*
++	 * configd's InterfaceNamer only names a new interface once IOKit is
++	 * quiet, and on agate something never settles: it gave up after its
++	 * 240 s timeout. Ask IONetworkStack for the name ourselves (the same
++	 * request InterfaceNamer sends: lowest free unit from 0); configd then
++	 * finds an attached en0 and configures it (agateecmname=0: leave it
++	 * to configd).
++	 */
++	int name = 1;
++	PE_parse_boot_argn("agateecmname", &name, sizeof(name));
++	if (name) {
++		thread_t th;
++		retain();
++		if (kernel_thread_start((thread_continue_t)&AgateECMEthernet::nameThread,
++		    this, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++		} else {
++			release();
++		}
++	}
 +	return true;
++}
++
++void
++AgateECMEthernet::nameThread(void *arg, wait_result_t wr __unused)
++{
++	AgateECMEthernet *self = (AgateECMEthernet *)arg;
++	OSDictionary *match = IOService::serviceMatching("IONetworkStack");
++	IOService *stack = match ? IOService::waitForMatchingService(match,
++	    30ULL * NSEC_PER_SEC) : NULL;
++	OSSafeReleaseNULL(match);
++	if (stack == NULL || self->fNetif == NULL) {
++		IOLog("AGATE ETH: no IONetworkStack, naming left to configd\n");
++	} else {
++		uint64_t id = self->fNetif->getRegistryEntryID();
++		OSDictionary *cmd = OSDictionary::withCapacity(3);
++		OSNumber *type = OSNumber::withNumber(1ULL, 32);   /* lowest unit */
++		OSNumber *unit = OSNumber::withNumber(0ULL, 32);
++		OSData *eid = OSData::withBytes(&id, sizeof(id));
++		IOReturn ret = kIOReturnNoMemory;
++		if (cmd && type && unit && eid) {
++			cmd->setObject("IONetworkStackUserCommand", type);
++			cmd->setObject("IOInterfaceUnit", unit);
++			cmd->setObject("IORegistryEntryID", eid);
++			ret = stack->setProperties(cmd);
++		}
++		IOLog("AGATE ETH: asked IONetworkStack for a name: 0x%x, now %s%u\n",
++		    ret, self->fNetif->getNamePrefix(), self->fNetif->getUnitNumber());
++		OSSafeReleaseNULL(cmd);
++		OSSafeReleaseNULL(type);
++		OSSafeReleaseNULL(unit);
++		OSSafeReleaseNULL(eid);
++		stack->release();
++	}
++	self->release();
 +}
 +
 +IOReturn
