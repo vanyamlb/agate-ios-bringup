@@ -1,0 +1,3596 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index cd1b906..9058b74 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -57,6 +57,8 @@ sweet_pthread_synch.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+ AGATE_CONN_ROOT = $(SRCROOT)/bsd/dev/agate_conninfra
+ $(foreach o,mt6893_pos.o agate_conninfra.o,$(eval $(o)_CFLAGS_ADD += -include $(AGATE_CONN_ROOT)/compat/agate_conninfra_compat.h -I$(AGATE_CONN_ROOT)/compat -I$(AGATE_CONN_ROOT)/mtk))
+ $(foreach o,mt6893_pos.o agate_conninfra.o,$(eval $(o)_CWARNFLAGS_ADD += -w -Wno-error))
++# agate: the station (HakiOS's redwood_sta/apple80211/wpa, APSL 2.0) and its MT6893 lower half
++$(foreach o,agate_mtkwifi.o redwood_sta.o redwood_apple80211.o redwood_wpa.o,$(eval $(o)_CWARNFLAGS_ADD += -w -Wno-error))
+ 
+ # Apple OSS HFS built in (bsd/sweet_hfs): compiled like the kext, see sweet_hfs_compat.h.
+ # The compat header must come after the kernel's -D options, hence _CFLAGS_ADD.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4b10ba7..c190d32 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -127,6 +127,10 @@ bsd/dev/agate_ecm.c			standard
+ bsd/dev/agate_wifi.c			standard
+ bsd/dev/agate_conninfra/agate_conninfra.c	standard
+ bsd/dev/agate_conninfra/mtk/mt6893_pos.c	standard
++bsd/dev/agate_wlan/agate_mtkwifi.c	standard
++bsd/dev/agate_wlan/redwood_sta.c	standard
++bsd/dev/agate_wlan/redwood_apple80211.c	standard
++bsd/dev/agate_wlan/redwood_wpa.c	standard
+ bsd/dev/ruby_tty.c			standard
+ bsd/dev/ruby_raw.c			standard
+ bsd/dev/ruby_probe.c			standard
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+index 8c791ea..17bf981 100644
+--- a/bsd/dev/agate_conninfra/agate_conninfra.c
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -517,6 +517,49 @@ ac_init_cmd(uint8_t cid, const void *payload, uint32_t plen, uint8_t *status)
+ /* ---- A4a: firmware commands, NVRAM, BSS activate, scan ---- */
+ static uint8_t ac_mac[6];
+ 
++/* wait for room on TX ring 17 (the DMA's index two behind ours at least) */
++static int
++ac_tx_room(void)
++{
++	for (int i = 0; i < 2000; i++) {
++		if ((ac_txidx + 1) % RING_N != readl(wd1 + 0x41c)) {
++			return 0;
++		}
++		delay(50);
++	}
++	return -1;
++}
++
++/* a packet already holding its TXD (frames for the MCU to send) onto TX ring 17 */
++int
++agate_wf_tx(const uint8_t *pkt, uint32_t len)
++{
++	vm_offset_t buf, td;
++	uint32_t i, w;
++
++	if (!pool || len > TXB_SIZE || ac_tx_room()) {
++		return -1;
++	}
++	buf = pool + TXB_OFF + ac_txidx * TXB_SIZE;
++	td = pool + TXR_OFF + ac_txidx * 16;
++	for (i = 0; i < len; i += 4) {
++		w = 0;
++		for (uint32_t k = 0; k < 4 && i + k < len; k++) {
++			w |= (uint32_t)pkt[i + k] << (8 * k);
++		}
++		writel(w, buf + i);
++	}
++	writel((uint32_t)(DMA_POOL_PA + TXB_OFF + ac_txidx * TXB_SIZE), td + 0);
++	writel(0, td + 8);
++	writel(0, td + 12);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	writel((len << 16) | (1u << 30), td + 4);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ac_txidx = (ac_txidx + 1) % RING_N;
++	writel(ac_txidx, wd1 + 0x418);
++	return 0;
++}
++
+ /* CONNAC2X_WIFI_CMD: TXD + {len, pq, CID, 0xA0, set/query, seq, ...}; returns seq */
+ static uint8_t
+ ac_cmd(uint8_t cid, int set, const void *payload, uint32_t plen)
+@@ -530,6 +573,9 @@ ac_cmd(uint8_t cid, int set, const void *payload, uint32_t plen)
+ 	if (seq == 0) {
+ 		seq = ++ac_seq;
+ 	}
++	if (ac_tx_room()) {
++		pr_err("A4: TX ring 17 full\n");
++	}
+ 	for (i = 0; i < 64; i += 4) {
+ 		writel(0, buf + i);
+ 	}
+@@ -679,6 +725,79 @@ ac_pump(uint8_t want_seq, uint8_t want_eid)
+ 	return hit;
+ }
+ 
++/* ---- A5: the rings for the station (bsd/dev/agate_wlan/agate_mtkwifi.c) ---- */
++typedef void (*agate_wf_event_fn)(uint8_t eid, uint8_t seq, const uint8_t *body, uint32_t length);
++typedef void (*agate_wf_frame_fn)(const uint8_t *rx, uint32_t length);
++static uint8_t ac_rxcopy[RXB_SIZE];
++
++static void
++ac_copyout(vm_offset_t src, uint32_t len)
++{
++	for (uint32_t i = 0; i < len; i += 4) {
++		uint32_t w = readl(src + i);
++		ac_rxcopy[i] = w & 0xff;
++		ac_rxcopy[i + 1] = (w >> 8) & 0xff;
++		ac_rxcopy[i + 2] = (w >> 16) & 0xff;
++		ac_rxcopy[i + 3] = (w >> 24) & 0xff;
++	}
++}
++
++uint8_t
++agate_wf_cmd(uint8_t cid, int set, const void *payload, uint32_t plen)
++{
++	return pool ? ac_cmd(cid, set, payload, plen) : 0;
++}
++
++void
++agate_wf_pump(agate_wf_event_fn event, agate_wf_frame_fn frame)
++{
++	if (!pool) {
++		return;
++	}
++	for (int n = 0; n < RING_N; n++) {          /* WFDMA1 RX 0: events (and frames of the SW type 0x3801) */
++		vm_offset_t rd = pool + RXR_OFF + ac_rxidx * 16;
++		uint32_t d1 = readl(rd + 4);
++		if (!(d1 & (1u << 31))) {
++			break;
++		}
++		uint32_t rlen = (d1 >> 16) & 0x3fff;
++		if (rlen > RXB_SIZE) {
++			rlen = RXB_SIZE;
++		}
++		ac_copyout(pool + RXB_OFF + ac_rxidx * RXB_SIZE, (rlen + 3) & ~3u);
++		writel((uint32_t)RXB_SIZE << 16, rd + 4);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		writel(ac_rxidx, wd1 + 0x508);
++		ac_rxidx = (ac_rxidx + 1) % RING_N;
++		uint32_t d0 = ac_rxcopy[0] | ac_rxcopy[1] << 8 | ac_rxcopy[2] << 16 | (uint32_t)ac_rxcopy[3] << 24;
++		if (((d0 >> 16) & 0x380f) == 0x3801 || ((d0 >> 27) & 0x1f) == 2) {
++			frame(ac_rxcopy, rlen);
++		} else if (rlen >= 36) {
++			if (ac_rxcopy[28] == 0x0d) {
++				ac_scan_done = 1;
++			}
++			event(ac_rxcopy[28], ac_rxcopy[29], ac_rxcopy + 36, rlen - 36);
++		}
++	}
++	for (int n = 0; n < RX0_N; n++) {           /* WFDMA0 RX 0: frames */
++		vm_offset_t rd = pool + RX0R_OFF + ac_rx0idx * 16;
++		uint32_t d1 = readl(rd + 4);
++		if (!(d1 & (1u << 31))) {
++			break;
++		}
++		uint32_t rlen = (d1 >> 16) & 0x3fff;
++		if (rlen > RXB_SIZE) {
++			rlen = RXB_SIZE;
++		}
++		ac_copyout(pool + RX0B_OFF + ac_rx0idx * RXB_SIZE, (rlen + 3) & ~3u);
++		writel((uint32_t)RXB_SIZE << 16, rd + 4);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		writel(ac_rx0idx, wd0 + 0x508);
++		ac_rx0idx = (ac_rx0idx + 1) % RX0_N;
++		frame(ac_rxcopy, rlen);
++	}
++}
++
+ static int
+ ac_wait(uint8_t seq, uint8_t eid, uint32_t ms)
+ {
+@@ -744,6 +863,12 @@ ac_scan(vm_offset_t blob, const volatile struct agfw_ent *e, uint32_t n)
+ 	}
+ 	pr_info("A4a: NVRAM %u fragments sent\n", nfrag);
+ 
++	if (ac_step >= 8) {
++		extern void agate_mtkwifi_attach(void);
++		pr_info("A5: firmware configured, handing the radio to the station\n");
++		agate_mtkwifi_attach();
++		return 0;
++	}
+ 	/* 3. activate the AIS BSS (nicActivateNetworkEx) */
+ 	uint8_t act[12] = { 0, 1, 0 /* AIS */, 0, 0, 0, 0, 0, 0, 0, 4 /* BMC WTBL */, 0 };
+ 	memcpy(act + 4, ac_mac, 6);
+diff --git a/bsd/dev/agate_wifi.c b/bsd/dev/agate_wifi.c
+index 751b562..9455586 100644
+--- a/bsd/dev/agate_wifi.c
++++ b/bsd/dev/agate_wifi.c
+@@ -221,6 +221,29 @@ agate_wifi_start(void)
+ 	if (!PE_parse_boot_argn("agatewifi", &aw_step, sizeof(aw_step)) || aw_step <= 0) {
+ 		return;
+ 	}
++	if (aw_step >= 8) {
++		/* en0 now, before wifid looks for it: its address is the phone's own, from the NVRAM
++		 * the shim left in the AGFW blob (Image + 0x1800000, kind 3 "nvram", MAC at offset 4) */
++		extern void agate_mtkwifi_early(const uint8_t mac[6]);
++		uint8_t mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x01 };
++		vm_offset_t h = ml_io_map(0x41880000, 0x1000);
++		if (h != 0 && *(volatile uint32_t *)h == 0x57464741u) {
++			uint32_t n = ((volatile uint32_t *)h)[2];
++			for (uint32_t i = 0; i < n && i < 16; i++) {
++				volatile uint32_t *e = (volatile uint32_t *)(h + 16 + 32 * i);
++				if (e[0] == 3) {
++					vm_offset_t nv = ml_io_map(0x41880000 + (e[3] & ~0xfffu), 0x1000);
++					if (nv != 0) {
++						for (int k = 0; k < 6; k++) {
++							uint32_t a = (e[3] & 0xfffu) + 4 + k;
++							mac[k] = (*(volatile uint32_t *)(nv + (a & ~3u)) >> (8 * (a & 3))) & 0xff;
++						}
++					}
++				}
++			}
++		}
++		agate_mtkwifi_early(mac);
++	}
+ 	if (kernel_thread_start(agate_wifi_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+ 		printf("AGATE WIFI: step %d armed\n", aw_step);
+diff --git a/bsd/dev/agate_wlan/agate_mtkwifi.c b/bsd/dev/agate_wlan/agate_mtkwifi.c
+new file mode 100644
+index 0000000..648374c
+--- /dev/null
++++ b/bsd/dev/agate_wlan/agate_mtkwifi.c
+@@ -0,0 +1,1103 @@
++/*
++ * agate (Xiaomi 11T, MT6893): the station -- scan, join (open or WPA2 with a passphrase), frames --
++ * on the running N9 firmware (bsd/dev/agate_conninfra/agate_conninfra.c, agatewifi >= 8), behind the
++ * station boundary of sys/redwood_sta.h that wifid reaches through redwood_apple80211.c.
++ *
++ * The MAC logic is HakiOS's bsd/dev/redwood_mtkwifi.c (MT6768, CONNAC; APSL 2.0): the same gen4m
++ * commands -- BSS_ACTIVATE_CTRL, SCAN_REQ_V2, CH_PRIVILEGE, SET_BSS_INFO, UPDATE_STA_RECORD,
++ * ADD_REMOVE_KEY, POWER_SAVE_MODE -- with their layouts checked against this phone's gen4m
++ * (wsys_cmd_handler_fw.h / nic_cmd_event.h of the device kernel: SET_BSS_INFO 116 bytes as theirs,
++ * UPDATE_STA_RECORD 196), Authentication and Association sent by the host, WPA2's handshake in
++ * redwood_wpa.c. What differs is CONNAC2's: its TX descriptor (nic_txd_v2.c), its RX descriptor
++ * (24 bytes, nic_connac2x_rx.h), the rings (commands and every frame to the MCU on WFDMA1 TX 17,
++ * events on WFDMA1 RX 0, frames on WFDMA0 RX 0) and the WTBL entries (0-3 kept for BIP: the BSS's
++ * broadcasts 4, the access point 5, as secPrivacySeekForBcEntry/ForEntry hand them out).
++ *
++ * Boot-args: agatessid=<name> agatepsk=<passphrase>: joined at the start (Settings can pick another).
++ */
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/random.h>
++#include <sys/systm.h>
++#include <sys/redwood_net.h>
++#include <sys/redwood_sta.h>
++#include <sys/redwood_wpa.h>
++
++extern void delay(int usec);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++/* agate_conninfra.c */
++typedef void (*agate_wf_event_fn)(uint8_t eid, uint8_t seq, const uint8_t *body, uint32_t length);
++typedef void (*agate_wf_frame_fn)(const uint8_t *rx, uint32_t length);
++extern uint8_t agate_wf_cmd(uint8_t cid, int set, const void *body, uint32_t length);
++extern int agate_wf_tx(const uint8_t *packet, uint32_t length);
++extern void agate_wf_pump(agate_wf_event_fn event, agate_wf_frame_fn frame);
++/* AgateWLAN.cpp */
++extern int agate_wlan_create(const uint8_t *mac);
++
++#define CMD_ID_SCAN_REQ_V2              0x03
++#define CMD_ID_POWER_SAVE_MODE          0x05
++#define CMD_ID_ADD_REMOVE_KEY           0x07
++#define CMD_ID_BSS_ACTIVATE_CTRL        0x11
++#define CMD_ID_SET_BSS_INFO             0x12
++#define CMD_ID_UPDATE_STA_RECORD        0x13
++#define CMD_ID_REMOVE_STA_RECORD        0x14
++#define CMD_ID_INDICATE_PM_BSS_CONNECTED 0x16
++#define CMD_ID_CH_PRIVILEGE             0x1c
++#define EVENT_ID_SCAN_DONE              0x0d
++#define EVENT_ID_CH_PRIVILEGE           0x10
++
++#define WF_WTBL_BMC                     4
++#define WF_WTBL_AP                      5
++#define WF_BSS_MOST                     48
++#define WF_MAIL                         8
++
++static LCK_GRP_DECLARE(wf_lock_group, "agate-mtkwifi");
++static LCK_MTX_DECLARE(wf_lock, &wf_lock_group);
++static uint8_t wf_address[6];
++static bool wf_up, wf_made;
++
++struct wf_mail {
++	uint8_t eid, seq;
++	uint16_t length;
++	bool full;
++	uint8_t body[1024];
++};
++static struct wf_mail wf_mail[WF_MAIL];
++static unsigned wf_mail_next;
++static struct redwood_sta_bss *wf_heard;
++static unsigned wf_heard_count, wf_frames, wf_rx_dropped, wf_rx_ethernets;
++static struct {
++	unsigned tx, tx_failed, arp, udp, tcp, other, unicast, broadcast, clear, wtbl, error, said, dropped_said, events, mgmt;
++} wf_st;
++
++static struct {
++	bool joined, secure, keyed, linked;
++	uint8_t pairwise_in[16], group_in[32];
++	unsigned group_in_length, group_in_index;
++	uint8_t bssid[6], rsn[22];
++	unsigned rsn_length, channel;
++	uint16_t aid, operational, basic;
++	uint8_t phy, group_cipher;
++	struct redwood_sta_bss bss;
++	struct lx_wpa wpa;
++	uint32_t eapol_said;
++} wf_net;
++
++static struct {
++	bool full;
++	uint8_t subtype;
++	uint16_t length;
++	uint8_t frame[512];
++} wf_mgmt;
++static unsigned wf_mgmt_heard;
++
++static uint32_t
++wf_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return (uint32_t)(ns / 1000000);
++}
++
++static uint16_t
++wf_frequency(unsigned channel)
++{
++	return (uint16_t)(channel == 14 ? 2484 : channel <= 14 ? 2407 + 5 * channel : 5000 + 5 * channel);
++}
++
++/* ---- what comes in ---- */
++
++static void
++wf_event(uint8_t eid, uint8_t seq, const uint8_t *body, uint32_t length)
++{
++	struct wf_mail *m = &wf_mail[wf_mail_next++ % WF_MAIL];
++
++	wf_st.events++;
++	m->eid = eid;
++	m->seq = seq;
++	m->length = (uint16_t)(length < sizeof(m->body) ? length : sizeof(m->body));
++	memcpy(m->body, body, m->length);
++	m->full = true;
++}
++
++static void
++wf_rx_beacon(const uint8_t *frame, uint32_t length, int rssi, unsigned channel)
++{
++	struct redwood_sta_bss *bss = NULL;
++	const uint8_t *ie, *end;
++
++	if (length < 36 || wf_heard == NULL) {
++		return;
++	}
++	for (unsigned i = 0; i < wf_heard_count; i++) {
++		if (memcmp(wf_heard[i].bssid, frame + 16, 6) == 0) {
++			bss = &wf_heard[i];
++		}
++	}
++	if (bss == NULL) {
++		if (wf_heard_count >= WF_BSS_MOST) {
++			return;
++		}
++		bss = &wf_heard[wf_heard_count++];
++		bzero(bss, sizeof(*bss));
++		memcpy(bss->bssid, frame + 16, 6);
++	} else if ((frame[0] & 0xfc) == 0x80 && bss->ssid_length != 0) {
++		bss->rssi = (int16_t)(rssi > bss->rssi ? rssi : bss->rssi);
++		return;
++	}
++	bss->rssi = (int16_t)rssi;
++	bss->beacon_interval = (uint16_t)(frame[32] | frame[33] << 8);
++	bss->capability = (uint16_t)(frame[34] | frame[35] << 8);
++	bss->elements_length = (uint16_t)(length - 36 < REDWOOD_STA_ELEMENTS_MOST ? length - 36 : REDWOOD_STA_ELEMENTS_MOST);
++	memcpy(bss->elements, frame + 36, bss->elements_length);
++	for (ie = frame + 36, end = frame + length; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
++		if (ie[0] == 0 && ie[1] <= 32) {
++			memcpy(bss->ssid, ie + 2, ie[1]);
++			bss->ssid_length = ie[1];
++		} else if (ie[0] == 3 && ie[1] == 1) {
++			channel = ie[2];
++		}
++	}
++	bss->frequency = wf_frequency(channel);
++}
++
++static void wf_eapol(const uint8_t *message, uint32_t length);
++
++static void
++wf_rx_ethernet(const uint8_t *frame, uint32_t length, bool protected)
++{
++	wf_rx_ethernets++;
++	if (length < 14 || length > REDWOOD_NET_FRAME_MAX || !wf_net.joined || (wf_net.keyed && !protected)) {
++		if (wf_net.keyed && !protected && length >= 14) {
++			wf_st.clear++;
++		}
++		return;
++	}
++	if (frame[0] & 1) {
++		wf_st.broadcast++;
++	} else {
++		wf_st.unicast++;
++	}
++	if (frame[12] == 0x08 && frame[13] == 0x06) {
++		wf_st.arp++;
++	} else if (frame[12] == 0x08 && frame[13] == 0x00 && length >= 34) {
++		if (frame[23] == 6) {
++			wf_st.tcp++;
++		} else if (frame[23] == 17) {
++			wf_st.udp++;
++		} else {
++			wf_st.other++;
++		}
++	} else {
++		wf_st.other++;
++	}
++	if (frame[12] == 0x88 && frame[13] == 0x8e) {
++		if (memcmp(frame + 6, wf_net.bssid, 6) == 0) {
++			wf_eapol(frame + 14, length - 14);
++		}
++	} else if (wf_net.linked) {
++		redwood_net_input(frame, length);
++	}
++}
++
++static void
++wf_rx_mgmt(const uint8_t *frame, uint32_t length)
++{
++	const uint8_t subtype = frame[0] >> 4;
++
++	if (memcmp(frame + 10, wf_net.bssid, 6) != 0 || memcmp(frame + 4, wf_address, 6) != 0) {
++		return;
++	}
++	wf_mgmt_heard++;
++	if ((subtype == 12 || subtype == 10) && wf_net.joined) {
++		printf("agate wifi: the access point %s us (reason %u)\n", subtype == 12 ? "deauthenticated" : "disassociated",
++		    length >= 26 ? frame[24] | frame[25] << 8 : 0);
++		wf_net.joined = wf_net.linked = wf_net.keyed = false;
++		redwood_net_link_state(false);
++		redwood_sta_lost(ECONNRESET);
++		return;
++	}
++	if (wf_net.joined) {
++		wf_st.mgmt++;
++	}
++	wf_mgmt.full = true;
++	wf_mgmt.subtype = subtype;
++	wf_mgmt.length = (uint16_t)(length < sizeof(wf_mgmt.frame) ? length : sizeof(wf_mgmt.frame));
++	memcpy(wf_mgmt.frame, frame, wf_mgmt.length);
++}
++
++/*
++ * One received frame (nic_rxd_v2 / nic_connac2x_rx.h): the 24-byte RX descriptor -- DW0 byte count and
++ * packet type (2: RX data), DW1 WLAN index [9:0], groups [15:11], security mode [20:16], errors [27:23],
++ * DW2 header translated (bit 13) and the padding before the frame (2 bytes x [15:14]), DW3 the channel
++ * [15:8] -- then groups 4 (16 bytes), 1 (16), 2 (8), 3 (8: RCPI0 in its second word), 5 (72).
++ */
++static void
++wf_rx_frame(const uint8_t *f, uint32_t got)
++{
++	uint32_t d0, d1, d2, d3, at = 24, count, length;
++	unsigned groups, wlan, sec, channel;
++	const uint8_t *frame;
++	int rssi = -100;
++	bool errors;
++
++	wf_frames++;
++	if (got < 24) {
++		return;
++	}
++	memcpy(&d0, f, 4);
++	memcpy(&d1, f + 4, 4);
++	memcpy(&d2, f + 8, 4);
++	memcpy(&d3, f + 12, 4);
++	count = d0 & 0xffff;
++	if (count > got || count < 24) {
++		return;
++	}
++	groups = (d1 >> 11) & 0x1f;
++	wlan = d1 & 0x3ff;
++	sec = (d1 >> 16) & 0x1f;
++	errors = (d1 & (0x1fu << 23)) != 0;
++	channel = (d3 >> 8) & 0xff;
++	at += (groups & 8) ? 16 : 0;
++	at += (groups & 1) ? 16 : 0;
++	at += (groups & 2) ? 8 : 0;
++	if (groups & 4) {
++		if (at + 8 <= count) {
++			rssi = ((int)f[at + 4] - 220) / 2;
++		}
++		at += 8;
++	}
++	at += (groups & 16) ? 72 : 0;
++	at += 2 * ((d2 >> 14) & 3);
++	if (count < at + 14) {
++		return;
++	}
++	frame = f + at;
++	length = count - at;
++	if (d2 & (1u << 13)) {                  /* header translated: an Ethernet frame */
++		if ((wlan == WF_WTBL_AP || (wlan == WF_WTBL_BMC && (frame[0] & 1))) && !errors) {
++			wf_rx_ethernet(frame, length, sec != 0);
++		} else {
++			wf_rx_dropped++;
++			if (wlan != WF_WTBL_AP) {
++				wf_st.wtbl++;
++			} else {
++				wf_st.error++;
++			}
++		}
++		return;
++	}
++	if (length < 24) {
++		return;
++	}
++	switch ((frame[0] >> 2) & 3) {
++	case 0:
++		if ((frame[0] & 0xfc) == 0x80 || (frame[0] & 0xfc) == 0x50) {
++			wf_rx_beacon(frame, length, rssi, channel);
++		} else {
++			wf_rx_mgmt(frame, length);
++		}
++		break;
++	case 2: {
++		const uint32_t header = 24 + ((frame[0] & 0x80) ? 2 : 0) + ((frame[1] & 3) == 3 ? 6 : 0);
++		static uint8_t ethernet[REDWOOD_NET_FRAME_MAX];
++		const uint8_t *da = frame + 4, *sa = (frame[1] & 2) ? frame + 16 : frame + 10;
++		const uint8_t *snap = frame + header;
++
++		if (length < header + 8 || memcmp(snap, "\xaa\xaa\x03\x00\x00\x00", 6) != 0 ||
++		    length - header - 8 + 14 > sizeof(ethernet) || (frame[1] & 3) != 2 ||
++		    !(wlan == WF_WTBL_AP || (wlan == WF_WTBL_BMC && (da[0] & 1))) || errors ||
++		    memcmp(frame + 10, wf_net.bssid, 6) != 0) {
++			break;
++		}
++		memcpy(ethernet, da, 6);
++		memcpy(ethernet + 6, sa, 6);
++		memcpy(ethernet + 12, snap + 6, length - header - 6);
++		wf_rx_ethernet(ethernet, length - header - 8 + 14, sec != 0);
++		break;
++	}
++	default:
++		break;
++	}
++}
++
++static void
++wf_pump(void)
++{
++	agate_wf_pump(wf_event, wf_rx_frame);
++}
++
++/* (wf_lock held) the event `eid` (and, unless 0, sequence `seq`): its body's length, or -1 after wait_ms */
++static int
++wf_wait(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room, unsigned wait_ms)
++{
++	for (unsigned t = 0; t <= wait_ms; t++) {
++		wf_pump();
++		for (unsigned i = 0; i < WF_MAIL; i++) {
++			struct wf_mail *m = &wf_mail[i];
++			if (m->full && m->eid == eid && (seq == 0 || m->seq == seq)) {
++				uint32_t n = m->length < room ? m->length : room;
++				if (body != NULL) {
++					memcpy(body, m->body, n);
++				}
++				m->full = false;
++				return (int)m->length;
++			}
++		}
++		lck_mtx_unlock(&wf_lock);
++		delay(1000);
++		lck_mtx_lock(&wf_lock);
++	}
++	return -1;
++}
++
++static uint32_t
++wf_wait_mgmt(uint8_t subtype, unsigned wait_ms)
++{
++	for (unsigned t = 0; t <= wait_ms; t++) {
++		wf_pump();
++		if (wf_mgmt.full && wf_mgmt.subtype == subtype) {
++			wf_mgmt.full = false;
++			return wf_mgmt.length;
++		}
++		lck_mtx_unlock(&wf_lock);
++		delay(1000);
++		lck_mtx_lock(&wf_lock);
++	}
++	return 0;
++}
++
++/* ---- what goes out: CONNAC2 TX descriptors (nic_txd_v2_compose, _compose_security_frame) ---- */
++
++static uint16_t
++wf_lowest_rate(void)
++{
++	return wf_net.channel > 14 ? 0x4b /* RATE_OFDM_6M */ : 0x00 /* RATE_CCK_1M_LONG */;
++}
++
++/*
++ * A frame for the MCU to send (nicTxCmd's COMMAND_TYPE_MANAGEMENT_FRAME / _SECURITY_FRAME, TC4: the
++ * MCU's queue 1, packet format COMMAND), its 32-byte TXD then the frame, into WFDMA1 TX 17:
++ *   management: header format 802.11 (2), its header 12 words, type and subtype, the sequence number
++ *   Ethernet (EAPOL, and the data of this first version): format non-802.11 Ethernet II, the EtherType
++ *   6 words in; EAPOL before the keys at the BSS's lowest basic rate, fixed; the rest protected once keyed
++ */
++static bool
++wf_tx_frame(const uint8_t *frame, uint32_t length, bool management, bool fixed_rate, bool protect, uint16_t sn)
++{
++	static uint8_t packet[32 + 2048];
++	uint32_t dw[8] = { 0 };
++	const uint32_t count = 32 + length;
++
++	if (count > sizeof(packet)) {
++		return false;
++	}
++	dw[0] = (count & 0xffff) | (2u << 23) | (1u << 25);
++	dw[1] = WF_WTBL_AP | (1u << 31);
++	dw[2] = 30u << 16;                                  /* lifetime: 2 s (in 64 TU) */
++	dw[3] = 30u << 11;                                  /* tries */
++	if (management) {
++		const uint8_t type = (frame[0] >> 2) & 3, subtype = frame[0] >> 4;
++
++		dw[1] |= (1u << 10) | (2u << 16) | ((24u / 2) << 11);
++		dw[2] |= subtype | (uint32_t)type << 4;
++		dw[3] |= ((uint32_t)(sn & 0xfff) << 16) | (1u << 31);
++		dw[7] = ((uint32_t)subtype << 16) | ((uint32_t)type << 20);
++	} else {
++		dw[0] |= 6u << 16;                          /* (12 bytes) / 2 */
++		dw[1] |= 1u << 15;                          /* Ethernet II */
++		if (fixed_rate) {
++			dw[2] |= 1u << 31;
++			dw[6] = (uint32_t)wf_lowest_rate() << 16;
++		}
++		if (protect) {
++			dw[3] |= 1u << 1;
++		}
++	}
++	memcpy(packet, dw, 32);
++	memcpy(packet + 32, frame, length);
++	return agate_wf_tx(packet, count) == 0;
++}
++
++static uint16_t wf_mgmt_seq;
++
++static bool
++wf_tx_mgmt(uint8_t subtype, const uint8_t *body, uint32_t body_length)
++{
++	static uint8_t frame[512];
++
++	if (24 + body_length > sizeof(frame)) {
++		return false;
++	}
++	bzero(frame, 24);
++	frame[0] = (uint8_t)(subtype << 4);
++	memcpy(frame + 4, wf_net.bssid, 6);
++	memcpy(frame + 10, wf_address, 6);
++	memcpy(frame + 16, wf_net.bssid, 6);
++	wf_mgmt_seq = (uint16_t)((wf_mgmt_seq + 1) & 0xfff);
++	frame[22] = (uint8_t)(wf_mgmt_seq << 4);
++	frame[23] = (uint8_t)(wf_mgmt_seq >> 4);
++	memcpy(frame + 24, body, body_length);
++	return wf_tx_frame(frame, 24 + body_length, true, false, false, wf_mgmt_seq);
++}
++
++static bool
++wf_tx_ethernet(const uint8_t *frame, uint32_t length)
++{
++	const bool eapol = length >= 14 && frame[12] == 0x88 && frame[13] == 0x8e;
++
++	return wf_tx_frame(frame, length, false, eapol && !wf_net.keyed, wf_net.keyed, 0);
++}
++
++/* ---- the firmware's side of a network ---- */
++
++static void
++wf_bss_active(bool on)
++{
++	uint8_t activate[12] = { 0 };
++
++	activate[1] = on ? 1 : 0;
++	memcpy(activate + 4, wf_address, 6);
++	activate[10] = WF_WTBL_BMC;
++	(void)agate_wf_cmd(CMD_ID_BSS_ACTIVATE_CTRL, 1, activate, sizeof(activate));
++}
++
++static bool
++wf_scan(void)
++{
++	static uint8_t scan[1188], done[64];
++	static uint8_t scan_seq;
++	const uint32_t began = wf_ms();
++	int got;
++
++	if (wf_heard == NULL && (wf_heard = kalloc_data(WF_BSS_MOST * sizeof(*wf_heard), Z_WAITOK | Z_ZERO)) == NULL) {
++		return false;
++	}
++	wf_heard_count = 0;
++	if (!wf_net.joined) {
++		wf_bss_active(true);
++	}
++	bzero(scan, sizeof(scan));
++	scan[0] = ++scan_seq;
++	scan[2] = 1;                            /* active */
++	scan[3] = 1;                            /* SCAN_REQ_SSID_WILDCARD */
++	scan[6] = 0x02;                         /* ENUM_SCN_DBDC_SCAN_DIS */
++	scan[7] = 1;
++	(void)agate_wf_cmd(CMD_ID_SCAN_REQ_V2, 1, scan, sizeof(scan));
++	got = wf_wait(EVENT_ID_SCAN_DONE, 0, done, sizeof(done), 12000);
++	if (!wf_net.joined) {
++		wf_bss_active(false);
++	}
++	printf("agate wifi: scan %u %s in %u ms: %u networks heard, %u frames\n", scan_seq, got >= 0 ? "done" : "NOT DONE",
++	    wf_ms() - began, wf_heard_count, wf_frames);
++	return got >= 0;
++}
++
++static void
++wf_rates(const struct redwood_sta_bss *bss, uint16_t *all, uint16_t *basic)
++{
++	static const uint8_t rate[14] = { 2, 4, 11, 22, 44, 66, 12, 18, 24, 36, 48, 72, 96, 108 };
++	const uint8_t *ie = bss->elements, *end = bss->elements + bss->elements_length;
++
++	*all = *basic = 0;
++	for (; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
++		if (ie[0] != 1 && ie[0] != 50) {
++			continue;
++		}
++		for (unsigned i = 0; i < ie[1]; i++) {
++			for (unsigned b = 0; b < 14; b++) {
++				if ((ie[2 + i] & 0x7f) == rate[b]) {
++					*all |= (uint16_t)(1u << b);
++					*basic |= (ie[2 + i] & 0x80) ? (uint16_t)(1u << b) : 0;
++				}
++			}
++		}
++	}
++}
++
++static const uint8_t *
++wf_element(const struct redwood_sta_bss *bss, uint8_t id)
++{
++	const uint8_t *ie = bss->elements, *end = bss->elements + bss->elements_length;
++
++	for (; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
++		if (ie[0] == id) {
++			return ie;
++		}
++	}
++	return NULL;
++}
++
++/* CMD_SET_BSS_INFO (116 bytes, CMD_SET_BSS_RLM_PARAM at 68) */
++static void
++wf_bss_info(bool connected)
++{
++	uint8_t cmd[116] = { 0 };
++	const bool five = wf_net.channel > 14;
++	const uint16_t rate = wf_lowest_rate();
++
++	cmd[1] = connected ? 0 : 1;             /* MEDIA_STATE_CONNECTED / DISCONNECTED */
++	cmd[2] = 0;                             /* OP_MODE_INFRASTRUCTURE */
++	cmd[3] = wf_net.bss.ssid_length;
++	memcpy(cmd + 4, wf_net.bss.ssid, wf_net.bss.ssid_length);
++	memcpy(cmd + 36, wf_net.bssid, 6);
++	memcpy(cmd + 44, &wf_net.operational, 2);
++	memcpy(cmd + 46, &wf_net.basic, 2);
++	cmd[48] = 0;                            /* the access point's STA record */
++	memcpy(cmd + 50, &rate, 2);
++	cmd[52] = five ? 3 : 1;                 /* PHY_TYPE_OFDM_INDEX / PHY_TYPE_ERP_INDEX */
++	cmd[53] = wf_net.secure ? 7 : 0;        /* AUTH_MODE_WPA2_PSK / OPEN */
++	cmd[54] = wf_net.secure ? 6 : 1;        /* ENUM_ENCRYPTION3_ENABLED / DISABLED */
++	cmd[55] = wf_net.phy;
++	cmd[58] = WF_WTBL_BMC;
++	cmd[68] = 0;
++	cmd[69] = five ? 2 : 1;                 /* BAND_5G / BAND_2G4 */
++	cmd[70] = (uint8_t)wf_net.channel;
++	cmd[81] = (wf_net.bss.capability & 0x20) ? 1 : 0;
++	cmd[82] = (wf_net.bss.capability & 0x400) ? 1 : 0;
++	cmd[88] = 1;                            /* TX NSS */
++	cmd[89] = 1;                            /* RX NSS */
++	cmd[90] = 4;                            /* ENUM_BAND_AUTO */
++	cmd[93] = 1;
++	(void)agate_wf_cmd(CMD_ID_SET_BSS_INFO, 1, cmd, sizeof(cmd));
++}
++
++/* CMD_UPDATE_STA_RECORD: 196 bytes on this firmware (168 on the MT6768's), the same fields where set */
++static void
++wf_sta_record(uint8_t state)
++{
++	uint8_t cmd[196] = { 0 };
++	const uint16_t listen = 10;
++
++	cmd[1] = 0x41;                          /* STA_TYPE_LEGACY_AP */
++	memcpy(cmd + 2, wf_net.bssid, 6);
++	memcpy(cmd + 8, &wf_net.aid, 2);
++	memcpy(cmd + 10, &listen, 2);
++	cmd[13] = wf_net.phy;
++	memcpy(cmd + 14, &wf_net.operational, 2);
++	memcpy(cmd + 16, &wf_net.basic, 2);
++	cmd[20] = state;                        /* STA_STATE_1 / STA_STATE_3 */
++	cmd[23] = 1;                            /* CMD_UPDATE_STAREC_VER1 */
++	cmd[50] = (uint8_t)((wf_net.bss.rssi + 110) * 2);
++	cmd[54] = WF_WTBL_AP;
++	cmd[55] = WF_WTBL_BMC;
++	(void)agate_wf_cmd(CMD_ID_UPDATE_STA_RECORD, 1, cmd, sizeof(cmd));
++}
++
++static bool
++wf_channel(bool take)
++{
++	static uint8_t token;
++	uint8_t cmd[24] = { 0 }, granted[24];
++	const uint32_t most = 4000;
++	int got;
++
++	if (take) {
++		token = (uint8_t)(token + 1 != 0 ? token + 1 : 1);
++	}
++	cmd[1] = token;
++	cmd[2] = take ? 0 : 1;                  /* CMD_CH_ACTION_REQ / ABORT */
++	cmd[3] = (uint8_t)wf_net.channel;
++	cmd[5] = wf_net.channel > 14 ? 2 : 1;
++	cmd[9] = 0;                             /* CH_REQ_TYPE_JOIN */
++	cmd[10] = 4;                            /* ENUM_BAND_AUTO */
++	memcpy(cmd + 12, &most, 4);
++	(void)agate_wf_cmd(CMD_ID_CH_PRIVILEGE, 1, cmd, sizeof(cmd));
++	if (!take) {
++		return true;
++	}
++	got = wf_wait(EVENT_ID_CH_PRIVILEGE, 0, granted, sizeof(granted), 2000);
++	return got >= 3 && granted[2] == 0;     /* EVENT_CH_STATUS_GRANT */
++}
++
++static unsigned
++wf_rsn(uint8_t *rsn, uint8_t group)
++{
++	static const uint8_t ours[22] = { 48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac,
++		                         2, 0, 0 };
++
++	memcpy(rsn, ours, sizeof(ours));
++	rsn[7] = group;
++	return sizeof(ours);
++}
++
++static bool
++wf_add_key(bool pairwise, const uint8_t *key, unsigned length, unsigned index, uint8_t cipher, const uint8_t *rsc)
++{
++	uint8_t cmd[64] = { 0 };
++
++	cmd[0] = 1;
++	cmd[1] = pairwise ? 1 : 0;
++	cmd[2] = pairwise ? 1 : 0;
++	memcpy(cmd + 4, wf_net.bssid, 6);
++	cmd[11] = cipher;
++	cmd[12] = (uint8_t)index;
++	cmd[13] = (uint8_t)length;
++	cmd[14] = pairwise ? WF_WTBL_AP : WF_WTBL_BMC;
++	memcpy(cmd + 16, key, length);
++	if (rsc != NULL) {
++		memcpy(cmd + 48, rsc, 8);
++	}
++	(void)agate_wf_cmd(CMD_ID_ADD_REMOVE_KEY, 1, cmd, sizeof(cmd));
++	return true;
++}
++
++static void
++wf_eapol(const uint8_t *message, uint32_t length)
++{
++	static uint8_t reply[14 + LX_WPA_REPLY_MOST];
++	unsigned reply_length = 0;
++	const char *why = NULL;
++	int what;
++
++	if (!wf_net.joined || !wf_net.secure) {
++		return;
++	}
++	what = lx_wpa_message(&wf_net.wpa, message, length, reply + 14, &reply_length, &why);
++	if (wf_net.eapol_said++ < 8) {
++		printf("agate wifi [%u ms]: EAPOL of %u bytes: %s%s\n", wf_ms(), length, what == LX_WPA_ANSWER ?
++		    "message 1, answered" : what == LX_WPA_KEYS ? "message 3, answered; the keys go in" : what == LX_WPA_GROUP ?
++		    "a new group key" : what == LX_WPA_NOTHING ? "not for us" : "REFUSED: ", what == LX_WPA_BAD && why != NULL ? why : "");
++	}
++	if (what <= 0) {
++		return;
++	}
++	memcpy(reply, wf_net.bssid, 6);
++	memcpy(reply + 6, wf_address, 6);
++	reply[12] = 0x88;
++	reply[13] = 0x8e;
++	(void)wf_tx_ethernet(reply, 14 + reply_length);
++	if (what == LX_WPA_KEYS && (!wf_net.keyed || memcmp(wf_net.pairwise_in, wf_net.wpa.pairwise, 16) != 0)) {
++		(void)wf_add_key(true, wf_net.wpa.pairwise, 16, 0, 4 /* CIPHER_SUITE_CCMP */, NULL);
++		memcpy(wf_net.pairwise_in, wf_net.wpa.pairwise, 16);
++	}
++	if ((what == LX_WPA_KEYS || what == LX_WPA_GROUP) && wf_net.wpa.group_length <= sizeof(wf_net.group_in) &&
++	    (wf_net.group_in_length != wf_net.wpa.group_length || wf_net.group_in_index != wf_net.wpa.group_index ||
++	    memcmp(wf_net.group_in, wf_net.wpa.group, wf_net.wpa.group_length) != 0)) {
++		(void)wf_add_key(false, wf_net.wpa.group, wf_net.wpa.group_length, wf_net.wpa.group_index,
++		    wf_net.wpa.group_length == 32 ? 2 /* TKIP */ : 4 /* CCMP */, wf_net.wpa.group_counter);
++		memcpy(wf_net.group_in, wf_net.wpa.group, wf_net.wpa.group_length);
++		wf_net.group_in_length = wf_net.wpa.group_length;
++		wf_net.group_in_index = wf_net.wpa.group_index;
++	}
++	if (what == LX_WPA_KEYS) {
++		wf_net.keyed = true;
++	}
++}
++
++static int
++wf_join(const struct redwood_sta_join *what)
++{
++	static uint8_t body[320];
++	const uint32_t began = wf_ms();
++	const struct redwood_sta_bss *best = NULL;
++	const uint8_t *rsn_ie, *tim;
++	uint32_t got = 0, at;
++	uint16_t status = 0xffff, capability;
++	bool zero_bssid = (what->bssid[0] | what->bssid[1] | what->bssid[2] | what->bssid[3] | what->bssid[4] | what->bssid[5]) == 0;
++
++	for (unsigned pass = 0; pass < 2 && best == NULL; pass++) {
++		if (pass == 1 && !wf_scan()) {
++			break;
++		}
++		for (unsigned i = 0; i < wf_heard_count; i++) {
++			const struct redwood_sta_bss *b = &wf_heard[i];
++
++			if (b->ssid_length == what->ssid_length && memcmp(b->ssid, what->ssid, b->ssid_length) == 0 &&
++			    (zero_bssid || memcmp(b->bssid, what->bssid, 6) == 0) && (best == NULL || b->rssi > best->rssi)) {
++				best = b;
++			}
++		}
++	}
++	if (best == NULL) {
++		printf("agate wifi: join: the network asked for is not heard\n");
++		return ENOENT;
++	}
++	bzero(&wf_net, sizeof(wf_net));
++	wf_net.bss = *best;
++	memcpy(wf_net.bssid, best->bssid, 6);
++	wf_net.channel = best->frequency == 2484 ? 14 : best->frequency < 5000 ? (best->frequency - 2407u) / 5 :
++	    (best->frequency - 5000u) / 5;
++	wf_rates(best, &wf_net.operational, &wf_net.basic);
++	wf_net.phy = wf_net.channel > 14 ? (1u << 3) : (wf_net.operational & 0x3f00) ? 0x3 : 0x1;
++	rsn_ie = wf_element(best, 48);
++	wf_net.secure = what->security == REDWOOD_STA_WPA2_PSK;
++	if (wf_net.secure != (rsn_ie != NULL)) {
++		printf("agate wifi: join: the network is %s, and %s was asked for\n", rsn_ie != NULL ? "WPA2" : "open",
++		    wf_net.secure ? "WPA2" : "an open one");
++		return EPROTONOSUPPORT;
++	}
++	if (wf_net.secure) {
++		wf_net.group_cipher = rsn_ie[1] >= 6 ? rsn_ie[7] : 4;
++		wf_net.rsn_length = wf_rsn(wf_net.rsn, wf_net.group_cipher);
++		if (what->passphrase_length != 0) {
++			lx_wpa_pmk(what->passphrase, what->passphrase_length, best->ssid, best->ssid_length, wf_net.wpa.pmk);
++		} else {
++			memcpy(wf_net.wpa.pmk, what->pmk, 32);
++		}
++		memcpy(wf_net.wpa.own, wf_address, 6);
++		memcpy(wf_net.wpa.peer, wf_net.bssid, 6);
++		read_random(wf_net.wpa.own_nonce, sizeof(wf_net.wpa.own_nonce));
++		wf_net.wpa.rsn = wf_net.rsn;
++		wf_net.wpa.rsn_length = wf_net.rsn_length;
++	}
++	printf("agate wifi [%u ms]: joining %02x:%02x:%02x:..:%02x on channel %u (%d dBm, %s, rates %#x basic %#x)\n",
++	    wf_ms(), wf_net.bssid[0], wf_net.bssid[1], wf_net.bssid[2], wf_net.bssid[5], wf_net.channel, best->rssi,
++	    wf_net.secure ? "WPA2" : "open", wf_net.operational, wf_net.basic);
++
++	wf_bss_active(true);
++	if (!wf_channel(true)) {
++		printf("agate wifi: join: the channel was NOT GRANTED\n");
++		wf_bss_active(false);
++		return EIO;
++	}
++	wf_bss_info(false);
++	wf_sta_record(0);                       /* STA_STATE_1 */
++	wf_mgmt.full = false;
++
++	wf_mgmt_heard = 0;
++	for (unsigned try = 0; try < 3 && status != 0; try++) {
++		const uint8_t auth[6] = { 0, 0, 1, 0, 0, 0 };
++
++		(void)wf_tx_mgmt(11, auth, sizeof(auth));
++		if ((got = wf_wait_mgmt(11, 300)) >= 30 && wf_mgmt.frame[26] == 2) {
++			status = (uint16_t)(wf_mgmt.frame[28] | wf_mgmt.frame[29] << 8);
++		}
++	}
++	printf("agate wifi [%u ms]: authentication %s (status %u; %u frames from it, %u frames in all)\n", wf_ms(),
++	    status == 0 ? "accepted" : got == 0 ? "NOT ANSWERED" : "REFUSED", status, wf_mgmt_heard, wf_frames);
++	if (status != 0) {
++		goto failed;
++	}
++
++	capability = (uint16_t)((best->capability & 0x0421) | 0x0001 | (wf_net.secure ? 0x0010 : 0));
++	at = 0;
++	memcpy(body + at, &capability, 2);
++	body[at + 2] = 10;
++	body[at + 3] = 0;
++	at += 4;
++	body[at++] = 0;
++	body[at++] = best->ssid_length;
++	memcpy(body + at, best->ssid, best->ssid_length);
++	at += best->ssid_length;
++	for (uint8_t id = 1; id <= 50; id += 49) {
++		const uint8_t *ie = wf_element(best, id);
++
++		if (ie != NULL && at + 2 + ie[1] <= sizeof(body) - 32) {
++			memcpy(body + at, ie, 2 + ie[1]);
++			at += 2 + ie[1];
++		}
++	}
++	if (wf_net.secure) {
++		memcpy(body + at, wf_net.rsn, wf_net.rsn_length);
++		at += wf_net.rsn_length;
++	}
++	status = 0xffff;
++	for (unsigned try = 0; try < 3 && status != 0; try++) {
++		(void)wf_tx_mgmt(0, body, at);
++		if ((got = wf_wait_mgmt(1, 500)) >= 30) {
++			status = (uint16_t)(wf_mgmt.frame[26] | wf_mgmt.frame[27] << 8);
++			wf_net.aid = (uint16_t)((wf_mgmt.frame[28] | wf_mgmt.frame[29] << 8) & 0x3fff);
++		}
++	}
++	printf("agate wifi [%u ms]: association %s (status %u, AID %u)\n", wf_ms(), status == 0 ? "accepted" :
++	    got == 0 ? "NOT ANSWERED" : "REFUSED", status, wf_net.aid);
++	if (status != 0) {
++		goto failed;
++	}
++
++	wf_sta_record(2);                       /* STA_STATE_3 */
++	wf_bss_info(true);
++	{
++		uint8_t pm[12] = { 0 };
++
++		tim = wf_element(best, 5);
++		pm[1] = tim != NULL && tim[1] >= 2 ? tim[3] : 1;
++		memcpy(pm + 2, &wf_net.aid, 2);
++		memcpy(pm + 4, &best->beacon_interval, 2);
++		(void)agate_wf_cmd(CMD_ID_INDICATE_PM_BSS_CONNECTED, 1, pm, sizeof(pm));
++	}
++	(void)wf_channel(false);
++	{
++		const uint8_t cam[4] = { 0, 0, 0, 0 };          /* CMD_PS_PROFILE: constantly awake */
++
++		(void)agate_wf_cmd(CMD_ID_POWER_SAVE_MODE, 1, cam, sizeof(cam));
++	}
++	wf_net.joined = true;
++	if (wf_net.secure) {
++		for (unsigned t = 0; t < 8000 && !wf_net.keyed && wf_net.joined; t += 10) {
++			wf_pump();
++			lck_mtx_unlock(&wf_lock);
++			delay(10000);
++			lck_mtx_lock(&wf_lock);
++		}
++		if (!wf_net.keyed) {
++			printf("agate wifi [%u ms]: WPA2's handshake did NOT come through (%u messages; %u Ethernet frames, %u dropped)\n",
++			    wf_ms(), wf_net.eapol_said, wf_rx_ethernets, wf_rx_dropped);
++			wf_net.joined = false;
++			goto failed;
++		}
++	}
++	wf_net.linked = true;
++	redwood_net_link_state(true);
++	printf("agate wifi [%u ms]: THE NETWORK IS JOINED%s, %u ms in all\n", wf_ms(), wf_net.secure ?
++	    " AND ITS KEYS ARE IN" : "", wf_ms() - began);
++	return 0;
++
++failed:
++	(void)wf_channel(false);
++	{
++		const uint8_t remove[4] = { 0, 0, 0, 0 };
++
++		(void)agate_wf_cmd(CMD_ID_REMOVE_STA_RECORD, 1, remove, sizeof(remove));
++	}
++	wf_bss_active(false);
++	return wf_net.secure && wf_net.eapol_said != 0 ? EAUTH : ETIMEDOUT;
++}
++
++static void
++wf_leave(void)
++{
++	const uint8_t reason[2] = { 3, 0 };
++	const uint8_t remove[4] = { 0, 0, 0, 0 };
++
++	if (!wf_net.joined) {
++		return;
++	}
++	(void)wf_tx_mgmt(12, reason, sizeof(reason));
++	wf_net.joined = wf_net.linked = wf_net.keyed = false;
++	redwood_net_link_state(false);
++	(void)agate_wf_cmd(CMD_ID_REMOVE_STA_RECORD, 1, remove, sizeof(remove));
++	wf_bss_info(false);
++	wf_bss_active(false);
++}
++
++/* ---- the station (sys/redwood_sta.h) ---- */
++
++static enum redwood_sta_phase wf_phase = REDWOOD_STA_OFF;
++static int wf_last_error;
++
++static int
++wf_op_power(bool on)
++{
++	lck_mtx_lock(&wf_lock);
++	if (!on) {
++		wf_leave();
++	}
++	wf_phase = on ? REDWOOD_STA_IDLE : REDWOOD_STA_OFF;
++	lck_mtx_unlock(&wf_lock);
++	return 0;
++}
++
++static int
++wf_op_scan(__unused const struct redwood_sta_scan *what)
++{
++	bool done;
++
++	lck_mtx_lock(&wf_lock);
++	if (wf_phase == REDWOOD_STA_OFF) {
++		lck_mtx_unlock(&wf_lock);
++		return ENETDOWN;
++	}
++	if (wf_phase != REDWOOD_STA_JOINED) {
++		wf_phase = REDWOOD_STA_SCANNING;
++	}
++	done = wf_scan();
++	if (wf_phase == REDWOOD_STA_SCANNING) {
++		wf_phase = REDWOOD_STA_IDLE;
++	}
++	lck_mtx_unlock(&wf_lock);
++	return done ? 0 : EIO;
++}
++
++static void
++wf_op_heard(void (*each)(const struct redwood_sta_bss *bss, void *context), void *context)
++{
++	lck_mtx_lock(&wf_lock);
++	for (unsigned i = 0; i < wf_heard_count; i++) {
++		each(&wf_heard[i], context);
++	}
++	lck_mtx_unlock(&wf_lock);
++}
++
++static int
++wf_op_join(const struct redwood_sta_join *what)
++{
++	int error;
++
++	lck_mtx_lock(&wf_lock);
++	if (wf_phase == REDWOOD_STA_OFF) {
++		lck_mtx_unlock(&wf_lock);
++		return ENETDOWN;
++	}
++	wf_leave();
++	wf_phase = REDWOOD_STA_JOINING;
++	error = wf_join(what);
++	wf_phase = error == 0 ? REDWOOD_STA_JOINED : REDWOOD_STA_IDLE;
++	wf_last_error = error;
++	lck_mtx_unlock(&wf_lock);
++	return error;
++}
++
++static int
++wf_op_leave(void)
++{
++	lck_mtx_lock(&wf_lock);
++	wf_leave();
++	if (wf_phase == REDWOOD_STA_JOINED) {
++		wf_phase = REDWOOD_STA_IDLE;
++	}
++	lck_mtx_unlock(&wf_lock);
++	return 0;
++}
++
++static void
++wf_op_state(struct redwood_sta_state *state)
++{
++	bzero(state, sizeof(*state));
++	state->phase = wf_net.joined ? REDWOOD_STA_JOINED : wf_phase == REDWOOD_STA_JOINED ? REDWOOD_STA_IDLE : wf_phase;
++	if (wf_net.joined) {
++		state->bss = wf_net.bss;
++	}
++	state->last_error = wf_last_error;
++}
++
++static unsigned
++wf_op_channels(struct redwood_sta_channel *channels, unsigned most)
++{
++	static const uint8_t five[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
++		                        144, 149, 153, 157, 161, 165 };
++	unsigned n = 0;
++
++	for (unsigned c = 1; c <= 13 && n < most; c++) {
++		channels[n++] = (struct redwood_sta_channel){ wf_frequency(c), 0 };
++	}
++	for (unsigned i = 0; i < sizeof(five) && n < most; i++) {
++		const bool radar = five[i] >= 52 && five[i] <= 144;
++
++		channels[n++] = (struct redwood_sta_channel){ wf_frequency(five[i]),
++			                                      (uint16_t)(radar ? REDWOOD_STA_CHANNEL_PASSIVE | REDWOOD_STA_CHANNEL_RADAR : 0) };
++	}
++	return n;
++}
++
++static struct redwood_sta_ops wf_ops = {
++	.power = wf_op_power,
++	.scan = wf_op_scan,
++	.heard = wf_op_heard,
++	.join = wf_op_join,
++	.leave = wf_op_leave,
++	.state = wf_op_state,
++	.channels = wf_op_channels,
++};
++
++/* from AgateWLAN's outputPacket */
++int
++agate_mtkwifi_transmit(const uint8_t *frame, uint32_t length)
++{
++	bool sent;
++
++	if (!wf_up || !wf_net.linked || length < 14 || length > REDWOOD_NET_FRAME_MAX) {
++		return -1;
++	}
++	lck_mtx_lock(&wf_lock);
++	sent = wf_net.linked && wf_tx_ethernet(frame, length);
++	if (sent) {
++		wf_st.tx++;
++	} else {
++		wf_st.tx_failed++;
++	}
++	lck_mtx_unlock(&wf_lock);
++	return sent ? 0 : -1;
++}
++
++/* the rings, every 2 ms while frames come and every 10 ms when not */
++static void
++wf_poll_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t last_said = 0;
++
++	for (;;) {
++		unsigned before = wf_frames;
++
++		if (lck_mtx_try_lock(&wf_lock)) {
++			wf_pump();
++			if (wf_net.linked && wf_ms() - last_said >= 10000 && wf_st.said < 40) {
++				last_said = wf_ms();
++				wf_st.said++;
++				printf("agate wifi: carried: sent %u (%u not), in: %u to us, %u to all -- ARP %u, UDP %u, TCP %u, other %u; "
++				    "dropped: %u in the clear, %u of another WTBL entry, %u with errors\n", wf_st.tx, wf_st.tx_failed,
++				    wf_st.unicast, wf_st.broadcast, wf_st.arp, wf_st.udp, wf_st.tcp, wf_st.other, wf_st.clear, wf_st.wtbl,
++				    wf_st.error);
++			}
++			lck_mtx_unlock(&wf_lock);
++		}
++		delay(wf_frames != before ? 2000 : 10000);
++	}
++}
++
++/* early (bsd_init): en0 made, so wifid finds it when it starts */
++void
++agate_mtkwifi_early(const uint8_t mac[6])
++{
++	memcpy(wf_address, mac, 6);
++	wf_made = agate_wlan_create(wf_address) == 0;
++	printf("agate wifi: en0 %s (%02x:%02x:%02x:%02x:%02x:%02x)\n", wf_made ? "made for the radio" : "NOT MADE",
++	    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++}
++
++/* once the firmware runs and has its NVRAM (agate_conninfra.c, agatewifi >= 8) */
++void
++agate_mtkwifi_attach(void)
++{
++	thread_t th;
++	static struct redwood_sta_join given;
++	char ssid[33] = { 0 }, psk[65] = { 0 };
++
++	if (!wf_made) {
++		printf("agate wifi: no en0: the station is not attached\n");
++		return;
++	}
++	if (kernel_thread_start(wf_poll_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++	lck_mtx_lock(&wf_lock);
++	(void)wf_scan();
++	lck_mtx_unlock(&wf_lock);
++	for (unsigned i = 0; i < wf_heard_count; i++) {
++		printf("WIFI  %4u MHz  %4d dBm  %02x:%02x:%02x:%02x:%02x:%02x  \"%.*s\"\n", wf_heard[i].frequency, wf_heard[i].rssi,
++		    wf_heard[i].bssid[0], wf_heard[i].bssid[1], wf_heard[i].bssid[2], wf_heard[i].bssid[3], wf_heard[i].bssid[4],
++		    wf_heard[i].bssid[5], wf_heard[i].ssid_length, (const char *)wf_heard[i].ssid);
++	}
++	memcpy(wf_ops.address, wf_address, sizeof(wf_ops.address));
++	wf_phase = REDWOOD_STA_IDLE;
++	wf_up = true;
++	redwood_sta_attach(&wf_ops);
++	printf("agate wifi: the radio is the station behind en0: iOS's Wi-Fi side can scan and join\n");
++
++	if (PE_parse_boot_argn("agatessid", ssid, sizeof(ssid) - 1) && ssid[0] != 0) {
++		bzero(&given, sizeof(given));
++		given.ssid_length = (uint8_t)strnlen(ssid, 32);
++		memcpy(given.ssid, ssid, given.ssid_length);
++		if (PE_parse_boot_argn("agatepsk", psk, sizeof(psk) - 1) && psk[0] != 0) {
++			given.passphrase_length = (uint8_t)strnlen(psk, 63);
++			memcpy(given.passphrase, psk, given.passphrase_length);
++			given.security = REDWOOD_STA_WPA2_PSK;
++		} else {
++			given.security = REDWOOD_STA_OPEN;
++		}
++		(void)redwood_sta_ask_join_standing(&given);
++		printf("agate wifi: the network of the boot-args asked for (%u bytes of name, %s)\n", given.ssid_length,
++		    given.security == REDWOOD_STA_WPA2_PSK ? "WPA2" : "open");
++		bzero(psk, sizeof(psk));
++	}
++}
+diff --git a/bsd/dev/agate_wlan/redwood_apple80211.c b/bsd/dev/agate_wlan/redwood_apple80211.c
+new file mode 100644
+index 0000000..74ee80a
+--- /dev/null
++++ b/bsd/dev/agate_wlan/redwood_apple80211.c
+@@ -0,0 +1,744 @@
++/*
++ * agate (Xiaomi 11T): taken from HakiOS (github.com/oosexgang/hakios-xnu-kernel, branch mtk,
++ * xnu/files/bsd/...), Apple Public Source License 2.0 as that project states for its XNU files.
++ * Unchanged except where marked "agate:".
++ */
++/*
++ * Darwin-on-redwood: Apple80211, answered in the kernel.
++ *
++ * iOS's Wi-Fi side -- wifid, and through it Settings and the status bar -- talks to a Wi-Fi
++ * driver in requests that were once ioctls and are, where the driver offers no user client,
++ * ioctls still: SIOCGA80211 and SIOCSA80211 on any socket, with a struct apple80211req that
++ * names the interface, a request type, a value, and a buffer in the caller's memory
++ * (IO80211.framework: Apple80211Get/Set and their kin all end there). XNU hands an interface
++ * ioctl it does not know to the interface, so they arrive in bsd/dev/redwood_net.c, which
++ * passes them here when its link is a radio.
++ *
++ * What is asked is answered from the station boundary (sys/redwood_sta.h): the radio's power,
++ * its channels, a scan and what it heard, the network joined. What happens there by itself is
++ * told to iOS the way a driver tells it: kernel events of class 6 (IEEE 802.11), subclass 1,
++ * whose code is Apple80211's own event number and whose data begins with the interface's name
++ * in 16 bytes (IO80211.framework reads them from a PF_SYSTEM socket and compares the name).
++ *
++ * Every request is still written to the log -- who asks, get or set, the type, the value, the
++ * length -- because which of them wifid needs is found that way. Never what a request carries:
++ * a network's name or its key may be in there.
++ *
++ * The request types and the layouts are Apple's. The old ones are as the headers of its open
++ * IO80211 sources once described them (apple80211_ioctl.h, apple80211_var.h); where iOS 16.5
++ * differs the layout was read out of IO80211.framework of 16.5, which fills and reads the same
++ * structures on the other side (Apple80211GetWithIOCTL, _getScanData, _addScanResultToList,
++ * _performAssociation, _dispatchAsyncAssocEvent, _dispatchLinkChangedEvent).
++ *
++ * A join: ASSOCIATE (20) carries the network's name, perhaps its access point, and the
++ * passphrase as typed (the framework does not make the key of it), and is answered at once;
++ * when the station has joined or failed, event 9 says so, and ASSOCIATE_RESULT (21) gives the
++ * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
++ * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
++ */
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <sys/errno.h>
++#include <sys/kern_event.h>
++#include <sys/kernel.h>
++#include <sys/proc.h>
++#include <sys/redwood_input.h>
++#include <sys/redwood_net.h>
++#include <sys/redwood_sta.h>
++#include <sys/sockio.h>
++#include <sys/systm.h>
++
++#define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
++#define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
++
++struct apple80211req {
++	char req_if_name[16];
++	int32_t req_type;
++	int32_t req_val;
++	uint32_t req_len;
++	user_addr_t req_data __attribute__((aligned(8)));
++};
++
++/* (as far as they have come by: the names help reading the log) */
++static const char *
++type_name(int32_t type)
++{
++	static const struct {
++		int32_t type;
++		const char *name;
++	} names[] = {
++		{ 1, "SSID" }, { 2, "AUTH_TYPE" }, { 3, "CIPHER_KEY" }, { 4, "CHANNEL" }, { 5, "POWERSAVE" }, { 6, "PROTMODE" },
++		{ 7, "TXPOWER" }, { 8, "RATE" }, { 9, "BSSID" }, { 10, "SCAN_REQ" }, { 11, "SCAN_RESULT" }, { 12, "CARD_CAPABILITIES" },
++		{ 13, "STATE" }, { 14, "PHY_MODE" }, { 15, "OP_MODE" }, { 16, "RSSI" }, { 17, "NOISE" }, { 18, "INT_MIT" }, { 19, "POWER" },
++		{ 20, "ASSOCIATE" }, { 21, "ASSOCIATE_RESULT" }, { 22, "DISASSOCIATE" }, { 23, "STATUS_DEV_NAME" }, { 24, "IBSS_MODE" },
++		{ 25, "HOST_AP_MODE" }, { 26, "AP_MODE" }, { 27, "SUPPORTED_CHANNELS" }, { 28, "LOCALE" }, { 29, "DEAUTH" },
++		{ 30, "COUNTERMEASURES" }, { 32, "RATE_SET" }, { 42, "STATION_LIST" }, { 43, "DRIVER_VERSION" },
++		{ 44, "HARDWARE_VERSION" }, { 46, "RSN_IE" }, { 47, "BACKGROUND_SCAN" }, { 48, "AP_IE_LIST" }, { 49, "STATS" },
++		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
++		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
++		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
++		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
++	};
++
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (names[i].type == type) {
++			return names[i].name;
++		}
++	}
++	return "?";
++}
++
++/* ---- the layouts ------------------------------------------------------------------------------------------ */
++
++#define CHANNEL_20MHZ           0x2u
++#define CHANNEL_2GHZ            0x8u
++#define CHANNEL_5GHZ            0x10u
++#define CHANNEL_ACTIVE          0x80u           /* the radio may send there */
++#define CHANNEL_DFS             0x100u
++
++struct apple80211_channel {
++	uint32_t version, channel, flags;
++};
++
++/* SUPPORTED_CHANNELS (27) and HW_SUPPORTED_CHANNELS (254): 4824 bytes */
++struct apple80211_channels {
++	uint32_t version, count;
++	struct apple80211_channel channels[401];
++	uint32_t unused;
++};
++
++/* CHANNELS_INFO (207): 10016 bytes; of each channel a byte in each of several rows, and a word of flags */
++struct apple80211_channels_info {
++	uint8_t unknown_0[12];
++	uint16_t count;
++	uint8_t unknown_1[800];
++	uint8_t number[400], indoor[400], dfs[400], passive[400], wide_40[400], wide_80[400];
++	uint8_t unknown_2[1602];
++	uint32_t flags[400];
++	uint8_t unknown_3[3600];
++} __attribute__((packed));
++
++/* SCAN_REQ (10): 5456 bytes */
++struct apple80211_scan_request {
++	uint32_t version, bss_type;
++	uint8_t bssid[6], unused_0[2];
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint32_t scan_type;                     /* 1: asking, 2: listening only */
++	uint32_t phy_mode;
++	uint16_t dwell_ms, unused_1;
++	uint32_t rest_ms;
++	uint32_t channel_count;
++	struct apple80211_channel channels[400];
++	uint64_t flags;
++	uint32_t unused_2;
++	uint32_t name_count;                    /* networks asked for by name, each in 56 bytes */
++	uint8_t names[10][56];
++	uint32_t short_ssid, unused_3;
++};
++
++/* SCAN_RESULT (11) and CURRENT_NETWORK (103): 1164 bytes */
++struct apple80211_scan_result {
++	uint32_t version;
++	struct apple80211_channel channel;
++	uint16_t noise_known;
++	int16_t noise, snr, rssi;
++	uint16_t beacon_interval, capability;
++	uint8_t bssid[6];
++	uint8_t rate_count, unused_0;
++	uint32_t rates[15];                     /* Mbit/s */
++	uint8_t ssid_length, ssid[32], unused_1[3];
++	uint32_t age_ms;
++	uint8_t flags, unused_2;
++	uint16_t elements_length;               /* comes in as the room there is */
++	uint8_t elements[1024];
++};
++
++/* ASSOCIATE (20): 592 bytes; of what follows the key (the RSN element wifid built, flags) nothing is used */
++struct apple80211_assoc {
++	uint32_t version;
++	uint16_t mode, auth_lower, auth_upper, unused_0;
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint8_t bssid[6], unused_1[2];
++	uint32_t key_version, key_length, key_cipher;   /* cipher 10: a passphrase as typed; 6: the key (from 64 hex digits) */
++	uint16_t key_flags, key_index;
++	uint8_t key[64];
++	uint8_t rest[0x250 - 0x88];
++};
++
++#define CIPHER_PMK              6
++#define CIPHER_PASSPHRASE       10
++
++/* the link event's data (at least 32 bytes, or the framework drops the event) */
++struct apple80211_link_changed {
++	uint8_t down, unused_0[3];
++	int32_t rssi;
++	uint16_t snr, noise;
++	uint8_t unused_1[4];
++	uint8_t involuntary, unused_2[3];
++	uint32_t reason, subreason;
++	uint8_t unused_3[4];
++};
++
++_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
++    "the association request as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
++    "the link event as iOS 16.5 reads it");
++_Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_channels_info) == 10016 && offsetof(struct apple80211_channels_info, number) == 0x32e &&
++    offsetof(struct apple80211_channels_info, flags) == 0x12d0, "the channels' description as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_scan_request) == 5456 && offsetof(struct apple80211_scan_request, channels) == 0x48 &&
++    offsetof(struct apple80211_scan_request, flags) == 0x1308 && offsetof(struct apple80211_scan_request, names) == 0x1318,
++    "the scan request as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct apple80211_scan_result, ssid_length) == 0x60 &&
++    offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c,
++    "a scan's result as iOS 16.5 has it");
++
++/* Apple80211's events (APPLE80211_M_...) */
++enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
++       EVENT_SCAN_DONE = 10 };
++
++static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
++
++static LCK_GRP_DECLARE(apple80211_lock_group, "redwood-apple80211");
++static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
++static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
++static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
++
++/* ---- channels ---------------------------------------------------------------------------------------- */
++
++static unsigned
++channel_number(unsigned frequency)
++{
++	return frequency == 2484 ? 14 : frequency < 4000 ? (frequency - 2407) / 5 : (frequency - 5000) / 5;
++}
++
++static unsigned
++channel_frequency(const struct apple80211_channel *channel)
++{
++	bool low = channel->flags & CHANNEL_2GHZ ? true : channel->flags & CHANNEL_5GHZ ? false : channel->channel <= 14;
++
++	if (channel->channel == 0 || channel->channel > 196 || (channel->flags & 0x2000)) {     /* (0x2000: 6 GHz) */
++		return 0;
++	}
++	return low ? (channel->channel == 14 ? 2484 : 2407 + 5 * channel->channel) : 5000 + 5 * channel->channel;
++}
++
++static void
++channel_fill(struct apple80211_channel *channel, unsigned frequency, unsigned flags)
++{
++	channel->version = 1;
++	channel->channel = channel_number(frequency);
++	channel->flags = CHANNEL_20MHZ | (frequency < 4000 ? CHANNEL_2GHZ : CHANNEL_5GHZ) | (flags & REDWOOD_STA_CHANNEL_PASSIVE ?
++	    0 : CHANNEL_ACTIVE) | (flags & REDWOOD_STA_CHANNEL_RADAR ? CHANNEL_DFS : 0);
++}
++
++/* ---- what the caller is given back ------------------------------------------------------------------- */
++
++/* At most as many bytes as it has room for. */
++static int
++give(const struct apple80211req *request, const void *data, size_t length)
++{
++	return request->req_data == USER_ADDR_NULL ? 0 : copyout(data, request->req_data, length < request->req_len ? length :
++	       request->req_len);
++}
++
++/* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
++static int
++give_network(const struct apple80211req *request, const struct redwood_sta_bss *bss)
++{
++	struct apple80211_scan_result *result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
++	unsigned room = sizeof(result->elements);
++	int error;
++
++	if (result == NULL) {
++		return ENOMEM;
++	}
++	if (request->req_len >= sizeof(*result) && copyin(request->req_data, result, offsetof(struct apple80211_scan_result,
++	    elements)) == 0 && result->elements_length < room) {
++		room = result->elements_length;
++	}
++	bzero(result, sizeof(*result));
++	result->version = 1;
++	channel_fill(&result->channel, bss->frequency, 0);
++	result->rssi = bss->rssi;
++	result->beacon_interval = bss->beacon_interval;
++	result->capability = bss->capability;
++	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
++	result->ssid_length = bss->ssid_length;
++	memcpy(result->ssid, bss->ssid, bss->ssid_length);
++	result->age_ms = bss->age_ms;
++	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
++	memcpy(result->elements, bss->elements, result->elements_length);
++	/* the rates it says it has (elements 1 and 50: units of 500 kbit/s, the top bit marks the ones everybody must have) */
++	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
++	    at += 2 + bss->elements[at + 1]) {
++		for (unsigned i = 0; (bss->elements[at] == 1 || bss->elements[at] == 50) && i < bss->elements[at + 1]; i++) {
++			unsigned rate = (bss->elements[at + 2 + i] & 0x7f) / 2;
++
++			if (rate != 0 && rate <= 54 && result->rate_count < 15) {
++				result->rates[result->rate_count++] = rate;
++			}
++		}
++	}
++	error = give(request, result, sizeof(*result));
++	kfree_data(result, sizeof(*result));
++	return error;
++}
++
++/* ---- get ---------------------------------------------------------------------------------------------- */
++
++static int
++get(struct apple80211req *request)
++{
++	struct redwood_sta_state *state;
++	int error = 0;
++
++	switch (request->req_type) {
++	case 43:
++	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
++		static const char name[256] = "redwood: ath11k for the WCN6750";
++
++		return give(request, name, sizeof(name));
++	}
++	case 12: {
++		/*
++		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): the 13 bytes are the
++		 * bits alone, from the first (the framework hands in a buffer that begins after the old
++		 * header's version word). AES, AES-CCM, power management, short slot and preamble, WPA2, WME,
++		 * short guard interval at 20 MHz. Read wrong, the framework sees no WPA2 and builds no join
++		 * for a WPA2 network ("Unable to join").
++		 */
++		uint8_t bits[13] = { 0 };
++		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++
++		for (unsigned i = 0; i < sizeof(has); i++) {
++			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
++		}
++		return give(request, bits, sizeof(bits));
++	}
++	case 19: {                              /* the radio's power: one radio. Until the driver is up it counts as on: it */
++		struct {                        /* is being brought up, and iOS asks this once, early */
++			uint32_t version, radios, state[4];
++		} answer = { .version = 1, .radios = 1, .state = { !redwood_sta_present() || redwood_sta_powered() } };
++
++		return give(request, &answer, sizeof(answer));
++	}
++	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
++		request->req_val = 1;
++		return 0;
++	case 27:
++	case 254: {                             /* the channels the radio may tune to */
++		struct apple80211_channels *answer;
++		struct redwood_sta_channel channels[96];
++		unsigned count = redwood_sta_channels(channels, 96);
++
++		if (count == 0 || (answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO)) == NULL) {
++			return count == 0 ? ENXIO : ENOMEM;
++		}
++		answer->version = 1;
++		answer->count = count;
++		for (unsigned i = 0; i < count; i++) {
++			channel_fill(&answer->channels[i], channels[i].frequency, channels[i].flags);
++		}
++		error = give(request, answer, sizeof(*answer));
++		kfree_data(answer, sizeof(*answer));
++		return error;
++	}
++	case 207: {                             /* ... and more of each */
++		struct apple80211_channels_info *answer;
++		struct redwood_sta_channel channels[96];
++		unsigned count = redwood_sta_channels(channels, 96);
++
++		if (count == 0 || (answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO)) == NULL) {
++			return count == 0 ? ENXIO : ENOMEM;
++		}
++		answer->count = (uint16_t)count;
++		for (unsigned i = 0; i < count; i++) {
++			struct apple80211_channel channel;
++
++			channel_fill(&channel, channels[i].frequency, channels[i].flags);
++			answer->number[i] = (uint8_t)channel.channel;
++			answer->dfs[i] = (channels[i].flags & REDWOOD_STA_CHANNEL_RADAR) != 0;
++			answer->passive[i] = (channels[i].flags & REDWOOD_STA_CHANNEL_PASSIVE) != 0;
++			answer->flags[i] = channel.flags;
++		}
++		error = give(request, answer, sizeof(*answer));
++		kfree_data(answer, sizeof(*answer));
++		return error;
++	}
++	case 21:                                /* how the last join went (0: not over yet) */
++		lck_mtx_lock(&apple80211_lock);
++		request->req_val = (int32_t)join_result;
++		lck_mtx_unlock(&apple80211_lock);
++		return 0;
++	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
++		struct redwood_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
++		unsigned index;
++		bool there;
++
++		if (bss == NULL) {
++			return ENOMEM;
++		}
++		lck_mtx_lock(&apple80211_lock);
++		index = result_next++;
++		lck_mtx_unlock(&apple80211_lock);
++		there = redwood_sta_heard(index, bss);
++		error = there ? give_network(request, bss) : EIO;
++		kfree_data(bss, sizeof(*bss));
++		return error;
++	}
++	default:
++		break;
++	}
++
++	/* the rest is about the network joined, and there is none unless the station says so */
++	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
++		return ENOMEM;
++	}
++	redwood_sta_state(state);
++	switch (request->req_type) {
++	case 13:                                /* the state: APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
++		request->req_val = state->phase == REDWOOD_STA_JOINED ? 4 : state->phase == REDWOOD_STA_JOINING ? 2 :
++		    state->phase == REDWOOD_STA_SCANNING ? 1 : 0;
++		break;
++	case 1:                                 /* its name; the length goes back in the request */
++		if (state->phase != REDWOOD_STA_JOINED) {
++			error = ENXIO;
++		} else if ((error = give(request, state->bss.ssid, state->bss.ssid_length)) == 0) {
++			request->req_len = state->bss.ssid_length;
++		}
++		break;
++	case 9:                                 /* its access point's address */
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, state->bss.bssid, 6);
++		break;
++	case 4: {                               /* its channel */
++		struct {
++			uint32_t version;
++			struct apple80211_channel channel;
++		} answer = { .version = 1 };
++
++		if (state->phase != REDWOOD_STA_JOINED) {
++			error = ENXIO;
++		} else {
++			channel_fill(&answer.channel, state->bss.frequency, 0);
++			error = give(request, &answer, sizeof(answer));
++		}
++		break;
++	}
++	case 16: {                              /* how strongly it is heard: dBm, per radio and all together, twice over */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi }, .all = state->bss.rssi,
++			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
++
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 103:                               /* all of it, as a scan's result */
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
++		break;
++	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
++		struct {
++			uint32_t version, lower, upper, extended;
++		} answer = { .version = 1, .lower = 1, .upper = 8 };
++
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	default:
++		error = EOPNOTSUPP;
++		break;
++	}
++	kfree_data(state, sizeof(*state));
++	return error;
++}
++
++/* ---- set ---------------------------------------------------------------------------------------------- */
++
++static int
++set_scan(const struct apple80211req *request, char *said, size_t said_size)
++{
++	struct apple80211_scan_request *asked;
++	struct redwood_sta_scan *what;
++	unsigned unknown = 0;
++	int error;
++
++	if (request->req_len != sizeof(*asked)) {
++		return EINVAL;
++	}
++	if (!redwood_sta_present()) {
++		return EBUSY;                   /* (the radio is still being brought up: the framework tries again) */
++	}
++	asked = kalloc_data(sizeof(*asked), Z_WAITOK);
++	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
++	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, sizeof(*asked))) != 0) {
++		error = asked == NULL || what == NULL ? ENOMEM : error;
++		goto out;
++	}
++	if (asked->ssid_length <= sizeof(what->ssid)) {
++		what->ssid_length = (uint8_t)asked->ssid_length;
++		memcpy(what->ssid, asked->ssid, asked->ssid_length);
++	}
++	what->passive = asked->scan_type == 2;
++	what->dwell_ms = asked->dwell_ms;
++	/* (more channels than there is room to name: every channel) */
++	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
++		unsigned frequency = channel_frequency(&asked->channels[i]);
++
++		if (frequency != 0) {
++			what->frequencies[what->frequency_count++] = (uint16_t)frequency;
++		} else {
++			unknown++;
++		}
++	}
++	snprintf(said, said_size, " (a scan: type %u, %u channels of which %u are not the radio's, %u ms on each, a name of %u bytes, "
++	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, unknown, asked->dwell_ms, asked->ssid_length,
++	    asked->name_count, asked->flags);
++	if (asked->channel_count != 0 && asked->channel_count <= 64 && what->frequency_count == 0) {
++		error = EINVAL;                 /* (nothing of what is asked for is a channel of this radio's) */
++	} else {
++		lck_mtx_lock(&apple80211_lock);
++		result_next = 0;
++		lck_mtx_unlock(&apple80211_lock);
++		error = redwood_sta_ask_scan(what);
++	}
++out:
++	if (asked != NULL) {
++		kfree_data(asked, sizeof(*asked));
++	}
++	if (what != NULL) {
++		kfree_data(what, sizeof(*what));
++	}
++	return error;
++}
++
++static int
++set_join(const struct apple80211req *request, char *said, size_t said_size)
++{
++	struct apple80211_assoc *asked;
++	struct redwood_sta_join *what;
++	int error;
++
++	if (request->req_len < offsetof(struct apple80211_assoc, rest)) {
++		return EINVAL;
++	}
++	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
++	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
++	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
++		error = asked == NULL || what == NULL ? ENOMEM : error;
++		goto out;
++	}
++	/* (lengths and kinds only: the name, the access point and the key stay out of the log) */
++	snprintf(said, said_size, " (a join: a name of %u bytes, %s access point, authentication %#x/%#x, a key of %u bytes of kind %u)",
++	    asked->ssid_length, asked->bssid[0] | asked->bssid[1] | asked->bssid[2] | asked->bssid[3] | asked->bssid[4] |
++	    asked->bssid[5] ? "a given" : "any", asked->auth_lower, asked->auth_upper, asked->key_length, asked->key_cipher);
++	if (asked->ssid_length == 0 || asked->ssid_length > sizeof(what->ssid)) {
++		error = EINVAL;
++		goto out;
++	}
++	what->ssid_length = (uint8_t)asked->ssid_length;
++	memcpy(what->ssid, asked->ssid, asked->ssid_length);
++	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
++	if (asked->key_length == 0) {
++		what->security = REDWOOD_STA_OPEN;
++	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8 && asked->key_length <= 63) {
++		what->security = REDWOOD_STA_WPA2_PSK;
++		what->passphrase_length = (uint8_t)asked->key_length;
++		memcpy(what->passphrase, asked->key, asked->key_length);
++	} else if (asked->key_cipher == CIPHER_PMK && asked->key_length == sizeof(what->pmk)) {
++		what->security = REDWOOD_STA_WPA2_PSK;
++		memcpy(what->pmk, asked->key, sizeof(what->pmk));
++	} else {
++		error = EINVAL;
++		goto out;
++	}
++	lck_mtx_lock(&apple80211_lock);
++	join_result = 0;
++	lck_mtx_unlock(&apple80211_lock);
++	error = redwood_sta_ask_join(what);
++out:
++	if (asked != NULL) {
++		memset_s(asked, sizeof(*asked), 0, sizeof(*asked));
++		kfree_data(asked, sizeof(*asked));
++	}
++	if (what != NULL) {
++		memset_s(what, sizeof(*what), 0, sizeof(*what));
++		kfree_data(what, sizeof(*what));
++	}
++	return error;
++}
++
++static int
++set(const struct apple80211req *request, char *said, size_t said_size)
++{
++	switch (request->req_type) {
++	case 20:
++		return set_join(request, said, said_size);
++	case 22:                                /* leave the network */
++		return redwood_sta_ask_leave();
++	case 19: {                              /* the radio's power */
++		struct {
++			uint32_t version, radios, state[4];
++		} asked;
++		int error;
++
++		if (request->req_len < sizeof(asked) || (error = copyin(request->req_data, &asked, sizeof(asked))) != 0) {
++			return request->req_len < sizeof(asked) ? EINVAL : error;
++		}
++		snprintf(said, said_size, " (power: %s)", asked.state[0] ? "on" : "off");
++		return redwood_sta_ask_power(asked.state[0] != 0);
++	}
++	case 10:
++		return set_scan(request, said, said_size);
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++/* ---- events -------------------------------------------------------------------------------------------- */
++
++static void
++post(uint32_t code, const void *data, uint32_t length)
++{
++	struct kev_msg message = { .vendor_code = KEV_VENDOR_APPLE, .kev_class = KEV_IEEE80211_CLASS, .kev_subclass = 1,
++		                   .event_code = code };
++	char name[16];
++
++	memcpy(name, interface_name, sizeof(name));
++	message.dv[0].data_length = sizeof(name);
++	message.dv[0].data_ptr = name;
++	if (length != 0) {
++		message.dv[1].data_length = length;
++		message.dv[1].data_ptr = __DECONST(void *, data);
++	}
++	kev_post_msg(&message);
++}
++
++/* What the station side says has happened (bsd/dev/redwood_sta.c calls this, on its thread or the station's). */
++void
++redwood_apple80211_event(enum redwood_sta_event event, int status)
++{
++	static unsigned said;
++
++	if (said < 200) {
++		said++;
++		printf("apple80211: the station says: %s, %d\n", event == REDWOOD_STA_POWER ? "power" : event == REDWOOD_STA_SCAN_DONE ?
++		    "a scan is over" : event == REDWOOD_STA_JOIN_DONE ? "a join is over" : "the link", status);
++	}
++	switch (event) {
++	case REDWOOD_STA_POWER:
++		post(EVENT_POWER_CHANGED, NULL, 0);
++		break;
++	case REDWOOD_STA_SCAN_DONE:
++		lck_mtx_lock(&apple80211_lock);
++		result_next = 0;
++		lck_mtx_unlock(&apple80211_lock);
++		post(EVENT_SCAN_DONE, NULL, 0);
++		break;
++	case REDWOOD_STA_JOIN_DONE:
++		lck_mtx_lock(&apple80211_lock);
++		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
++		lck_mtx_unlock(&apple80211_lock);
++		post(EVENT_ASSOC_DONE, NULL, 0);
++		break;
++	case REDWOOD_STA_LINK: {
++		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
++			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
++		struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
++
++		if (state != NULL) {
++			redwood_sta_state(state);
++			link.rssi = status == 1 ? state->bss.rssi : 0;
++			kfree_data(state, sizeof(*state));
++		}
++		post(EVENT_SSID_CHANGED, NULL, 0);
++		post(EVENT_BSSID_CHANGED, NULL, 0);
++		post(EVENT_LINK_CHANGED, &link, sizeof(link));
++		break;
++	}
++	}
++}
++
++/* ---- the requests as they arrive --------------------------------------------------------------------- */
++
++/*
++ * How often each kind of request came and how it fared: said when the run ends, because the
++ * lines said along the way can be lost with the middle of a long log.
++ */
++static struct {
++	int32_t type;
++	bool set;
++	unsigned times, answered;
++	int last_error;
++} kinds[96];
++static unsigned kind_count;
++
++static void
++note(const struct apple80211req *request, bool is_set, int error)
++{
++	unsigned i;
++
++	lck_mtx_lock(&apple80211_lock);
++	for (i = 0; i < kind_count && !(kinds[i].type == request->req_type && kinds[i].set == is_set); i++) {
++	}
++	if (i < sizeof(kinds) / sizeof(kinds[0])) {
++		if (i == kind_count) {
++			kinds[kind_count++] = (typeof(kinds[0])) { .type = request->req_type, .set = is_set };
++		}
++		kinds[i].times++;
++		kinds[i].answered += error == 0;
++		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
++	}
++	lck_mtx_unlock(&apple80211_lock);
++}
++
++void
++redwood_apple80211_summary(void)
++{
++	static bool said;
++
++	if (said) {
++		return;
++	}
++	said = true;
++	for (unsigned i = 0; i < kind_count; i++) {
++		printf("apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
++		    type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error == 0 ? "\n" : "");
++		if (kinds[i].last_error != 0) {
++			printf("; the last refusal: %d%s\n", kinds[i].last_error, kinds[i].last_error == EOPNOTSUPP ? " (not built)" : "");
++		}
++	}
++}
++
++/* An Apple80211 request for the radio's interface, from the process that is running now. */
++errno_t
++redwood_apple80211_ioctl(u_long command, void *data)
++{
++	static unsigned said;
++	struct apple80211req *request = data;
++	char who[32] = "?", what[200] = "";
++	bool is_set = command == SIOCSA80211;
++	int error;
++
++	if (command != SIOCSA80211 && command != SIOCGA80211) {
++		return EOPNOTSUPP;
++	}
++	proc_selfname(who, sizeof(who));
++	error = is_set ? set(request, what, sizeof(what)) : get(request);
++	note(request, is_set, error);
++	/* (a request that is repeated for ever is said a few hundred times) */
++	if (said < 800) {
++		said++;
++		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
++		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
++		    EOPNOTSUPP ? "REFUSED\n" : "");
++		if (error != 0 && error != EOPNOTSUPP) {
++			printf("error %d\n", error);
++		}
++	}
++	return error;
++}
+diff --git a/bsd/dev/agate_wlan/redwood_sta.c b/bsd/dev/agate_wlan/redwood_sta.c
+new file mode 100644
+index 0000000..6961415
+--- /dev/null
++++ b/bsd/dev/agate_wlan/redwood_sta.c
+@@ -0,0 +1,376 @@
++/*
++ * agate (Xiaomi 11T): taken from HakiOS (github.com/oosexgang/hakios-xnu-kernel, branch mtk,
++ * xnu/files/bsd/...), Apple Public Source License 2.0 as that project states for its XNU files.
++ * Unchanged except where marked "agate:".
++ */
++/*
++ * Darwin-on-redwood: what stands between the two sides of the station boundary
++ * (sys/redwood_sta.h).
++ *
++ * Whoever wants a network asks from wherever it happens to be: an ioctl of wifid's, the thread
++ * that brings the radio up. The station side wants to be called by one thread, one call at a
++ * time, and a scan or a join takes seconds. So what is asked for is noted here and done by a
++ * thread of this file's; the asker returns at once and hears the outcome as an event. One
++ * request of each kind can wait: a second scan asked for while the first has not begun
++ * replaces it, as does a second join.
++ *
++ * What the last scan heard is kept here, so that it can be read without entering the station
++ * side, and so is the list of channels.
++ *
++ * The network the kernel was given in a file is a standing request: joined at the start, and
++ * again whenever the radio is turned back on (Settings' switch), until somebody asks for
++ * another network -- as iOS itself rejoins the networks it knows. If that other network cannot
++ * be joined (a wrong passphrase), the standing one is joined again.
++ */
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <sys/errno.h>
++#include <sys/redwood_input.h>
++#include <sys/redwood_sta.h>
++#include <sys/systm.h>
++
++extern void thread_set_thread_name(thread_t thread, const char *name);
++
++#define HEARD_MOST      128
++#define CHANNELS_MOST   96
++
++static LCK_GRP_DECLARE(sta_lock_group, "redwood-sta");
++static LCK_MTX_DECLARE(sta_lock, &sta_lock_group);
++
++static const struct redwood_sta_ops *sta_ops;   /* the station side, while there is one */
++static bool sta_thread_made;
++static bool sta_calls;                          /* the thread is in a call of the station side's */
++static unsigned sta_reads;                      /* ... and so many others are in its state() */
++static bool sta_on;                             /* the radio's power, as last asked for */
++
++/* what has been asked for and not begun */
++static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
++static struct redwood_sta_scan asked_scan_what;
++static struct redwood_sta_join asked_join_what;
++static struct redwood_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
++static struct redwood_sta_join fallback;        /* ... as it was before a join that has not come through yet */
++
++static struct redwood_sta_bss *heard;           /* by the last scan that came to an end */
++static unsigned heard_count;
++static struct redwood_sta_channel channels[CHANNELS_MOST];
++static unsigned channel_count;
++
++static void
++heard_one(const struct redwood_sta_bss *bss, __unused void *context)
++{
++	/* (only the thread writes the list, and it reads the count without the lock) */
++	if (heard_count < HEARD_MOST) {
++		lck_mtx_lock(&sta_lock);
++		heard[heard_count++] = *bss;
++		lck_mtx_unlock(&sta_lock);
++	}
++}
++
++static void
++sta_runs(__unused void *parameter, __unused wait_result_t result)
++{
++	static struct redwood_sta_scan scan;
++	static struct redwood_sta_join join;
++
++	for (;;) {
++		const struct redwood_sta_ops *ops;
++		bool power = false, power_on = false, leave = false, do_join = false, do_scan = false;
++		int error = 0;
++
++		lck_mtx_lock(&sta_lock);
++		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan)) {
++			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
++		}
++		ops = sta_ops;
++		/* one thing at a time, in the order that makes sense when several wait */
++		if (asked_power) {
++			power = true;
++			power_on = asked_power_on;
++			asked_power = false;
++		} else if (asked_leave) {
++			leave = true;
++			asked_leave = false;
++		} else if (asked_join) {
++			do_join = true;
++			join = asked_join_what;
++			bzero(&asked_join_what, sizeof(asked_join_what));
++			asked_join = false;
++		} else {
++			do_scan = true;
++			scan = asked_scan_what;
++			asked_scan = false;
++		}
++		sta_calls = true;
++		lck_mtx_unlock(&sta_lock);
++
++		if (power) {
++			struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
++			bool was_joined = false;
++
++			if (state != NULL) {
++				ops->state(state);
++				was_joined = state->phase == REDWOOD_STA_JOINED;
++				kfree_data(state, sizeof(*state));
++			}
++			error = ops->power(power_on);
++			if (!power_on && was_joined) {
++				redwood_apple80211_event(REDWOOD_STA_LINK, 0);
++			}
++			redwood_apple80211_event(REDWOOD_STA_POWER, error == 0 ? power_on : !power_on);
++			lck_mtx_lock(&sta_lock);
++			if (error == 0 && power_on && standing.ssid_length != 0 && !asked_join) {
++				asked_join_what = standing;
++				asked_join = true;
++			}
++			lck_mtx_unlock(&sta_lock);
++		} else if (leave) {
++			ops->leave();
++			redwood_apple80211_event(REDWOOD_STA_LINK, 0);
++		} else if (do_join) {
++			error = ops->join(&join);
++			bzero(&join, sizeof(join));
++			redwood_apple80211_event(REDWOOD_STA_JOIN_DONE, error);
++			if (error == 0) {
++				redwood_apple80211_event(REDWOOD_STA_LINK, 1);
++			}
++			/* a join that did not come through (a wrong passphrase) leaves things as they were: the standing network again */
++			lck_mtx_lock(&sta_lock);
++			if (error != 0 && fallback.ssid_length != 0 && !asked_join && !asked_leave && !asked_power) {
++				standing = asked_join_what = fallback;
++				asked_join = true;
++			}
++			bzero(&fallback, sizeof(fallback));
++			lck_mtx_unlock(&sta_lock);
++		} else if (do_scan) {
++			error = ops->scan(&scan);
++			lck_mtx_lock(&sta_lock);
++			heard_count = 0;
++			lck_mtx_unlock(&sta_lock);
++			ops->heard(heard_one, NULL);
++			redwood_apple80211_event(REDWOOD_STA_SCAN_DONE, error);
++		}
++
++		lck_mtx_lock(&sta_lock);
++		sta_calls = false;
++		lck_mtx_unlock(&sta_lock);
++		thread_wakeup((event_t)&sta_calls);
++	}
++}
++
++/* ---- the station side ---------------------------------------------------------------------------------- */
++
++void
++redwood_sta_attach(const struct redwood_sta_ops *ops)
++{
++	thread_t thread;
++
++	if (ops == NULL) {
++		lck_mtx_lock(&sta_lock);
++		sta_ops = NULL;
++		asked_power = asked_scan = asked_join = asked_leave = false;
++		while (sta_calls || sta_reads != 0) {
++			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_calls, THREAD_UNINT);
++		}
++		heard_count = channel_count = 0;
++		lck_mtx_unlock(&sta_lock);
++		return;
++	}
++	if (heard == NULL) {
++		heard = kalloc_data(HEARD_MOST * sizeof(*heard), Z_WAITOK | Z_ZERO);
++	}
++	if (heard == NULL) {
++		redwood_wifi_tell("wifi: no memory for what a scan hears: nobody can ask the radio for a network\n");
++		return;
++	}
++	if (!sta_thread_made) {
++		if (kernel_thread_start(sta_runs, NULL, &thread) != KERN_SUCCESS) {
++			redwood_wifi_tell("wifi: no thread for the station: nobody can ask the radio for a network\n");
++			return;
++		}
++		thread_set_thread_name(thread, "wifi-station");
++		thread_deallocate(thread);
++		sta_thread_made = true;
++	}
++	channel_count = ops->channels(channels, CHANNELS_MOST);
++	lck_mtx_lock(&sta_lock);
++	sta_ops = ops;
++	sta_on = true;
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	redwood_apple80211_event(REDWOOD_STA_POWER, 1);
++}
++
++void
++redwood_sta_lost(int error)
++{
++	redwood_apple80211_event(REDWOOD_STA_LINK, error != 0 ? error : ECONNRESET);
++}
++
++/* ---- who wants a network ------------------------------------------------------------------------------- */
++
++bool
++redwood_sta_present(void)
++{
++	return sta_ops != NULL;
++}
++
++bool
++redwood_sta_powered(void)
++{
++	return sta_ops != NULL && sta_on;
++}
++
++bool
++redwood_sta_busy(void)
++{
++	bool busy;
++
++	lck_mtx_lock(&sta_lock);
++	busy = sta_ops != NULL && (sta_calls || asked_power || asked_leave || asked_join || asked_scan);
++	lck_mtx_unlock(&sta_lock);
++	return busy;
++}
++
++int
++redwood_sta_ask_power(bool on)
++{
++	lck_mtx_lock(&sta_lock);
++	if (sta_ops == NULL) {
++		lck_mtx_unlock(&sta_lock);
++		return ENXIO;
++	}
++	sta_on = on;
++	asked_power = true;
++	asked_power_on = on;
++	if (!on) {
++		asked_scan = asked_join = asked_leave = false;
++	}
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	return 0;
++}
++
++int
++redwood_sta_ask_scan(const struct redwood_sta_scan *what)
++{
++	lck_mtx_lock(&sta_lock);
++	if (sta_ops == NULL || !sta_on) {
++		lck_mtx_unlock(&sta_lock);
++		return sta_ops == NULL ? ENXIO : ENETDOWN;
++	}
++	asked_scan_what = *what;
++	asked_scan = true;
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	return 0;
++}
++
++int
++redwood_sta_ask_join_standing(const struct redwood_sta_join *what)
++{
++	int error = redwood_sta_ask_join(what);
++
++	lck_mtx_lock(&sta_lock);
++	if (error == 0) {
++		standing = *what;
++	}
++	lck_mtx_unlock(&sta_lock);
++	return error;
++}
++
++int
++redwood_sta_ask_join(const struct redwood_sta_join *what)
++{
++	lck_mtx_lock(&sta_lock);
++	if (sta_ops == NULL || !sta_on) {
++		lck_mtx_unlock(&sta_lock);
++		return sta_ops == NULL ? ENXIO : ENETDOWN;
++	}
++	if (standing.ssid_length != 0) {
++		fallback = standing;
++	}
++	bzero(&standing, sizeof(standing));     /* (whoever asks for a network now has the say) */
++	asked_join_what = *what;
++	asked_join = true;
++	asked_leave = false;
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	return 0;
++}
++
++int
++redwood_sta_ask_leave(void)
++{
++	lck_mtx_lock(&sta_lock);
++	if (sta_ops == NULL) {
++		lck_mtx_unlock(&sta_lock);
++		return ENXIO;
++	}
++	asked_leave = true;
++	asked_join = false;
++	bzero(&asked_join_what, sizeof(asked_join_what));
++	bzero(&fallback, sizeof(fallback));
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	return 0;
++}
++
++bool
++redwood_sta_heard(unsigned index, struct redwood_sta_bss *bss)
++{
++	bool there;
++
++	lck_mtx_lock(&sta_lock);
++	if ((there = index < heard_count)) {
++		*bss = heard[index];
++	}
++	lck_mtx_unlock(&sta_lock);
++	return there;
++}
++
++void
++redwood_sta_state(struct redwood_sta_state *state)
++{
++	const struct redwood_sta_ops *ops;
++
++	bzero(state, sizeof(*state));
++	lck_mtx_lock(&sta_lock);
++	if ((ops = sta_ops) != NULL) {
++		sta_reads++;
++	}
++	lck_mtx_unlock(&sta_lock);
++	if (ops != NULL) {
++		ops->state(state);
++		lck_mtx_lock(&sta_lock);
++		sta_reads--;
++		lck_mtx_unlock(&sta_lock);
++		thread_wakeup((event_t)&sta_calls);
++	}
++}
++
++unsigned
++redwood_sta_channels(struct redwood_sta_channel *out, unsigned most)
++{
++	unsigned count;
++
++	lck_mtx_lock(&sta_lock);
++	count = channel_count < most ? channel_count : most;
++	memcpy(out, channels, count * sizeof(*out));
++	lck_mtx_unlock(&sta_lock);
++	return count;
++}
++
++bool
++redwood_sta_address(uint8_t *address)
++{
++	const struct redwood_sta_ops *ops = sta_ops;
++
++	if (ops != NULL) {
++		memcpy(address, ops->address, 6);
++	}
++	return ops != NULL;
++}
+diff --git a/bsd/dev/agate_wlan/redwood_wpa.c b/bsd/dev/agate_wlan/redwood_wpa.c
+new file mode 100644
+index 0000000..8d9ce48
+--- /dev/null
++++ b/bsd/dev/agate_wlan/redwood_wpa.c
+@@ -0,0 +1,533 @@
++/*
++ * agate (Xiaomi 11T): taken from HakiOS (github.com/oosexgang/hakios-xnu-kernel, branch mtk,
++ * xnu/files/bsd/...), Apple Public Source License 2.0 as that project states for its XNU files.
++ * Unchanged except where marked "agate:".
++ */
++/*
++ * (bsd/dev/redwood_wpa.c: wifi/lx/src/lx_wpa.c as it is, built into the kernel for the Infinix's radio
++ * (redwood_mtkwifi.c), whose firmware leaves the handshake to the host. The tests are that file's: tools/wpa-test.)
++ */
++/*
++ * The arithmetic of WPA2 with a passphrase (lx_wpa.h): SHA-1 and HMAC over it (FIPS 180, RFC
++ * 2104), the key of a name and a passphrase (PBKDF2, RFC 8018), the function that makes the
++ * handshake's keys out of that key, two addresses and two nonces (IEEE 802.11-2020, 12.7.1.2),
++ * AES decryption and the unwrapping of a key with it (FIPS 197, RFC 3394), and the messages of
++ * the four-way and the group-key handshake (12.7.6, 12.7.7; figure 12-35 is the layout).
++ *
++ * Nothing here is taken from another implementation; the tests in tools/wpa-test check it
++ * against the standards' own examples and against Python's hashlib and "cryptography".
++ * Nothing here is written for speed, and nothing here says a key in a message.
++ */
++#ifdef KERNEL
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <libkern/libkern.h>
++#else
++#include <stdint.h>
++#include <string.h>
++#endif
++
++#include <sys/redwood_wpa.h>
++
++/* ---- SHA-1 ------------------------------------------------------------------------------------ */
++
++struct sha1 {
++	uint32_t h[5];
++	uint64_t length;			/* bytes so far */
++	uint8_t block[64];
++};
++
++static uint32_t
++rol(uint32_t x, unsigned n)
++{
++	return (x << n | x >> (32 - n));
++}
++
++static void
++sha1_block(uint32_t h[5], const uint8_t *p)
++{
++	uint32_t w[80], a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
++
++	for (unsigned t = 0; t < 16; t++) {
++		w[t] = (uint32_t)p[4 * t] << 24 | (uint32_t)p[4 * t + 1] << 16 | (uint32_t)p[4 * t + 2] << 8 | p[4 * t + 3];
++	}
++	for (unsigned t = 16; t < 80; t++) {
++		w[t] = rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
++	}
++	for (unsigned t = 0; t < 80; t++) {
++		uint32_t f = t < 20 ? ((b & c) | (~b & d)) + 0x5a827999 : t < 40 ? (b ^ c ^ d) + 0x6ed9eba1 : t < 60 ?
++		    ((b & c) | (b & d) | (c & d)) + 0x8f1bbcdc : (b ^ c ^ d) + 0xca62c1d6;
++		uint32_t next = rol(a, 5) + f + e + w[t];
++
++		e = d;
++		d = c;
++		c = rol(b, 30);
++		b = a;
++		a = next;
++	}
++	h[0] += a;
++	h[1] += b;
++	h[2] += c;
++	h[3] += d;
++	h[4] += e;
++}
++
++static void
++sha1_begin(struct sha1 *s)
++{
++	s->h[0] = 0x67452301;
++	s->h[1] = 0xefcdab89;
++	s->h[2] = 0x98badcfe;
++	s->h[3] = 0x10325476;
++	s->h[4] = 0xc3d2e1f0;
++	s->length = 0;
++}
++
++static void
++sha1_more(struct sha1 *s, const uint8_t *data, unsigned length)
++{
++	for (unsigned i = 0; i < length; i++) {
++		s->block[s->length++ % 64] = data[i];
++		if (s->length % 64 == 0) {
++			sha1_block(s->h, s->block);
++		}
++	}
++}
++
++static void
++sha1_end(struct sha1 *s, uint8_t digest[20])
++{
++	uint64_t bits = s->length * 8;
++	uint8_t tail[8];
++
++	sha1_more(s, (const uint8_t *)"\x80", 1);
++	while (s->length % 64 != 56) {
++		sha1_more(s, (const uint8_t *)"", 1);
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		tail[i] = (uint8_t)(bits >> (56 - 8 * i));
++	}
++	sha1_more(s, tail, 8);
++	for (unsigned i = 0; i < 20; i++) {
++		digest[i] = (uint8_t)(s->h[i / 4] >> (24 - 8 * (i % 4)));
++	}
++}
++
++/* HMAC-SHA1 of several pieces in a row. */
++static void
++hmac_sha1(const uint8_t *key, unsigned key_length, const uint8_t *const pieces[], const unsigned lengths[], unsigned count,
++    uint8_t digest[20])
++{
++	uint8_t pad[64], hashed[20], inner[20];
++	struct sha1 s;
++
++	if (key_length > 64) {
++		sha1_begin(&s);
++		sha1_more(&s, key, key_length);
++		sha1_end(&s, hashed);
++		key = hashed;
++		key_length = 20;
++	}
++	for (unsigned i = 0; i < 64; i++) {
++		pad[i] = (i < key_length ? key[i] : 0) ^ 0x36;
++	}
++	sha1_begin(&s);
++	sha1_more(&s, pad, 64);
++	for (unsigned i = 0; i < count; i++) {
++		sha1_more(&s, pieces[i], lengths[i]);
++	}
++	sha1_end(&s, inner);
++	for (unsigned i = 0; i < 64; i++) {
++		pad[i] ^= 0x36 ^ 0x5c;
++	}
++	sha1_begin(&s);
++	sha1_more(&s, pad, 64);
++	sha1_more(&s, inner, 20);
++	sha1_end(&s, digest);
++	memset(pad, 0, sizeof(pad));
++	memset(inner, 0, sizeof(inner));
++}
++
++/* ---- the key of a name and a passphrase -------------------------------------------------------- */
++
++/* PBKDF2 with HMAC-SHA1, 4096 rounds, 32 bytes: two blocks of 20, of the second the first 12. */
++void
++lx_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, const unsigned char *name, unsigned name_length,
++    unsigned char pmk[32])
++{
++	for (unsigned block = 1; block <= 2; block++) {
++		const uint8_t number[4] = { 0, 0, 0, (uint8_t)block };
++		const uint8_t *first[2] = { name, number };
++		const unsigned first_lengths[2] = { name_length, 4 };
++		uint8_t u[20], sum[20];
++
++		hmac_sha1(passphrase, passphrase_length, first, first_lengths, 2, u);
++		memcpy(sum, u, 20);
++		for (unsigned round = 1; round < 4096; round++) {
++			const uint8_t *again[1] = { u };
++			const unsigned again_lengths[1] = { 20 };
++
++			hmac_sha1(passphrase, passphrase_length, again, again_lengths, 1, u);
++			for (unsigned i = 0; i < 20; i++) {
++				sum[i] ^= u[i];
++			}
++		}
++		memcpy(pmk + 20 * (block - 1), sum, block == 1 ? 20 : 12);
++		memset(u, 0, sizeof(u));
++		memset(sum, 0, sizeof(sum));
++	}
++}
++
++/* The standard's PRF: HMAC-SHA1 of (label, a zero byte, data, a counter byte), block after block. */
++static void
++prf(const uint8_t *key, unsigned key_length, const char *label, const uint8_t *data, unsigned data_length, uint8_t *out,
++    unsigned out_length)
++{
++	uint8_t zero = 0, counter = 0, digest[20];
++	const uint8_t *pieces[4] = { (const uint8_t *)label, &zero, data, &counter };
++	const unsigned lengths[4] = { (unsigned)strlen(label), 1, data_length, 1 };
++
++	for (unsigned done = 0; done < out_length; done += 20, counter++) {
++		hmac_sha1(key, key_length, pieces, lengths, 4, digest);
++		memcpy(out + done, digest, out_length - done < 20 ? out_length - done : 20);
++	}
++	memset(digest, 0, sizeof(digest));
++}
++
++/* ---- AES-128, decryption only, and the unwrapping of a key --------------------------------------- */
++
++static uint8_t sbox[256], inverse_sbox[256];
++
++static uint8_t
++times(uint8_t a, uint8_t b)			/* in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1 */
++{
++	uint8_t product = 0;
++
++	for (; b != 0; b >>= 1) {
++		if (b & 1) {
++			product ^= a;
++		}
++		a = (uint8_t)(a << 1 ^ (a & 0x80 ? 0x1b : 0));
++	}
++	return (product);
++}
++
++/* FIPS 197, 5.1.1: a byte's inverse in the field, then the affine map. */
++static void
++aes_tables(void)
++{
++	if (sbox[0] != 0) {
++		return;
++	}
++	for (unsigned x = 0; x < 256; x++) {
++		uint8_t inverse = 0, s;
++
++		for (unsigned y = 1; y < 256 && x != 0; y++) {
++			if (times((uint8_t)x, (uint8_t)y) == 1) {
++				inverse = (uint8_t)y;
++				break;
++			}
++		}
++		s = inverse;
++		for (unsigned i = 1; i < 5; i++) {
++			s ^= (uint8_t)(inverse << i | inverse >> (8 - i));
++		}
++		s ^= 0x63;
++		sbox[x] = s;
++		inverse_sbox[s] = (uint8_t)x;
++	}
++}
++
++static void
++aes_keys(const uint8_t key[16], uint8_t round_keys[176])
++{
++	uint8_t constant = 1;
++
++	aes_tables();
++	memcpy(round_keys, key, 16);
++	for (unsigned i = 16; i < 176; i += 4) {
++		uint8_t word[4];
++
++		memcpy(word, round_keys + i - 4, 4);
++		if (i % 16 == 0) {
++			uint8_t first = word[0];
++
++			word[0] = sbox[word[1]] ^ constant;
++			word[1] = sbox[word[2]];
++			word[2] = sbox[word[3]];
++			word[3] = sbox[first];
++			constant = times(constant, 2);
++		}
++		for (unsigned j = 0; j < 4; j++) {
++			round_keys[i + j] = round_keys[i - 16 + j] ^ word[j];
++		}
++	}
++}
++
++/* FIPS 197, 5.3: the inverse cipher on one block (bytes in column order: byte r of column c is s[4c + r]). */
++static void
++aes_decrypt(const uint8_t round_keys[176], uint8_t s[16])
++{
++	for (unsigned i = 0; i < 16; i++) {
++		s[i] ^= round_keys[160 + i];
++	}
++	for (int round = 9; round >= 0; round--) {
++		uint8_t t[16];
++
++		for (unsigned c = 0; c < 4; c++) {		/* the rows shifted back, and the bytes substituted back */
++			for (unsigned r = 0; r < 4; r++) {
++				t[4 * ((c + r) % 4) + r] = inverse_sbox[s[4 * c + r]];
++			}
++		}
++		for (unsigned i = 0; i < 16; i++) {
++			t[i] ^= round_keys[16 * round + i];
++		}
++		if (round == 0) {
++			memcpy(s, t, 16);
++			break;
++		}
++		for (unsigned c = 0; c < 4; c++) {		/* the columns mixed back */
++			const uint8_t *a = t + 4 * c;
++
++			s[4 * c + 0] = times(a[0], 14) ^ times(a[1], 11) ^ times(a[2], 13) ^ times(a[3], 9);
++			s[4 * c + 1] = times(a[0], 9) ^ times(a[1], 14) ^ times(a[2], 11) ^ times(a[3], 13);
++			s[4 * c + 2] = times(a[0], 13) ^ times(a[1], 9) ^ times(a[2], 14) ^ times(a[3], 11);
++			s[4 * c + 3] = times(a[0], 11) ^ times(a[1], 13) ^ times(a[2], 9) ^ times(a[3], 14);
++		}
++	}
++}
++
++/*
++ * RFC 3394, 2.2.2: `wrapped` is 8 bytes longer than what comes out, which goes to `plain`. 0, or -1
++ * if the length is not one a wrapped key has or the check value does not come out.
++ */
++static int
++aes_unwrap(const uint8_t kek[16], const uint8_t *wrapped, unsigned length, uint8_t *plain)
++{
++	unsigned n = length / 8 - 1;
++	uint8_t round_keys[176], a[8], block[16];
++	int good = 0;
++
++	if (length % 8 != 0 || length < 24) {
++		return (-1);
++	}
++	aes_keys(kek, round_keys);
++	memcpy(a, wrapped, 8);
++	memcpy(plain, wrapped + 8, 8 * n);
++	for (int j = 5; j >= 0; j--) {
++		for (unsigned i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (unsigned)j + i;
++
++			memcpy(block, a, 8);
++			for (unsigned k = 0; k < 8; k++) {
++				block[7 - k] ^= (uint8_t)(t >> (8 * k));
++			}
++			memcpy(block + 8, plain + 8 * (i - 1), 8);
++			aes_decrypt(round_keys, block);
++			memcpy(a, block, 8);
++			memcpy(plain + 8 * (i - 1), block + 8, 8);
++		}
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		good |= a[i] ^ 0xa6;
++	}
++	memset(round_keys, 0, sizeof(round_keys));
++	memset(block, 0, sizeof(block));
++	return (good == 0 ? 0 : -1);
++}
++
++/* ---- the handshake -------------------------------------------------------------------------------- */
++
++/*
++ * A key message, after the four bytes every EAPOL frame begins with (version, type 3, length):
++ *   4 the kind of descriptor (2: RSN)     5 what the message is (bits below)     7 key length
++ *   9 replay counter (8)     17 nonce (32)     49 IV (16)     65 RSC (8)     73 reserved (8)
++ *   81 MIC (16)     97 length of the key data     99 key data
++ */
++#define AT_KIND		4
++#define AT_INFO		5
++#define AT_REPLAY	9
++#define AT_NONCE	17
++#define AT_RSC		65
++#define AT_MIC		81
++#define AT_DATA_LENGTH	97
++#define AT_DATA		99
++#define MESSAGE_MOST	640
++
++#define INFO_VERSION	0x0007			/* 2: HMAC-SHA1 for the MIC, the AES key wrap for the key data */
++#define INFO_PAIRWISE	0x0008
++#define INFO_INSTALL	0x0040
++#define INFO_ACK	0x0080
++#define INFO_MIC	0x0100
++#define INFO_SECURE	0x0200
++#define INFO_ENCRYPTED	0x1000
++
++static void
++mic_of(const struct lx_wpa *wpa, const uint8_t *message, unsigned length, uint8_t mic[16])
++{
++	const uint8_t zeros[16] = { 0 };
++	const uint8_t *pieces[3] = { message, zeros, message + AT_MIC + 16 };
++	const unsigned lengths[3] = { AT_MIC, 16, length - AT_MIC - 16 };
++	uint8_t digest[20];
++
++	hmac_sha1(wpa->kck, 16, pieces, lengths, 3, digest);
++	memcpy(mic, digest, 16);
++}
++
++/* The keys of the handshake and the pairwise key, from the PMK, both addresses and both nonces. */
++static void
++derive(struct lx_wpa *wpa)
++{
++	uint8_t data[76], keys[48];
++	int own_first = memcmp(wpa->own, wpa->peer, 6) < 0, own_nonce_first = memcmp(wpa->own_nonce, wpa->peer_nonce, 32) < 0;
++
++	memcpy(data, own_first ? wpa->own : wpa->peer, 6);
++	memcpy(data + 6, own_first ? wpa->peer : wpa->own, 6);
++	memcpy(data + 12, own_nonce_first ? wpa->own_nonce : wpa->peer_nonce, 32);
++	memcpy(data + 44, own_nonce_first ? wpa->peer_nonce : wpa->own_nonce, 32);
++	prf(wpa->pmk, 32, "Pairwise key expansion", data, sizeof(data), keys, sizeof(keys));
++	memcpy(wpa->kck, keys, 16);
++	memcpy(wpa->kek, keys + 16, 16);
++	memcpy(wpa->pairwise, keys + 32, 16);
++	memset(keys, 0, sizeof(keys));
++	wpa->have_keys = 1;
++}
++
++/* Our message in answer to `message`: the same counter, our bits, our nonce and key data if any, signed. */
++static void
++answer(const struct lx_wpa *wpa, const uint8_t *message, unsigned info, const uint8_t *nonce, const uint8_t *data,
++    unsigned data_length, uint8_t *reply, unsigned *reply_length)
++{
++	unsigned length = AT_DATA + data_length;
++
++	memset(reply, 0, length);
++	reply[0] = message[0];
++	reply[1] = 3;
++	reply[2] = (uint8_t)((length - 4) >> 8);
++	reply[3] = (uint8_t)(length - 4);
++	reply[AT_KIND] = 2;
++	reply[AT_INFO] = (uint8_t)(info >> 8);
++	reply[AT_INFO + 1] = (uint8_t)info;
++	memcpy(reply + AT_REPLAY, message + AT_REPLAY, 8);
++	if (nonce != NULL) {
++		memcpy(reply + AT_NONCE, nonce, 32);
++	}
++	reply[AT_DATA_LENGTH] = (uint8_t)(data_length >> 8);
++	reply[AT_DATA_LENGTH + 1] = (uint8_t)data_length;
++	if (data_length != 0) {
++		memcpy(reply + AT_DATA, data, data_length);
++	}
++	mic_of(wpa, reply, length, reply + AT_MIC);
++	*reply_length = length;
++}
++
++/* The group key among what message 3 (or a group message) carries: an element 0xdd of the suite 00-0f-ac, kind 1. */
++static int
++group_key(struct lx_wpa *wpa, const uint8_t *data, unsigned length, const uint8_t *counter)
++{
++	for (unsigned at = 0; at + 2 <= length && at + 2 + data[at + 1] <= length; at += 2 + data[at + 1]) {
++		const uint8_t *e = data + at;
++
++		if (e[0] == 0xdd && e[1] == 0) {
++			break;				/* (padding from here on) */
++		}
++		if (e[0] == 0xdd && e[1] >= 6 + 5 && e[2] == 0x00 && e[3] == 0x0f && e[4] == 0xac && e[5] == 1 &&
++		    e[1] - 6u <= sizeof(wpa->group)) {
++			wpa->group_index = e[6] & 3;
++			wpa->group_length = e[1] - 6u;
++			memcpy(wpa->group, e + 8, wpa->group_length);
++			memcpy(wpa->group_counter, counter, 8);
++			return (0);
++		}
++	}
++	return (-1);
++}
++
++int
++lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length, unsigned char *reply, unsigned *reply_length,
++    const char **why)
++{
++	uint8_t mic[16], data[MESSAGE_MOST];
++	unsigned info, body, data_length, difference = 0;
++	const char *nothing;
++
++	why = why != NULL ? why : &nothing;
++	*why = "";
++	*reply_length = 0;
++	if (length < 4 || message[1] != 3) {
++		return (LX_WPA_NOTHING);
++	}
++	body = (unsigned)message[2] << 8 | message[3];
++	if (length < AT_DATA || 4 + body > length || 4 + body < AT_DATA || 4 + body > MESSAGE_MOST) {
++		*why = "its length is not a key message's";
++		return (LX_WPA_BAD);
++	}
++	length = 4 + body;
++	info = (unsigned)message[AT_INFO] << 8 | message[AT_INFO + 1];
++	data_length = (unsigned)message[AT_DATA_LENGTH] << 8 | message[AT_DATA_LENGTH + 1];
++	if (message[AT_KIND] != 2) {
++		*why = "it is not an RSN key message (WPA of the first kind?)";
++		return (LX_WPA_BAD);
++	}
++	if ((info & INFO_VERSION) != 2) {
++		*why = "its key descriptor is not version 2 (the network wants another kind of key management)";
++		return (LX_WPA_BAD);
++	}
++	if (AT_DATA + data_length > length) {
++		*why = "its key data is longer than the message";
++		return (LX_WPA_BAD);
++	}
++
++	/* message 1: the access point's nonce, unsigned */
++	if ((info & (INFO_PAIRWISE | INFO_ACK | INFO_MIC)) == (INFO_PAIRWISE | INFO_ACK)) {
++		memcpy(wpa->peer_nonce, message + AT_NONCE, 32);
++		derive(wpa);
++		answer(wpa, message, 2 | INFO_PAIRWISE | INFO_MIC, wpa->own_nonce, wpa->rsn, wpa->rsn_length, reply, reply_length);
++		return (LX_WPA_ANSWER);
++	}
++
++	/* everything else is signed, by an access point that has shown it has the key */
++	if (!(info & INFO_MIC) || !(info & INFO_ACK)) {
++		return (LX_WPA_NOTHING);
++	}
++	if (!wpa->have_keys) {
++		*why = "it is signed, and there has been no message 1 to make the keys from";
++		return (LX_WPA_BAD);
++	}
++	mic_of(wpa, message, length, mic);
++	for (unsigned i = 0; i < 16; i++) {
++		difference |= mic[i] ^ message[AT_MIC + i];
++	}
++	if (difference != 0) {
++		*why = "its signature is not right (a wrong passphrase gives this)";
++		return (LX_WPA_BAD);
++	}
++	if (wpa->replay_known && memcmp(message + AT_REPLAY, wpa->replay, 8) <= 0) {
++		*why = "its counter is not beyond the last one's (a message played again)";
++		return (LX_WPA_BAD);
++	}
++	if ((info & INFO_PAIRWISE) && memcmp(message + AT_NONCE, wpa->peer_nonce, 32) != 0) {
++		*why = "its nonce is not message 1's";
++		return (LX_WPA_BAD);
++	}
++	if (!(info & INFO_ENCRYPTED) || aes_unwrap(wpa->kek, message + AT_DATA, data_length, data) != 0) {
++		*why = "its key data does not unwrap";
++		return (LX_WPA_BAD);
++	}
++	if (group_key(wpa, data, data_length - 8, message + AT_RSC) != 0) {
++		memset(data, 0, sizeof(data));
++		*why = "there is no group key in it";
++		return (LX_WPA_BAD);
++	}
++	memset(data, 0, sizeof(data));
++	memcpy(wpa->replay, message + AT_REPLAY, 8);
++	wpa->replay_known = 1;
++
++	/* message 3 of the four, or message 1 of a new group key */
++	if (info & INFO_PAIRWISE) {
++		answer(wpa, message, 2 | INFO_PAIRWISE | INFO_MIC | INFO_SECURE, NULL, NULL, 0, reply, reply_length);
++		return (LX_WPA_KEYS);
++	}
++	answer(wpa, message, 2 | INFO_MIC | INFO_SECURE, NULL, NULL, 0, reply, reply_length);
++	return (LX_WPA_GROUP);
++}
+diff --git a/bsd/sys/redwood_input.h b/bsd/sys/redwood_input.h
+new file mode 100644
+index 0000000..80b06d2
+--- /dev/null
++++ b/bsd/sys/redwood_input.h
+@@ -0,0 +1,11 @@
++/*
++ * agate (Xiaomi 11T): of HakiOS's sys/redwood_input.h (APSL 2.0) only the Wi-Fi log line its
++ * station uses.
++ */
++#ifndef _SYS_REDWOOD_INPUT_H_
++#define _SYS_REDWOOD_INPUT_H_
++#ifdef KERNEL
++#include <sys/systm.h>
++#define redwood_wifi_tell(...)  printf(__VA_ARGS__)
++#endif
++#endif
+diff --git a/bsd/sys/redwood_net.h b/bsd/sys/redwood_net.h
+new file mode 100644
+index 0000000..4e45c2a
+--- /dev/null
++++ b/bsd/sys/redwood_net.h
+@@ -0,0 +1,16 @@
++/*
++ * agate (Xiaomi 11T): the part of HakiOS's sys/redwood_net.h (APSL 2.0) that its station and
++ * Apple80211 code use. On agate the Wi-Fi interface is an IOEthernetController of the built-in
++ * IONetworkingFamily (iokit/Kernel/arm/AgateWLAN.cpp), not a BSD-KPI ifnet; these are its C side.
++ */
++#ifndef _SYS_REDWOOD_NET_H_
++#define _SYS_REDWOOD_NET_H_
++#ifdef KERNEL
++#include <stdbool.h>
++#include <sys/types.h>
++#define REDWOOD_NET_FRAME_MAX   1514
++void    redwood_net_input(const uint8_t *frame, size_t length);
++void    redwood_net_link_state(bool up);
++errno_t redwood_apple80211_ioctl(u_long command, void *data);
++#endif /* KERNEL */
++#endif /* _SYS_REDWOOD_NET_H_ */
+diff --git a/bsd/sys/redwood_sta.h b/bsd/sys/redwood_sta.h
+new file mode 100644
+index 0000000..994fadc
+--- /dev/null
++++ b/bsd/sys/redwood_sta.h
+@@ -0,0 +1,127 @@
++/*
++ * agate (Xiaomi 11T): taken from HakiOS (github.com/oosexgang/hakios-xnu-kernel, branch mtk,
++ * xnu/files/bsd/...), Apple Public Source License 2.0 as that project states for its XNU files.
++ * Unchanged except where marked "agate:".
++ */
++/*
++ * Darwin-on-redwood: the station boundary.
++ *
++ * On one side whatever does the scanning and the joining with a radio: the station logic over
++ * ath11k on the phone (wifi/lx in the repository). On the other whoever wants a network: the
++ * Apple80211 requests of iOS's Wi-Fi side, answered in bsd/dev/redwood_apple80211.c, and the
++ * kernel's own join of the network it was given in a file (bsd/dev/redwood_wifi.c). Frames do
++ * not pass here, and neither does "the link is up": those go through bsd/sys/redwood_net.h,
++ * which the station side calls itself.
++ *
++ * Between the two stands bsd/dev/redwood_sta.c: one thread, on which every call into the station
++ * side is made, one at a time, and what the last scan heard, kept for whoever asks.
++ *
++ * Nothing but C's own types here: the station side is not compiled as XNU's code.
++ */
++#ifndef _SYS_REDWOOD_STA_H_
++#define _SYS_REDWOOD_STA_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define REDWOOD_STA_ELEMENTS_MOST       1024
++
++/* One access point, as a scan heard it. */
++struct redwood_sta_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_length;
++	uint16_t frequency;                     /* MHz */
++	int16_t rssi;                           /* dBm */
++	uint16_t beacon_interval;               /* in units of 1024 microseconds */
++	uint16_t capability;                    /* the beacon's capability field */
++	uint32_t age_ms;                        /* how long ago it was last heard */
++	uint16_t elements_length;               /* the beacon's information elements as received: who asks */
++	uint8_t elements[REDWOOD_STA_ELEMENTS_MOST];    /* reads the network's protection out of them itself */
++};
++
++/* What to scan for. All zero: every channel, the radio's own way. */
++struct redwood_sta_scan {
++	uint8_t ssid[32], ssid_length;          /* ask for this network by name (a hidden one answers only then) */
++	uint16_t frequencies[64], frequency_count;      /* only these channels */
++	bool passive;                           /* only listen */
++	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
++};
++
++enum { REDWOOD_STA_OPEN, REDWOOD_STA_WPA2_PSK };
++
++struct redwood_sta_join {
++	uint8_t ssid[32], ssid_length;
++	uint8_t bssid[6];                       /* all zero: the access point of that name heard best */
++	int security;
++	uint8_t pmk[32];                        /* WPA2 with a passphrase: the key made of the passphrase and the name ... */
++	uint8_t passphrase[64], passphrase_length;      /* ... or, if this is not empty, the passphrase itself */
++};
++
++enum redwood_sta_phase { REDWOOD_STA_OFF, REDWOOD_STA_IDLE, REDWOOD_STA_SCANNING, REDWOOD_STA_JOINING, REDWOOD_STA_JOINED };
++
++struct redwood_sta_state {
++	enum redwood_sta_phase phase;
++	struct redwood_sta_bss bss;             /* the network joined or being joined */
++	int last_error;                         /* why the last join failed or the network was lost (an errno); 0: it was not */
++};
++
++#define REDWOOD_STA_CHANNEL_PASSIVE     1u      /* the radio may only listen there */
++#define REDWOOD_STA_CHANNEL_RADAR       2u      /* ... and has to look out for radar */
++
++struct redwood_sta_channel {
++	uint16_t frequency;                     /* MHz */
++	uint16_t flags;
++};
++
++/*
++ * What the station side supplies. All but state() are called on one thread, one at a time, and
++ * may take as long as the thing takes: scan() returns when the scan is over, join() when frames
++ * can pass or it is known why not. Each gives 0 or an errno.
++ */
++struct redwood_sta_ops {
++	int (*power)(bool on);                  /* off: leave the network, stop the radio; on: start it */
++	int (*scan)(const struct redwood_sta_scan *what);
++	void (*heard)(void (*each)(const struct redwood_sta_bss *bss, void *context), void *context);   /* by the last scan */
++	int (*join)(const struct redwood_sta_join *what);
++	int (*leave)(void);
++	void (*state)(struct redwood_sta_state *state);         /* on any thread; does not sleep */
++	unsigned (*channels)(struct redwood_sta_channel *channels, unsigned most);      /* what the radio may tune to */
++	uint8_t address[6];
++};
++
++/* What happens, said to whoever listens (the Apple80211 side). */
++enum redwood_sta_event {
++	REDWOOD_STA_POWER,                      /* status: 1 on, 0 off */
++	REDWOOD_STA_SCAN_DONE,                  /* status: 0, or the scan's errno */
++	REDWOOD_STA_JOIN_DONE,                  /* status: 0, or the join's errno */
++	REDWOOD_STA_LINK,                       /* status: 1 a network is joined, 0 it has been left when asked,
++	                                         * an errno: it was lost (the access point showed us the door) */
++};
++
++#ifdef KERNEL
++/* ---- the station side ---- */
++void     redwood_sta_attach(const struct redwood_sta_ops *ops);         /* NULL: it is going away (waits for a call under way) */
++void     redwood_sta_lost(int error);                                   /* the network joined is gone by itself */
++
++/* ---- who wants a network: each asks and returns; the outcome is an event. 0, or an errno ---- */
++bool     redwood_sta_present(void);
++int      redwood_sta_ask_power(bool on);
++int      redwood_sta_ask_scan(const struct redwood_sta_scan *what);
++int      redwood_sta_ask_join(const struct redwood_sta_join *what);
++/* ... and joined again whenever the radio is turned on, until some other network is asked for */
++int      redwood_sta_ask_join_standing(const struct redwood_sta_join *what);
++int      redwood_sta_ask_leave(void);
++bool     redwood_sta_busy(void);                                        /* something asked for is not over yet */
++bool     redwood_sta_powered(void);
++/* the `index`th access point the last scan heard: true, or false when there are not that many */
++bool     redwood_sta_heard(unsigned index, struct redwood_sta_bss *bss);
++void     redwood_sta_state(struct redwood_sta_state *state);
++unsigned redwood_sta_channels(struct redwood_sta_channel *channels, unsigned most);
++bool     redwood_sta_address(uint8_t *address);
++
++/* ---- the listener: bsd/dev/redwood_apple80211.c ---- */
++void     redwood_apple80211_event(enum redwood_sta_event event, int status);
++void     redwood_apple80211_summary(void);                              /* what was asked in this run, to the log */
++#endif
++
++#endif
+diff --git a/bsd/sys/redwood_wpa.h b/bsd/sys/redwood_wpa.h
+new file mode 100644
+index 0000000..4e44e2f
+--- /dev/null
++++ b/bsd/sys/redwood_wpa.h
+@@ -0,0 +1,58 @@
++/*
++ * agate (Xiaomi 11T): taken from HakiOS (github.com/oosexgang/hakios-xnu-kernel, branch mtk,
++ * xnu/files/bsd/...), Apple Public Source License 2.0 as that project states for its XNU files.
++ * Unchanged except where marked "agate:".
++ */
++/*
++ * (bsd/dev/sys/redwood_wpa.h: wifi/lx/src/lx_wpa.h as it is, built into the kernel for the Infinix's radio
++ * (redwood_mtkwifi.c), whose firmware leaves the handshake to the host. The tests are that file's: tools/wpa-test.)
++ */
++/*
++ * WPA2 with a passphrase, as a station sees it: the key a name and a passphrase make, and the
++ * four-way handshake in which an access point and a station prove that key to each other and
++ * arrive at the keys their frames are ciphered with (IEEE 802.11-2020, 12.7; RSN, AKM "PSK",
++ * key descriptor version 2: HMAC-SHA1 and the AES key wrap). lx_wpa.c is the arithmetic and
++ * nothing else -- no radio, no kernel --, so that it runs on the machine the kernel is built on
++ * (tools/wpa-test) as it runs in the kernel.
++ */
++#ifndef _LX_WPA_H_
++#define _LX_WPA_H_
++
++/* The key ("PMK") of a network's name and passphrase: 32 bytes. Slow on purpose: 8192 rounds of HMAC-SHA1. */
++void lx_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, const unsigned char *name, unsigned name_length,
++    unsigned char pmk[32]);
++
++struct lx_wpa {
++	unsigned char pmk[32];
++	unsigned char own[6], peer[6];		/* the station's address and the access point's */
++	unsigned char own_nonce[32];		/* 32 bytes nobody can guess, fresh for every handshake */
++	const unsigned char *rsn;		/* the station's RSN element as its association request had it ... */
++	unsigned rsn_length;			/* ... which goes into message 2 */
++	/* from here on: lx_wpa.c's */
++	unsigned char peer_nonce[32];
++	unsigned char kck[16], kek[16];		/* the keys the handshake's own messages are signed and ciphered with */
++	unsigned char replay[8];		/* the counter of the last message accepted */
++	int have_keys, replay_known;
++	/* what comes out of it */
++	unsigned char pairwise[16];		/* the key for frames between the two ("TK", CCMP) */
++	unsigned char group[32];		/* the key the access point sends to everybody with ("GTK") ... */
++	unsigned group_length, group_index;	/* ... its length, and its number (1 to 3) */
++	unsigned char group_counter[8];		/* ... and the packet number its frames have got to ("RSC") */
++};
++
++/*
++ * What a message of the handshake (an EAPOL frame: what follows the Ethernet header of a frame
++ * of type 0x888e) calls for. `reply` has room for LX_WPA_REPLY_MOST bytes.
++ */
++#define LX_WPA_REPLY_MOST	256
++enum {
++	LX_WPA_BAD = -1,		/* not a message that can be answered: *why says what was wrong with it */
++	LX_WPA_NOTHING = 0,		/* not for us to answer (not a key message) */
++	LX_WPA_ANSWER = 1,		/* message 1: send the reply (message 2) */
++	LX_WPA_KEYS = 2,		/* message 3: send the reply (message 4), then both keys are to be used */
++	LX_WPA_GROUP = 3,		/* a new group key later on: send the reply, then use the new group key */
++};
++int lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length, unsigned char *reply,
++    unsigned *reply_length, const char **why);
++
++#endif
+diff --git a/iokit/Kernel/arm/AgateECMEthernet.cpp b/iokit/Kernel/arm/AgateECMEthernet.cpp
+index 83874fa..6d46f81 100644
+--- a/iokit/Kernel/arm/AgateECMEthernet.cpp
++++ b/iokit/Kernel/arm/AgateECMEthernet.cpp
+@@ -130,7 +130,10 @@ AgateECMEthernet::nameThread(void *arg, wait_result_t wr __unused)
+ 		uint64_t id = self->fNetif->getRegistryEntryID();
+ 		OSDictionary *cmd = OSDictionary::withCapacity(3);
+ 		OSNumber *type = OSNumber::withNumber(1ULL, 32);   /* lowest unit */
+-		OSNumber *unit = OSNumber::withNumber(0ULL, 32);
++		int wifi = 0;
++		PE_parse_boot_argn("agatewifi", &wifi, sizeof(wifi));
++		/* en0 is the Wi-Fi's (AgateWLAN) when the station runs: USB networking is en1 */
++		OSNumber *unit = OSNumber::withNumber(wifi >= 8 ? 1ULL : 0ULL, 32);
+ 		OSData *eid = OSData::withBytes(&id, sizeof(id));
+ 		IOReturn ret = kIOReturnNoMemory;
+ 		if (cmd && type && unit && eid) {
+diff --git a/iokit/Kernel/arm/AgateWLAN.cpp b/iokit/Kernel/arm/AgateWLAN.cpp
+new file mode 100644
+index 0000000..aa4a3a6
+--- /dev/null
++++ b/iokit/Kernel/arm/AgateWLAN.cpp
+@@ -0,0 +1,330 @@
++/*
++ * agate (Xiaomi 11T): the MT6893's Wi-Fi as iOS expects to find a Wi-Fi adapter.
++ *
++ * As HakiOS found (its iokit/Kernel/RedwoodWLAN.cpp, APSL 2.0): wifid's device is the service
++ * whose property IO80211InterfaceRole is "Infrastructure" and whose IOInterfaceName is the
++ * interface; with no user client to open, IO80211.framework falls back to ioctls
++ * (SIOCGA80211/SIOCSA80211), answered by bsd/dev/agate_wlan/redwood_apple80211.c; and
++ * SystemConfiguration calls an IONetworkInterface a Wi-Fi interface when its controller is an
++ * IO80211Controller. agate has IONetworkingFamily built in (0497), so here that is a real
++ * IOEthernetController (as AgateECMEthernet): the class IO80211Controller in between, its
++ * interface an IOEthernetInterface of the Wi-Fi subfamily that hands the Apple80211 ioctls on.
++ * Named en0 (USB networking moves to en1 when agatewifi >= 8).
++ *
++ * Frames: outputPacket -> agate_mtkwifi_transmit() (bsd/dev/agate_wlan/agate_mtkwifi.c);
++ * redwood_net_input() / redwood_net_link_state() back the other way.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/network/IOEthernetController.h>
++#include <IOKit/network/IOEthernetInterface.h>
++#include <IOKit/network/IONetworkMedium.h>
++#include <IOKit/network/IOOutputQueue.h>
++#include <sys/kpi_mbuf.h>
++#include <net/kpi_interface.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++#define SIOCSA80211     0x802869c8u
++#define SIOCGA80211     0xc02869c9u
++
++extern "C" {
++int  agate_mtkwifi_transmit(const uint8_t *frame, uint32_t length);
++errno_t redwood_apple80211_ioctl(u_long command, void *data);
++kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++void thread_deallocate(thread_t);
++}
++
++class IO80211Controller : public IOEthernetController {
++	OSDeclareAbstractStructors(IO80211Controller);
++};
++OSDefineMetaClassAndAbstractStructors(IO80211Controller, IOEthernetController);
++
++class AgateWLANInterface : public IOEthernetInterface {
++	OSDeclareDefaultStructors(AgateWLANInterface);
++public:
++	bool init(IONetworkController *controller) APPLE_KEXT_OVERRIDE;
++	SInt32 performCommand(IONetworkController *ctr, unsigned long cmd, void *arg0, void *arg1) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AgateWLANInterface, IOEthernetInterface);
++
++bool
++AgateWLANInterface::init(IONetworkController *controller)
++{
++	if (!IOEthernetInterface::init(controller)) {
++		return false;
++	}
++	setInterfaceSubType(IFNET_SUBFAMILY_WIFI);
++	setProperty("IO80211InterfaceRole", "Infrastructure");
++	setProperty("IOBuiltin", true);
++	return true;
++}
++
++SInt32
++AgateWLANInterface::performCommand(IONetworkController *ctr, unsigned long cmd, void *arg0, void *arg1)
++{
++	if (cmd == SIOCSA80211 || cmd == SIOCGA80211) {
++		return redwood_apple80211_ioctl(cmd, arg1);
++	}
++	return IOEthernetInterface::performCommand(ctr, cmd, arg0, arg1);
++}
++
++class AgateWLAN : public IO80211Controller {
++	OSDeclareDefaultStructors(AgateWLAN);
++public:
++	IOEthernetInterface *fNetif;
++	IONetworkMedium     *fMedium;
++	IOWorkLoop          *fWorkLoop;
++	volatile bool        fEnabled, fLinked;
++	uint8_t              fMac[6];
++
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	bool createWorkLoop(void) APPLE_KEXT_OVERRIDE;
++	IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE;
++	IONetworkInterface *createInterface(void) APPLE_KEXT_OVERRIDE;
++	IOReturn enable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
++	IOReturn disable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
++	UInt32 outputPacket(mbuf_t m, void *param) APPLE_KEXT_OVERRIDE;
++	IOReturn getHardwareAddress(IOEthernetAddress *addr) APPLE_KEXT_OVERRIDE;
++	IOReturn setPromiscuousMode(bool active) APPLE_KEXT_OVERRIDE;
++	IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
++	IOReturn setMulticastList(IOEthernetAddress *addrs, UInt32 count) APPLE_KEXT_OVERRIDE;
++	void input(const uint8_t *data, uint32_t len);
++	void link(bool up);
++	static void nameThread(void *arg, wait_result_t wr);
++};
++OSDefineMetaClassAndStructors(AgateWLAN, IO80211Controller);
++
++static AgateWLAN *gAgateWLAN;
++
++bool
++AgateWLAN::createWorkLoop(void)
++{
++	fWorkLoop = IOWorkLoop::workLoop();
++	return fWorkLoop != NULL;
++}
++
++IOWorkLoop *
++AgateWLAN::getWorkLoop(void) const
++{
++	return fWorkLoop;
++}
++
++IONetworkInterface *
++AgateWLAN::createInterface(void)
++{
++	AgateWLANInterface *netif = new AgateWLANInterface;
++
++	if (netif != NULL && !netif->init(this)) {
++		netif->release();
++		netif = NULL;
++	}
++	return netif;
++}
++
++bool
++AgateWLAN::start(IOService *provider)
++{
++	if (!IO80211Controller::start(provider)) {
++		IOLog("AGATE WLAN: IOEthernetController::start failed\n");
++		return false;
++	}
++	OSDictionary *media = OSDictionary::withCapacity(1);
++	fMedium = IONetworkMedium::medium(kIOMediumIEEE80211Auto, 54000000);
++	if (media == NULL || fMedium == NULL ||
++	    !IONetworkMedium::addMedium(media, fMedium) ||
++	    !publishMediumDictionary(media)) {
++		IOLog("AGATE WLAN: medium setup failed\n");
++		OSSafeReleaseNULL(media);
++		return false;
++	}
++	media->release();
++	setProperty("IOModel", "MT6893 CONNAC2 Wi-Fi");
++	setProperty("IOVendor", "MediaTek");
++	setProperty("IOBuiltin", true);
++	if (!attachInterface((IONetworkInterface **)&fNetif, false)) {
++		IOLog("AGATE WLAN: attachInterface failed\n");
++		return false;
++	}
++	fNetif->registerService();
++
++	thread_t th;
++	retain();
++	if (kernel_thread_start((thread_continue_t)&AgateWLAN::nameThread, this, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		release();
++	}
++	IOLog("AGATE WLAN: controller up (%02x:%02x:%02x:%02x:%02x:%02x)\n",
++	    fMac[0], fMac[1], fMac[2], fMac[3], fMac[4], fMac[5]);
++	return true;
++}
++
++/* as AgateECMEthernet: ask IONetworkStack for en0 ourselves (configd's namer waits forever here) */
++void
++AgateWLAN::nameThread(void *arg, wait_result_t wr __unused)
++{
++	AgateWLAN *self = (AgateWLAN *)arg;
++	OSDictionary *match = IOService::serviceMatching("IONetworkStack");
++	IOService *stack = match ? IOService::waitForMatchingService(match, 30ULL * NSEC_PER_SEC) : NULL;
++
++	OSSafeReleaseNULL(match);
++	if (stack != NULL && self->fNetif != NULL) {
++		uint64_t id = self->fNetif->getRegistryEntryID();
++		OSDictionary *cmd = OSDictionary::withCapacity(3);
++		OSNumber *type = OSNumber::withNumber(1ULL, 32);
++		OSNumber *unit = OSNumber::withNumber(0ULL, 32);
++		OSData *eid = OSData::withBytes(&id, sizeof(id));
++		IOReturn ret = kIOReturnNoMemory;
++		if (cmd && type && unit && eid) {
++			cmd->setObject("IONetworkStackUserCommand", type);
++			cmd->setObject("IOInterfaceUnit", unit);
++			cmd->setObject("IORegistryEntryID", eid);
++			ret = stack->setProperties(cmd);
++		}
++		IOLog("AGATE WLAN: asked IONetworkStack for a name: 0x%x, now %s%u\n",
++		    ret, self->fNetif->getNamePrefix(), self->fNetif->getUnitNumber());
++		OSSafeReleaseNULL(cmd);
++		OSSafeReleaseNULL(type);
++		OSSafeReleaseNULL(unit);
++		OSSafeReleaseNULL(eid);
++		stack->release();
++	} else {
++		IOLog("AGATE WLAN: no IONetworkStack, naming left to configd\n");
++	}
++	self->release();
++}
++
++IOReturn
++AgateWLAN::enable(IONetworkInterface *netif __unused)
++{
++	fEnabled = true;
++	setLinkStatus(kIONetworkLinkValid | (fLinked ? kIONetworkLinkActive : 0),
++	    fLinked ? fMedium : NULL, fLinked ? 54000000 : 0);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AgateWLAN::disable(IONetworkInterface *netif __unused)
++{
++	fEnabled = false;
++	setLinkStatus(kIONetworkLinkValid, NULL, 0);
++	return kIOReturnSuccess;
++}
++
++void
++AgateWLAN::link(bool up)
++{
++	fLinked = up;
++	if (fEnabled) {
++		setLinkStatus(kIONetworkLinkValid | (up ? kIONetworkLinkActive : 0),
++		    up ? fMedium : NULL, up ? 54000000 : 0);
++	}
++	IOLog("AGATE WLAN: link %s\n", up ? "UP" : "down");
++}
++
++UInt32
++AgateWLAN::outputPacket(mbuf_t m, void *param __unused)
++{
++	uint8_t frame[1600];
++	size_t len = mbuf_pkthdr_len(m);
++
++	if (fEnabled && fLinked && len >= 14 && len <= 1514 &&
++	    mbuf_copydata(m, 0, len, frame) == 0) {
++		(void)agate_mtkwifi_transmit(frame, (uint32_t)len);
++	}
++	freePacket(m);
++	return kIOReturnOutputSuccess;
++}
++
++IOReturn
++AgateWLAN::getHardwareAddress(IOEthernetAddress *addr)
++{
++	bcopy(fMac, addr->bytes, 6);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AgateWLAN::setPromiscuousMode(bool active __unused)
++{
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AgateWLAN::setMulticastMode(bool active __unused)
++{
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AgateWLAN::setMulticastList(IOEthernetAddress *addrs __unused, UInt32 count __unused)
++{
++	return kIOReturnSuccess;
++}
++
++void
++AgateWLAN::input(const uint8_t *data, uint32_t len)
++{
++	if (!fEnabled || fNetif == NULL) {
++		return;
++	}
++	mbuf_t m = allocatePacket(len);
++	if (m == NULL) {
++		return;
++	}
++	if (mbuf_copyback(m, 0, len, data, MBUF_DONTWAIT) != 0) {
++		freePacket(m);
++		return;
++	}
++	fNetif->inputPacket(m, len, 0);
++}
++
++extern "C" int
++agate_wlan_create(const uint8_t *mac)
++{
++	AgateWLAN *w = new AgateWLAN;
++	IOService *prov = IOService::getResourceService();
++
++	if (w == NULL || !w->init(NULL)) {
++		OSSafeReleaseNULL(w);
++		return -1;
++	}
++	bcopy(mac, w->fMac, 6);
++	OSData *d = OSData::withBytes(mac, 6);
++	if (d != NULL) {
++		w->setProperty("IOMACAddress", d);
++		d->release();
++	}
++	if (!w->attach(prov)) {
++		w->release();
++		return -1;
++	}
++	if (!w->start(prov)) {
++		w->detach(prov);
++		w->release();
++		return -1;
++	}
++	w->registerService();
++	gAgateWLAN = w;
++	return 0;
++}
++
++extern "C" void
++redwood_net_input(const uint8_t *frame, size_t length)
++{
++	if (gAgateWLAN != NULL) {
++		gAgateWLAN->input(frame, (uint32_t)length);
++	}
++}
++
++extern "C" void
++redwood_net_link_state(bool up)
++{
++	if (gAgateWLAN != NULL) {
++		gAgateWLAN->link(up);
++	}
++}
++#endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 4ad72ae..8ea35ad 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -42,3 +42,4 @@ iokit/sweet_ionet/IONetworkUserClient.cpp        optional iokitcpp
+ iokit/sweet_ionet/IOOutputQueue.cpp              optional iokitcpp
+ iokit/sweet_ionet/IOPacketQueue.cpp              optional iokitcpp
+ iokit/Kernel/arm/AgateECMEthernet.cpp                           optional iokitcpp
++iokit/Kernel/arm/AgateWLAN.cpp                                  optional iokitcpp
