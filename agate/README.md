@@ -163,3 +163,19 @@ SweetHID and touch works on the iOS home screen.
 panics with "CPU registration timeout"). `config/xnu12-touch-big.cmdline`:
 `cpus=7`, `agatetouch=1`, `agatevmch=1`. The UI is a little faster (still
 CPU rendering: there is no GPU driver).
+
+## Result: USB device mode and the kernel log over USB (2026-11-19)
+
+`base=ruby` (workflow input; `AGATE_BASE=ruby`) builds the whole ruby set
+(0001-0334, MediaTek MTU3 USB device stack included) plus the agate patches
+rebased as `agate/patches-ruby/0490-0495`. The MTU3/IPPC/PHY blocks of
+MT6893 sit at the same addresses as on MT6877 (`0x11201000`, `0x11203e00`,
+`0x11e40000`). 0495: `rubyps5169=0` skips ruby's PS5169 enable on GPIO121,
+an I2C SDA line on agate. `config/xnu15-usb.cmdline` adds `rubyusb=1
+rubyps5169=0 rubyusbirq=0` (polled; ruby's IRQ service has MT6877's INTID).
+
+46 s after reset the Mac enumerates `ruby USB P2` (`1209:0002`), iOS boots
+as before (7 cores, touch, kernel-driven frames), and
+`tools/usblog.py dump|follow OUT` (pyusb + libusb, read-only vendor
+requests 0x2B/0x2A) pulls the whole console ring off the phone: no more
+filming the screen.
