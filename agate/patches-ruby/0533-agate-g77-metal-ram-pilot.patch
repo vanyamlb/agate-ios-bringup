@@ -1,0 +1,122 @@
+diff --git a/bsd/dev/agate_gpu.c b/bsd/dev/agate_gpu.c
+index 0306fde..368990d 100644
+--- a/bsd/dev/agate_gpu.c
++++ b/bsd/dev/agate_gpu.c
+@@ -3,7 +3,7 @@
+  * agategpu=1 reads controllers. agategpu=2 reads rails.
+  * agategpu=3 tests MFG and reads the GPU ID at the stock boot point.
+  * agategpu=4 runs the vendor one-shot job for G77 r0p1.
+- * agategpu=5 or 6 hands the initialized GPU to the IOKit accelerator.
++ * agategpu=5 through 7 hands the initialized GPU to the IOKit accelerator.
+  * Register layout cross-checked with the agate FDT and the MT6893 X6739
+  * reference (hakios_mali_mt6893.h, commit 9eeec2d2e12f).
+  */
+@@ -841,7 +841,7 @@ agate_gpu_vsram_probe(int (*read_reg)(uint16_t, uint16_t *))
+ 	int step = 0;
+ 	uint16_t ctrl, chip, monitor, selector;
+ 
+-	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || (step < 2 || step > 6)) {
++	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || (step < 2 || step > 7)) {
+ 		return;
+ 	}
+ 	if (read_reg(AGATE_VSRAM_OTHERS_EN, &ctrl) != 0) {
+@@ -893,7 +893,7 @@ agate_gpu_probe(void)
+ 	uint32_t clock, status, status2;
+ 	uint32_t prot0, prot1, prot2, prot3;
+ 
+-	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || (step < 1 || step > 6)) {
++	if (!PE_parse_boot_argn("agategpu", &step, sizeof(step)) || (step < 1 || step > 7)) {
+ 		return;
+ 	}
+ 
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index f41b75b..133dd7e 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6884,6 +6884,38 @@ load_init_program(proc_t p)
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) && CONFIG_BASESYSTEMROOT
++	int agate_gpu_mode = 0;
++	if (PE_parse_boot_argn("agategpu", &agate_gpu_mode, sizeof(agate_gpu_mode)) && agate_gpu_mode == 7) {
++		vfs_context_t ctx = vfs_context_kernel();
++		vnode_t developer;
++		error = vnode_lookup("/Developer", VNODE_LOOKUP_NOFOLLOW, &developer, ctx);
++		if (!error) {
++			if (vnode_isvroot(developer) || !vnode_isdir(developer)) {
++				error = EBUSY;
++			}
++			vnode_put(developer);
++		}
++		if (!error) {
++			/* Match imageboot's HFS device argument convention. The pilot
++			 * mounts the boot ADT's RAMDisk at /Developer and keeps / on UFS. */
++			char device[] = "/dev/md0";
++			char *device_path = device;
++			error = kernel_mount("hfs", NULLVP, NULLVP, "/Developer", &device_path, 0,
++			    MNT_RDONLY | MNT_DONTBROWSE | MNT_NOSUID | MNT_NODEV,
++			    KERNEL_MOUNT_NOAUTH | KERNEL_MOUNT_BASESYSTEMROOT, ctx);
++		}
++		if (!error) {
++			printf("AGATE METAL: mounted diagnostic RAM volume read-only\n");
++			error = load_init_program_at_path(p, (user_addr_t)scratch_addr, "/Developer/metal-init");
++			if (!error) {
++				return;
++			}
++		}
++		printf("AGATE METAL: pilot setup failed (%d); continuing with launchd\n", error);
++	}
++#endif
++
+ #if DEBUG || DEVELOPMENT
+ 	/* Check for boot-arg suffix first */
+ 	char launchd_suffix[64];
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 1778a77..5f65199 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -909,7 +909,7 @@ bool
+ VivaGPUAccelerator::start(IOService *provider)
+ {
+ 	int mode = 0;
+-	if (!PE_parse_boot_argn("agategpu", &mode, sizeof(mode)) || (mode != 5 && mode != 6)) {
++	if (!PE_parse_boot_argn("agategpu", &mode, sizeof(mode)) || (mode < 5 || mode > 7)) {
+ 		return false;
+ 	}
+ 	fMode = mode;
+@@ -1487,13 +1487,16 @@ VivaGPUAccelerator::clearAddressSpaces(void)
+ void
+ VivaGPUAccelerator::finishStartup(bool passed)
+ {
+-	if (passed && fMode == 6) {
+-		setProperty("MetalPluginName", "VivaMTLDriver");
+-		setProperty("MetalPluginClassName", "VMDevice");
++	if (passed && (fMode == 6 || fMode == 7)) {
++		if (fMode == 6) {
++			setProperty("MetalPluginName", "VivaMTLDriver");
++			setProperty("MetalPluginClassName", "VMDevice");
++		}
+ 		gVivaGPU = this;
+ 		fPublished = true;
+ 		registerService();
+-		IOLog("AGATE GPU: Metal accelerator published\n");
++		IOLog("%s", fMode == 7 ? "AGATE GPU: Metal pilot service ready\n" :
++		    "AGATE GPU: Metal accelerator published\n");
+ 		return;
+ 	}
+ 
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 96b1b83..e8400d2 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -1,7 +1,8 @@
+ /*
+  * Xiaomi 11T job-manager driver for Mali-G77. Based on Nik300/ios-viva.
+  * agategpu=5 verifies hardware writeback. agategpu=6 publishes the accelerator
+- * after the writeback test passes.
++ * after the writeback test passes. Mode 7 registers a service for the
++ * RAM-volume pilot without attaching it to the iOS compositor.
+  */
+ #ifndef _IOKIT_ARM_VIVAGPU_H
+ #define _IOKIT_ARM_VIVAGPU_H

@@ -139,7 +139,7 @@ jobs:
           cp dxb/fakeroot/System/Library/Kernels/kernel.development.sweet out/
           # dxb skips patches that fail to apply with only a warning: make
           # sure every agate patch really is in the kernel.
-          for marker in "AGATE UFS: read-only probe" "AGATE UFS: root window" "AGATE decmpfs: types 3, 4" "SWEET HID: autoswipe armed" "AGATE TOUCH: thread started" "AGATE GPU: runtime WA complete" "AGATE GPU: runtime writeback selftest" "AGATE GPU: Metal accelerator published" "mediatek,mt6893-mali"; do
+          for marker in "AGATE UFS: read-only probe" "AGATE UFS: root window" "AGATE decmpfs: types 3, 4" "SWEET HID: autoswipe armed" "AGATE TOUCH: thread started" "AGATE GPU: runtime WA complete" "AGATE GPU: runtime writeback selftest" "AGATE GPU: Metal accelerator published" "AGATE METAL: mounted diagnostic RAM volume" "AGATE GPU: Metal pilot service ready" "mediatek,mt6893-mali"; do
             strings out/kernel.development.sweet | grep -q "$marker" ||
               { echo "agate patch missing from the kernel: $marker" >&2; exit 1; }
           done
@@ -154,48 +154,30 @@ jobs:
           path: out/
           if-no-files-found: error
 
-  payload:
-    needs: kernel
-    if: ${{ always() && (needs.kernel.result == 'success' || needs.kernel.result == 'skipped') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+  paint-pilot:
+    runs-on: macos-15
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Toolchain
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Compile and sign the iOS pilot
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-
-      - name: Shim
-        run: sh agate/shim/build.sh
-
-      - name: Fetch ios-topaz tools (pinned)
-        run: |
-          git init -q topaz
-          git -C topaz fetch -q --depth 1 "$TOPAZ_REPO" "$TOPAZ_SHA"
-          git -C topaz checkout -q FETCH_HEAD
-          test "$(git -C topaz rev-parse HEAD)" = "$TOPAZ_SHA"
-
-      - uses: actions/download-artifact@v4
+          set -eu
+          mkdir -p pilot
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          CC="$(xcrun --sdk iphoneos -f clang)"
+          "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror \
+            agate/tools/metal-pilot/init.c -o pilot/metal-init
+          "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror -fobjc-arc \
+            agate/tools/metal-pilot/smoke.m -framework Foundation -framework Metal -framework IOKit -o pilot/metal-smoke
+          cd pilot
+          for f in metal-init metal-smoke; do
+            codesign -s - --force "$f"
+            codesign --verify --strict "$f"
+            test "$(lipo -archs "$f")" = arm64
+          done
+          shasum -a 256 metal-init metal-smoke > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: agate-kernel
-          path: kernel
-          run-id: ${{ inputs.kernel_run || github.run_id }}
-          github-token: ${{ github.token }}
-
-      - name: ADT and payload
-        run: |
-          mkdir -p out
-          python3 agate/tools/mkadt_agate.py --topaz topaz out/agate.adt --dump > out/agate-adt.txt
-          python3 topaz/tools/mkpayload.py kernel/kernel.development.sweet out/agate.adt \
-            out/payload.bin --cmdline "$(cat agate/config/xnu1.cmdline)" | tee out/payload.txt
-          cp agate/shim/out/shim.bin agate/shim/out/shim.dis agate/config/xnu1.cmdline out/
-          cp kernel/kernel-hashes.txt kernel/patchset.txt kernel/patches.txt out/
-          (cd out && sha256sum shim.bin agate.adt payload.bin > SHA256SUMS && cat SHA256SUMS)
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: agate-xnu
-          path: out/
+          name: agate-metal-pilot
+          path: pilot/
           if-no-files-found: error
