@@ -37,6 +37,24 @@ Two traps on the way: `memset_io` on the conn sysram must be 32-bit device store
 `memset` faulted with an alignment abort, ESR `0x96000061`), and without VCN18/VCN13 the A-die
 reads `0x00000000` while every step still returns 0.
 
+**A3a (2026-11-19, shim AGFW + patch 0502, `agatewifi=5`).** The WM (Wi-Fi) MCU runs its ROM
+under XNU. `tools/mkfwblob.py` packs the phone's own ROM EMI images into an "AGFW" blob that
+`pack_xnu.py --fw-blob` puts at Image+0x1800000; the shim copies them (32-bit stores, MMU off)
+to the conn EMI at `0x8fb00000` + `(addr & 0xFFFFFF)` without their 48-byte header, dates to
+`0x27f0e0`/`0x27f0f0`, as gen4m `wlanDownloadEMISection` does. Then, after A2b:
+
+```
+EMI+230000 (wmmcu):    30021f46 828b1058 009201dd 08462384   (= soc3_0_ram_wmmcu body)
+EMI+2b0000 (wifi-rom): b0020f46 0c000058 009200dd 004600fc   (= soc3_0_ram_wifi body)
+A3a: remap=89040000, releasing WM CPU (rgu+0x10=00000000)
+A3a: ROM state 00001d1e after 40 ms -> WM MCU ROM is UP, ready for the patch
+```
+
+`CONN_CFG_AP2WF_REMAP_1` = `0x89040000`, WF dynamic base `+0x1dc/+0x1e0` = 0, WFSYS semaphore
+reset (`0x18000018[0]` = 0), WM CPU out of reset (`0x18000010[0]` = 1), ROM ready code `0x1D1E`
+at `0x184c1604`. Next (A3b): WFDMA rings, ROM patch (`soc3_0_patch_wmmcu`) and N9 RAM code
+(`WIFI_RAM_CODE_soc3_0_1a_1.bin`, kept in the blob as kind-2 entries) over the connac2 MCU protocol.
+
 ## Material collected (not in the repository: the owner's own phone data)
 
 `agate-data/wifi-fw/` on the build machine, read from the running Android with root:
