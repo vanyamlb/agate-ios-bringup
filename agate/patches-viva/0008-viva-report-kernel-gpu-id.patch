@@ -1,0 +1,16 @@
+diff --git a/driver/vmg_screen.c b/driver/vmg_screen.c
+index c03c166..63901dc 100644
+--- a/driver/vmg_screen.c
++++ b/driver/vmg_screen.c
+@@ -341,8 +341,9 @@ vmg_device *vmg_device_create(const char *which, char *error, size_t error_size)
+         struct pipe_screen_config config = { .driver_name_is_inferred = false, .options = &options, .options_info = &info };
+         dev->screen = panfrost_create_screen(dev->fd, &config, NULL);
+         dev->panfrost = true;
+-        // Panfrost names the GPU from its product id: Mali-G57 = 0x9093 (the only one the ISA compiler targets)
+-        if (dev->screen && strstr(dev->screen->get_name(dev->screen), "Mali-G57")) g_gpu_product_id = 0x9093;
++        struct vgpu_version version = {0};
++        if (dev->screen && vgpu_ioctl(dev->fd, VGPU_SEL_GET_VERSION, &version) == 0)
++            g_gpu_product_id = version.gpu_id >> 16;
+ #if VMG_HAVE_LLVMPIPE
+     } else if (!strcmp(which, "llvmpipe")) {
+         dev->winsys = null_sw_create();

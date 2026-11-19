@@ -1,201 +1,55 @@
-name: agate-xnu
-
-# Builds the agate (Xiaomi 11T, MT6893) XNU boot payload:
-#   kernel  (macos-15): sweet baseline 0001-0079 + ruby 0080-0083, public upstream
-#   payload (ubuntu):   agate shim + agate ADT + mkpayload.py (ios-topaz tools)
-# The boot image itself is packed locally (agate/tools/pack_xnu.py) from the
-# owner's boot image; no device image, IPSW or personal data is used here.
-
+name: agate Metal userspace diagnostic
 on:
   workflow_dispatch:
-    inputs:
-      runner:
-        description: hosted macOS image (macos-15-intel usually has shorter queues than macos-15 arm64)
-        default: "macos-15-intel"
-      kernel_run:
-        description: reuse agate-kernel from this run id (skips the kernel build)
-        default: ""
-      base:
-        description: "patch base: sweet (baseline + ruby 0080-0084) or ruby (whole ruby set incl. USB)"
-        default: "sweet"
-  push:
-    branches: [main]
-    paths:
-      - "agate/ci/**"
-      - "agate/patches/**"
-      - "agate/shim/**"
-      - "agate/tools/mkadt_agate.py"
-      - "agate/config/**"
-      - ".github/workflows/agate-xnu.yml"
-
-concurrency:
-  group: agate-xnu-${{ github.ref }}-${{ inputs.runner || 'macos-15-intel' }}-${{ inputs.base || 'sweet' }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
-  actions: read
-
-env:
-  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
-  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
-  TOPAZ_REPO: https://github.com/MakrSas/ios-topaz.git
-  TOPAZ_SHA: 5095ac19dbdcf37b64b81fe443f4027ad51b84bf
-  MACOS_VERSION: "13.5"
-  XCODE_VERSION: "16.0"
-  KERNEL_CONFIG: DEVELOPMENT
-  MACHINE_CONFIG: SWEET
-  CCACHE_DIR: ${{ github.workspace }}/.ccache
-  CCACHE_BASEDIR: ${{ github.workspace }}
-  CCACHE_COMPILERCHECK: content
-  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
-  CCACHE_MAXSIZE: 3G
-  CCACHE_WRAP: ${{ github.workspace }}/ccache-bin
-
 jobs:
-  kernel:
-    if: ${{ !inputs.kernel_run }}
-    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
-    timeout-minutes: 240
+  metal-userspace:
+    runs-on: macos-15
+    timeout-minutes: 65
+    env:
+      JOBS: 4
+      VIVA_CCACHE: ccache
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Prepare agate patchset
-        run: AGATE_BASE="${{ inputs.base || 'sweet' }}" sh agate/ci/prepare-agate.sh base
-
-      - name: Fetch build script
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Fetch pinned Viva sources
         run: |
-          git init -q dxb
-          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
-          git -C dxb checkout -q FETCH_HEAD
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
-          cp base/xnu/patches/*.patch base/xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
-          # ruby: Cortex-A55/A78 (ARMv8.2), keep the kernel on Cortex-A55
-          # (clang's apple-m1 default emits LSE atomics and LDAPR)
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a55"/' dxb/build.sh
-          grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a55"' dxb/build.sh
-          # xnu's makedefs take CC/CXX from the environment dxb exports; xcodebuild
-          # (mig, ctf tools) needs a single executable, so point at wrappers
-          sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh
-          grep -c 'export CC="$CCACHE_WRAP/clang"' dxb/build.sh
-          ls dxb/patches | tail
-
-      - name: Deps
+          git init viva
+          git -C viva fetch --depth 1 https://github.com/Nik300/viva-gpu.git 9ebe5e46f74f6d75fce1d76b2ea4ea603cb63637
+          git -C viva checkout --detach FETCH_HEAD
+          test "$(git -C viva rev-parse HEAD)" = 9ebe5e46f74f6d75fce1d76b2ea4ea603cb63637
+          cp agate/patches-viva/0007-*.patch viva/mesa/patches/
+          git -C viva apply --check ../agate/patches-viva/0008-viva-report-kernel-gpu-id.patch
+          git -C viva apply ../agate/patches-viva/0008-viva-report-kernel-gpu-id.patch
+      - name: Build tools
         run: |
-          brew install jq gum bash cmake ninja ccache
-          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
-          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
-          sudo chmod +x /usr/local/bin/xcodes
-          sw_vers
-          ls -d /Applications/Xcode*.app
-          XC=""
-          for cand in "/Applications/Xcode_${XCODE_VERSION}.app" "/Applications/Xcode_${XCODE_VERSION%%.*}.app"; do
-            if [ -d "$cand" ]; then XC="$cand"; break; fi
+          brew install llvm spirv-llvm-translator spirv-tools zstd pkgconf ccache
+          xcrun --sdk iphoneos --show-sdk-path
+      - name: Build iOS Metal bundle and tests
+        run: |
+          cd viva
+          bash ios/build.sh all
+      - name: Verify and package
+        run: |
+          set -euo pipefail
+          cd viva/ios/out
+          test -x VivaMTLDriver.bundle/VivaMTLDriver
+          test -x tests/phase3
+          test -x tests/vmprobe
+          test -x tests/test_vgpu
+          codesign --verify --strict VivaMTLDriver.bundle
+          for binary in VivaMTLDriver.bundle/VivaMTLDriver tests/vmprobe tests/phase3 tests/test_vgpu; do
+            test "$(lipo -archs "$binary")" = arm64
           done
-          if [ -z "$XC" ]; then
-            echo "Xcode ${XCODE_VERSION} not found in ${RUNNER_IMAGE}; refusing to drift"
-            exit 1
-          fi
-          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
-          sudo xcode-select -s "$XC"
-          xcodebuild -version
-          xcrun --find iig
-          xcrun --sdk macosx --show-sdk-version
-          xcrun clang --version | head -1
-          mkdir -p "$CCACHE_WRAP"
-          for t in clang clang++; do
-            printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -find $t)" > "$CCACHE_WRAP/$t"
-            chmod +x "$CCACHE_WRAP/$t"
-          done
-          cat "$CCACHE_WRAP/clang"
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+          strings VivaMTLDriver.bundle/VivaMTLDriver | awk '/^Mali-G77$/ { found=1 } END { exit !found }'
+          cp ../../LICENSE ../../NOTICE .
+          tar -czf "$GITHUB_WORKSPACE/agate-metal-ios.tar.gz" VivaMTLDriver.bundle tests LICENSE NOTICE
+          cd "$GITHUB_WORKSPACE"
+          shasum -a 256 agate-metal-ios.tar.gz > agate-metal-ios.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          path: ${{ github.workspace }}/.ccache
-          key: agate-ccache-${{ env.XCODE_VERSION }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ hashFiles('agate/ci/**', '.github/workflows/agate-xnu.yml') }}
-          restore-keys: |
-            agate-ccache-${{ env.XCODE_VERSION }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
-
-      - name: Build
-        working-directory: dxb
-        env:
-          # keep going after errors so one run reports every compile failure
-          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-          # bearssl.org intermittently returns 502; this mirror carries the
-          # same pinned commit and the SHA check in 0020-stage-bearssl.sh.
-          GIT_CONFIG_COUNT: "1"
-          GIT_CONFIG_KEY_0: url.https://github.com/status-im/BearSSL.insteadOf
-          GIT_CONFIG_VALUE_0: https://www.bearssl.org/git/BearSSL
-        run: |
-          ccache -z
-          bash build.sh
-          ccache -s
-
-      - name: Collect
-        run: |
-          mkdir -p out
-          cp dxb/fakeroot/System/Library/Kernels/kernel.development.sweet out/
-          # dxb skips patches that fail to apply with only a warning: make
-          # sure every agate patch really is in the kernel.
-          for marker in "AGATE UFS: read-only probe" "AGATE UFS: root window" "AGATE decmpfs: types 3, 4" "SWEET HID: autoswipe armed" "AGATE TOUCH: thread started"; do
-            strings out/kernel.development.sweet | grep -q "$marker" ||
-              { echo "agate patch missing from the kernel: $marker" >&2; exit 1; }
-          done
-          python3 ci/kernel_hash.py out/kernel.development.sweet | tee out/kernel-hashes.txt
-          python3 ci/patchset_hash.py base/xnu/patches > out/patchset.txt
-          ls base/xnu/patches > out/patches.txt
-          (cd out && shasum -a 256 kernel.development.sweet > SHA256SUMS)
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: agate-kernel
-          path: out/
-          if-no-files-found: error
-
-  payload:
-    needs: kernel
-    if: ${{ always() && (needs.kernel.result == 'success' || needs.kernel.result == 'skipped') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Toolchain
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-
-      - name: Shim
-        run: sh agate/shim/build.sh
-
-      - name: Fetch ios-topaz tools (pinned)
-        run: |
-          git init -q topaz
-          git -C topaz fetch -q --depth 1 "$TOPAZ_REPO" "$TOPAZ_SHA"
-          git -C topaz checkout -q FETCH_HEAD
-          test "$(git -C topaz rev-parse HEAD)" = "$TOPAZ_SHA"
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: agate-kernel
-          path: kernel
-          run-id: ${{ inputs.kernel_run || github.run_id }}
-          github-token: ${{ github.token }}
-
-      - name: ADT and payload
-        run: |
-          mkdir -p out
-          python3 agate/tools/mkadt_agate.py --topaz topaz out/agate.adt --dump > out/agate-adt.txt
-          python3 topaz/tools/mkpayload.py kernel/kernel.development.sweet out/agate.adt \
-            out/payload.bin --cmdline "$(cat agate/config/xnu1.cmdline)" | tee out/payload.txt
-          cp agate/shim/out/shim.bin agate/shim/out/shim.dis agate/config/xnu1.cmdline out/
-          cp kernel/kernel-hashes.txt kernel/patchset.txt kernel/patches.txt out/
-          (cd out && sha256sum shim.bin agate.adt payload.bin > SHA256SUMS && cat SHA256SUMS)
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: agate-xnu
-          path: out/
+          name: agate-metal-ios
+          path: |
+            agate-metal-ios.tar.gz
+            agate-metal-ios.sha256
           if-no-files-found: error

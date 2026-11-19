@@ -1,0 +1,22 @@
+Subject: [PATCH] panfrost: recognize the Mali-G77 model
+Based-on: https://github.com/zenithblue-oss/panvk-kbase-android/blob/cf70e02b918e1864cbcd746a7fefa57b96c673ce/patches/jm-v9/006-add-the-mali-g77-model-row.patch
+Original-author: abhay-byte
+
+The MT6893 G77 ID 0x90800011 normalizes to product (9, 0, 0).
+Keep identity distinct from G57 and use the donor patch's tile-buffer
+sizes and per-core rates as initial values for hardware validation.
+
+diff --git a/src/panfrost/model/pan_model.c b/src/panfrost/model/pan_model.c
+index 22fb4f7..9d0fdd3 100644
+--- a/src/panfrost/model/pan_model.c
++++ b/src/panfrost/model/pan_model.c
+@@ -81,6 +81,9 @@ const struct pan_model pan_model_list[] = {
+    BIFROST_MODEL(PAN_PROD_ID(7, 2, 2),    "G52",    "G52", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192)),
+    BIFROST_MODEL(PAN_PROD_ID(7, 4, 2),    "G52 r1", "G52", MODEL_ANISO(ALL),  MODEL_TB_SIZES( 8192,  8192)),
+ 
++   /* Mali-G77 (TTRx); use the conservative G57 Valhall v9 sizes. */
++   VALHALL_MODEL(PAN_PROD_ID(9, 0, 0), 0, "G77",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
++                                              MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+    VALHALL_MODEL(PAN_PROD_ID(9, 0, 1), 0, "G57",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
+                                               MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+    VALHALL_MODEL(PAN_PROD_ID(9, 0, 3), 0, "G57",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
