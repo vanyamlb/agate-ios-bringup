@@ -1,0 +1,255 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index cb50713..976cc25 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -124,6 +124,7 @@ bsd/dev/ruby_usb_config.c			standard
+ bsd/dev/ruby_usb_ep_test.c			standard
+ bsd/dev/ruby_usb_io.c			standard
+ bsd/dev/agate_ecm.c			standard
++bsd/dev/agate_wifi.c			standard
+ bsd/dev/ruby_tty.c			standard
+ bsd/dev/ruby_raw.c			standard
+ bsd/dev/ruby_probe.c			standard
+diff --git a/bsd/dev/agate_wifi.c b/bsd/dev/agate_wifi.c
+new file mode 100644
+index 0000000..80a2ee7
+--- /dev/null
++++ b/bsd/dev/agate_wifi.c
+@@ -0,0 +1,223 @@
++/*
++ * agate (Xiaomi 11T, MT6893): Wi-Fi bring-up, milestone A1 - the
++ * connectivity subsystem ("conninfra", CONNAC 2.0) powered and its chip id
++ * read. Boot-arg agatewifi=N:
++ *   1  read only: the SPM power state of the conn domain, the AXI bus
++ *      protection, the ap2conn clock; nothing is written
++ *   2  power on with MediaTek's own "POS" sequence for this SoC
++ *      (conninfra/platform/mt6893/mt6893_pos.c,
++ *      consys_conninfra_on_power_ctrl_mt6893 without the SPM API), then
++ *      wake conn_infra and read CONN_HW_VER (expected 0x20010101)
++ * The conn domain's registers are only touched once SPM acks its power and
++ * the bus protection is off; every access is logged before it is made.
++ * Runs in its own thread agatewifidelay seconds (default 60) after start,
++ * so the USB log (rubyusb) is up first.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++extern void delay(int usec);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++#define AW_SPM          0x10006000UL
++#define AW_INFRA_AO     0x10001000UL
++#define AW_TOPRGU       0x10007000UL
++#define AW_INFRACFG     0x1020e000UL
++#define AW_CONN_CFG     0x18001000UL    /* CONN_INFRA_CFG */
++#define AW_HOST_CSR     0x18060000UL    /* CONN_HOST_CSR_TOP (64 KiB) */
++
++#define SPM_POWERON_CONFIG_EN   0x0000
++#define SPM_PWR_STATUS          0x016c
++#define SPM_PWR_STATUS_2ND      0x0170
++#define SPM_CONN_PWR_CON        0x0304
++#define TOPRGU_WDT_SWSYSRST     0x0018
++#define INFRA_AP2MD_GALS_CTL    0x0504
++#define PROTECTEN_CLR           0x02a4
++#define PROTECTEN_STA1          0x0228
++#define PROTECTEN2_CLR          0x0718
++#define PROTECTEN2_STA1         0x0724
++#define CONN_HW_VER_OFF         0x0000
++#define CONN_CFG_ID_OFF         0x0004
++#define HOST_WAKEPU_TOP         0x01a0
++#define HOST_SLP_PROT_CTRL      0x0184
++#define HOST_DEADFEED_EN        0x0124
++#define CONN_HW_VER             0x20010101u
++
++static vm_offset_t aw_spm, aw_ao, aw_rgu, aw_infra, aw_cfg, aw_csr;
++
++static inline uint32_t
++aw_rd(vm_offset_t b, uint32_t o)
++{
++	return *(volatile uint32_t *)(b + o);
++}
++
++static inline void
++aw_wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* poll bit until it equals val: times x us; 0 = ok */
++static int
++aw_poll(vm_offset_t b, uint32_t o, int bit, int val, int times, int us)
++{
++	for (int i = 0; i < times; i++) {
++		if ((int)((aw_rd(b, o) >> bit) & 1) == val) {
++			return 0;
++		}
++		delay(us);
++	}
++	return -1;
++}
++
++static void
++aw_state(const char *when)
++{
++	printf("AGATE WIFI: %s SPM_PWR_STATUS=%08x 2ND=%08x CONN_PWR_CON=%08x "
++	    "PROTECTEN_STA1=%08x PROTECTEN2_STA1=%08x GALS=%08x\n", when,
++	    aw_rd(aw_spm, SPM_PWR_STATUS), aw_rd(aw_spm, SPM_PWR_STATUS_2ND),
++	    aw_rd(aw_spm, SPM_CONN_PWR_CON), aw_rd(aw_ao, PROTECTEN_STA1),
++	    aw_rd(aw_ao, PROTECTEN2_STA1), aw_rd(aw_infra, INFRA_AP2MD_GALS_CTL));
++}
++
++static int
++aw_power_on(void)
++{
++	printf("AGATE WIFI: power on (MediaTek POS sequence)\n");
++	/* SPM register access key + enable */
++	aw_wr(aw_spm, SPM_POWERON_CONFIG_EN,
++	    (aw_rd(aw_spm, SPM_POWERON_CONFIG_EN) & ~0xffff0001u) | 0x0b160001u);
++	/* ap2conn host_ck CG on */
++	aw_wr(aw_infra, INFRA_AP2MD_GALS_CTL, aw_rd(aw_infra, INFRA_AP2MD_GALS_CTL) | 0x1);
++	/* conn_infra_on primary power, ack in PWR_STATUS[1] */
++	aw_wr(aw_spm, SPM_CONN_PWR_CON, aw_rd(aw_spm, SPM_CONN_PWR_CON) | 0x4);
++	if (aw_poll(aw_spm, SPM_PWR_STATUS, 1, 1, 10, 500)) {
++		printf("AGATE WIFI: primary power ack missing\n");
++	}
++	/* secondary power, ack in PWR_STATUS_2ND[1] */
++	aw_wr(aw_spm, SPM_CONN_PWR_CON, aw_rd(aw_spm, SPM_CONN_PWR_CON) | 0x8);
++	if (aw_poll(aw_spm, SPM_PWR_STATUS_2ND, 1, 1, 10, 500)) {
++		printf("AGATE WIFI: secondary power ack missing\n");
++	}
++	/* bus clock on (conn_clk_dis=0), isolation off */
++	aw_wr(aw_spm, SPM_CONN_PWR_CON, aw_rd(aw_spm, SPM_CONN_PWR_CON) & ~0x10u);
++	delay(1);
++	aw_wr(aw_spm, SPM_CONN_PWR_CON, aw_rd(aw_spm, SPM_CONN_PWR_CON) & ~0x2u);
++	/* TOPRGU: de-assert the CONNSYS software reset (bit 9, key 0x88) */
++	aw_wr(aw_rgu, TOPRGU_WDT_SWSYSRST,
++	    (aw_rd(aw_rgu, TOPRGU_WDT_SWSYSRST) & ~0xff000200u) | 0x88000000u);
++	/* SPM: ap_sw_rst_b = 1 */
++	aw_wr(aw_spm, SPM_CONN_PWR_CON, aw_rd(aw_spm, SPM_CONN_PWR_CON) | 0x1);
++	delay(500);
++	aw_state("after power");
++	/* AXI sleep protection off: AP2CONN RX, CONN2AP RX, AP2CONN TX */
++	aw_wr(aw_ao, PROTECTEN2_CLR, 0x00000002);
++	if (aw_poll(aw_ao, PROTECTEN2_STA1, 2, 0, 100, 500)) {
++		printf("AGATE WIFI: AP2CONN RX protect still on\n");
++		return -1;
++	}
++	aw_wr(aw_ao, PROTECTEN_CLR, 0x00004000);
++	aw_wr(aw_ao, PROTECTEN_CLR, 0x00002000);
++	if (aw_poll(aw_ao, PROTECTEN_STA1, 13, 0, 100, 500)) {
++		printf("AGATE WIFI: AP2CONN TX protect still on\n");
++		return -1;
++	}
++	delay(6000);            /* CONNSYS XO clock ready */
++	aw_state("after protect off");
++	return 0;
++}
++
++static void
++aw_chipid(void)
++{
++	uint32_t ack = (aw_rd(aw_spm, SPM_PWR_STATUS) >> 1) & 1;
++	uint32_t ack2 = (aw_rd(aw_spm, SPM_PWR_STATUS_2ND) >> 1) & 1;
++	uint32_t prot = (aw_rd(aw_ao, PROTECTEN_STA1) >> 13) & 1;
++	uint32_t prot2 = (aw_rd(aw_ao, PROTECTEN2_STA1) >> 2) & 1;
++
++	if (!ack || !ack2 || prot || prot2) {
++		printf("AGATE WIFI: conn domain not reachable (ack %u/%u protect %u/%u), "
++		    "not touching 0x18000000\n", ack, ack2, prot, prot2);
++		return;
++	}
++	printf("AGATE WIFI: writing CONN_INFRA_WAKEPU_TOP (0x180601a0)\n");
++	aw_wr(aw_csr, HOST_WAKEPU_TOP, 0x1);
++	printf("AGATE WIFI: polling ap2conn slpprot_rdy (0x18060184[5])\n");
++	int r = aw_poll(aw_csr, HOST_SLP_PROT_CTRL, 5, 0, 10, 1000);
++	printf("AGATE WIFI: slpprot %s, CTRL=%08x\n", r ? "NOT ready" : "ready",
++	    aw_rd(aw_csr, HOST_SLP_PROT_CTRL));
++	if (r) {
++		return;
++	}
++	printf("AGATE WIFI: reading CONN_HW_VER (0x18001000)\n");
++	uint32_t ver = 0;
++	for (int i = 0; i < 10; i++) {
++		ver = aw_rd(aw_cfg, CONN_HW_VER_OFF);
++		if (ver == CONN_HW_VER) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("AGATE WIFI: CONN_HW_VER=%08x CFG_ID=%08x -> %s\n", ver,
++	    aw_rd(aw_cfg, CONN_CFG_ID_OFF),
++	    ver == CONN_HW_VER ? "MT6893 conninfra is ALIVE" : "unexpected");
++	if (ver == CONN_HW_VER) {
++		/* MediaTek's deadfeed workaround, as their driver does next */
++		aw_wr(aw_csr, HOST_DEADFEED_EN, aw_rd(aw_csr, HOST_DEADFEED_EN) & ~0x1u);
++	}
++}
++
++static int aw_step;
++
++static void
++agate_wifi_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	int secs = 60;
++	PE_parse_boot_argn("agatewifidelay", &secs, sizeof(secs));
++	for (int i = 0; i < secs; i++) {
++		delay(1000000);
++	}
++	aw_spm = ml_io_map(AW_SPM, 0x1000);
++	aw_ao = ml_io_map(AW_INFRA_AO, 0x1000);
++	aw_rgu = ml_io_map(AW_TOPRGU, 0x1000);
++	aw_infra = ml_io_map(AW_INFRACFG, 0x1000);
++	aw_cfg = ml_io_map(AW_CONN_CFG, 0x1000);
++	aw_csr = ml_io_map(AW_HOST_CSR, 0x10000);
++	if (!aw_spm || !aw_ao || !aw_rgu || !aw_infra || !aw_cfg || !aw_csr) {
++		printf("AGATE WIFI: map failed\n");
++		return;
++	}
++	aw_state("initial");
++	if (aw_step >= 2) {
++		if (aw_power_on() == 0) {
++			aw_chipid();
++		}
++		aw_state("final");
++	} else {
++		aw_chipid();    /* read only: only if Android/LK left it powered */
++	}
++	printf("AGATE WIFI: step %d done\n", aw_step);
++}
++
++void
++agate_wifi_start(void)
++{
++	thread_t th;
++
++	if (!PE_parse_boot_argn("agatewifi", &aw_step, sizeof(aw_step)) || aw_step <= 0) {
++		return;
++	}
++	if (kernel_thread_start(agate_wifi_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		printf("AGATE WIFI: step %d armed\n", aw_step);
++	}
++}
++#endif
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index f3024fd..918160e 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -907,6 +907,9 @@ bsd_init(void)
+ 	/* agate: CDC-ECM ue0 on the ruby USB data plane (ruby_enum=3) */
+ 	extern void agate_ecm_start(void);
+ 	agate_ecm_start();
++	/* agate: Wi-Fi bring-up probe (agatewifi=N) */
++	extern void agate_wifi_start(void);
++	agate_wifi_start();
+ #endif
+ 
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
