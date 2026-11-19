@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
 new file mode 100644
-index 0000000..0d0ab1c
+index 0000000..1778a77
 --- /dev/null
 +++ b/iokit/Kernel/arm/VivaGPU.cpp
-@@ -0,0 +1,3360 @@
+@@ -0,0 +1,3400 @@
 +/*
 + * MIT License
 + *
@@ -60,6 +60,7 @@ index 0000000..0d0ab1c
 +
 +#include "VivaGPU.h"
 +#include "SweetSurface.h"
++#include "../../../bsd/dev/ruby_gic.h"
 +
 +extern "C" bool agate_gpu_runtime_ready(void);
 +extern "C" bool agate_gpu_runtime_after_reset(vm_offset_t mali);
@@ -875,6 +876,41 @@ index 0000000..0d0ab1c
 +	return fWorkLoop;
 +}
 +
++/* RubyGIC exposes the standard IOKit interrupt API using its own controller
++ * name and trigger flags. The ADT supplies the three MT6893 GIC INTIDs. */
++static bool
++publishMaliInterrupts(IOService *provider)
++{
++	const uint32_t expected[] = {394, 395, 396};    /* GPU, MMU, JOB */
++	auto *data = OSDynamicCast(OSData, provider->getProperty("agate-gpu-intids"));
++	if (data == NULL || data->getLength() != sizeof(expected) ||
++	    memcmp(data->getBytesNoCopy(), expected, sizeof(expected)) != 0) {
++		return false;
++	}
++
++	OSArray *controllers = OSArray::withCapacity(3);
++	OSArray *specifiers = OSArray::withCapacity(3);
++	const OSSymbol *name = OSSymbol::withCStringNoCopy("RubyGIC");
++	bool ok = controllers && specifiers && name;
++	for (uint32_t intid : expected) {
++		if (!ok) {
++			break;
++		}
++		const struct ruby_gic_spec spec = {intid, RUBY_GIC_LEVEL};
++		OSData *vector = OSData::withBytes(&spec, sizeof(spec));
++		ok = vector && controllers->setObject(name) && specifiers->setObject(vector);
++		OSSafeReleaseNULL(vector);
++	}
++	if (ok) {
++		ok = provider->setProperty("IOInterruptControllers", controllers) &&
++		    provider->setProperty("IOInterruptSpecifiers", specifiers);
++	}
++	OSSafeReleaseNULL(name);
++	OSSafeReleaseNULL(controllers);
++	OSSafeReleaseNULL(specifiers);
++	return ok;
++}
++
 +bool
 +VivaGPUAccelerator::start(IOService *provider)
 +{
@@ -919,6 +955,10 @@ index 0000000..0d0ab1c
 +		return false;
 +	}
 +	fMali = (vm_offset_t)fMap->getVirtualAddress();
++	if (!publishMaliInterrupts(provider)) {
++		IOLog("AGATE GPU: could not publish RubyGIC interrupt sources\n");
++		return false;
++	}
 +	fGate = IOCommandGate::commandGate(this);
 +	fTimer = IOTimerEventSource::timerEventSource(this, &VivaGPUAccelerator::jobTimer);
 +	fStartTimer = IOTimerEventSource::timerEventSource(this, &VivaGPUAccelerator::startTimer);
