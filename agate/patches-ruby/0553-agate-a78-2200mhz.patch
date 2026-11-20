@@ -1,0 +1,111 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" int cpu_number(void);
++extern "C" bool agate_vsram_proc1(int sel, uint16_t *rg, uint16_t *da);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -455,7 +456,7 @@
+ 		 * then posdiv 4 -> 2 on the four A78 PLLs = 1459 MHz (Android's order: voltage first when going up).
+ 		 * Vsram_proc1 stays within agate's 100..250 mV of Vproc. Only from exactly that state; agatecpuboost=0 off.
+ 		 */
+-		uint32_t boost = 1;
++		uint32_t boost = 2;
+ 		PE_parse_boot_argn("agatecpuboost", &boost, sizeof(boost));
+ 		volatile uint32_t *apmixed = (volatile uint32_t *)ml_io_map(0x1000c000, 0x1000);
+ 		volatile uint32_t *mcucfg = (volatile uint32_t *)ml_io_map(0x0c53a000, 0x1000);
+@@ -485,6 +486,54 @@
+ 			    agateCpuKhz(apmixed[0x24c / 4], mcucfg[0x2ac / 4]) / 1000,
+ 			    agateCpuKhz(apmixed[0x21c / 4], mcucfg[0x2b0 / 4]) / 1000);
+ 		}
++		/*
++		 * 0553: step 2, A78 to agate OPP 3 (L 2200 MHz, Vproc1 906.25 mV, Vsram >= 1006.25 mV). Up in steps that keep
++		 * Vsram - Vproc within agate's 100..250 mV: Vsram 1000, Vproc1 906.25, Vsram 1006.25; then the DDS for
++		 * 2200 MHz with the CHG bit while posdiv is still 2 (1100 MHz), then posdiv 1. agatecpuboost=1 stops at 1459.
++		 */
++		uint8_t v1 = 0;
++		bool at1459 = boost >= 2 && apmixed != NULL && pmif != NULL && agateMt6315Read(pmif, 6, 0x1449, &v1) && v1 == 0x78;
++		for (uint32_t i = 0; at1459 && i < 4; i++) {
++			at1459 = ((apmixed[a78[i] / 4] >> 24) & 7u) == 1 && (apmixed[a78[i] / 4] & 0x3fffffu) == 0x1c13b1u;
++		}
++		uint16_t rg = 0, da = 0;
++		bool sram = false;
++		for (int t = 0; at1459 && t < 100 && !(sram = agate_vsram_proc1(-1, &rg, &da)); t++) {
++			IODelay(1000);
++		}
++		if (!at1459 || !sram || da < 0x38 || da > 0x60) {
++			IOLog("AGATE CPUBOOST2: not applied (from 1459 MHz %u, vsram read %u, vsram sel %#x/%#x)\n", at1459, sram, rg, da);
++		} else {
++			bool ok = agate_vsram_proc1(0x50, &rg, &da) && da == 0x50;          /* 1000 mV */
++			IODelay(100);
++			ok = ok && agateMt6315Write(pmif, 6, 0x1449, 0x91);                  /* 906.25 mV */
++			IODelay(200);
++			ok = ok && agate_vsram_proc1(0x51, &rg, &da) && da == 0x51;          /* 1006.25 mV */
++			IODelay(100);
++			if (!ok) {
++				IOLog("AGATE CPUBOOST2: voltage step not confirmed (vsram %#x/%#x); PLLs left at 1459 MHz\n", rg, da);
++			} else {
++				const uint32_t dds = ((2200u << 14) / 26u) & 0x3fffffu;
++				for (uint32_t i = 0; i < 4; i++) {
++					apmixed[a78[i] / 4] = ((apmixed[a78[i] / 4] & ~0x803fffffu) | dds) | (1u << 31);
++				}
++				__asm__ __volatile__("dsb sy" ::: "memory");
++				IODelay(40);
++				for (uint32_t i = 0; i < 4; i++) {
++					apmixed[a78[i] / 4] = apmixed[a78[i] / 4] & ~(7u << 24);
++				}
++				__asm__ __volatile__("dsb sy" ::: "memory");
++				IODelay(10);
++				uint8_t now2 = 0;
++				(void)agateMt6315Read(pmif, 6, 0x1449, &now2);
++				IOLog("AGATE CPUBOOST2: Vproc1 %u.%02u mV, Vsram1 %u.%02u mV, A78 PLLs %u/%u/%u/%u MHz\n",
++				    now2 * 625 / 100, now2 * 625 % 100, (50000 + da * 625) / 100, (50000 + da * 625) % 100,
++				    agateCpuKhz(apmixed[0x22c / 4], mcucfg[0x2a4 / 4]) / 1000,
++				    agateCpuKhz(apmixed[0x23c / 4], mcucfg[0x2a8 / 4]) / 1000,
++				    agateCpuKhz(apmixed[0x24c / 4], mcucfg[0x2ac / 4]) / 1000,
++				    agateCpuKhz(apmixed[0x21c / 4], mcucfg[0x2b0 / 4]) / 1000);
++			}
++		}
+ 	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+--- a/bsd/dev/agate_conninfra/agate_conninfra.c
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -232,6 +232,32 @@
+ 	}
+ 	pw_release();
+ 	return marked;
++}
++
++/*
++ * 0553: MT6359P VSRAM_PROC1, the A78 cores' SRAM rail (agate mt6359p-regulator: RG VOSEL at
++ * LDO_VSRAM_PROC1_ELR 0x1b44 [6:0], DA VOSEL at VOSEL1 0x1e90 [14:8], 500 mV + 6.25 mV/step).
++ * sel < 0 only reads. Shares SWINF_2 with Wi-Fi's PMIC setup through pw_acquire().
++ */
++bool
++agate_vsram_proc1(int sel, uint16_t *rg, uint16_t *da)
++{
++	uint16_t v = 0, d = 0;
++	if (!pw_acquire()) {
++		return false;
++	}
++	bool ok = pw_read(0x1b44, &v) == 0;
++	if (ok && sel >= 0 && sel <= 0x6f) {
++		ok = pw_write(0x1b44, (uint16_t)((v & ~0x7fu) | (uint16_t)sel)) == 0 && pw_read(0x1b44, &v) == 0;
++	}
++	if (ok) {
++		delay(50);
++		ok = pw_read(0x1e90, &d) == 0;
++	}
++	pw_release();
++	*rg = v & 0x7fu;
++	*da = (d >> 8) & 0x7fu;
++	return ok;
+ }
+ 
+ #define VCN13_CON0  0x1c1c
