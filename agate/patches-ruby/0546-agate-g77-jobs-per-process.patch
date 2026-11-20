@@ -1,0 +1,29 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -2413,6 +2413,14 @@
+ 	fRunning[slot] = NULL;
+ 	fStopDeadline[slot] = 0;
+ 	job->vm->running--;
++	if (slot < 2) {
++		/* 0546: is the compositor rendering on the GPU? 1, 10, 100, ... chains per process and slot */
++		const uint32_t n = ++job->vm->doneJobs[slot];
++		if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000 || n % 100000 == 0) {
++			IOLog("AGATE GPU: %s[%d] %u %s chains done\n", job->vm->proc, job->vm->pid, n,
++			    slot == 0 ? "fragment (frames)" : "vertex/compute");
++		}
++	}
+ 	if (error == kIOReturnSuccess && at > job->startAt) {
+ 		fExecN++;
+ 		fExecSum += at - job->startAt;
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -98,6 +98,7 @@
+ 	uint32_t  running;              /* jobs on the hardware with this VM */
+ 	uint64_t  lastUse;              /* LRU stamp for address-space eviction */
+ 	uint32_t  faults;
++	uint32_t  doneJobs[2];          /* 0546: completed fragment (0) and vertex/compute (1) chains */
+ 	bool      asFaulted;            /* its AS was disabled by a fault: reprogram before the next job */
+ 	/* accounting ("gpu status", limits per process) */
+ 	int        pid;
