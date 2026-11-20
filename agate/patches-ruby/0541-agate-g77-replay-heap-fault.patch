@@ -1,0 +1,66 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 1a14eb1..6694c03 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -179,6 +179,7 @@ extern "C" void agate_gpu_runtime_off(void);
+ #define AS_TRANSCFG_HI          0x34
+ #define AS_CMD_UPDATE           1
+ #define AS_CMD_LOCK             2
++#define AS_CMD_UNLOCK           3
+ #define AS_CMD_FLUSH_PT         4
+ #define AS_CMD_FLUSH_MEM        5
+ #define AS_STATUS_ACTIVE        (1u << 0)
+@@ -821,7 +822,14 @@ VivaGPUBO::growHeap(uint64_t addr)
+ 		return false;
+ 	}
+ 	if (chunks[idx] != NULL) {
+-		return true;            /* another unit faulted on it before the flush: already mapped */
++		/* The IRQ is clear, but an already-mapped fault still stalls the
++		 * address space until UNLOCK retries the faulting transaction. */
++		const int as = vm->asSlot;
++		if (as < 0 || !vm->gpu->asWait(as)) {
++			return false;
++		}
++		vm->gpu->wr(AS_BASE(as) + AS_COMMAND, AS_CMD_UNLOCK);
++		return vm->gpu->asWait(as);
+ 	}
+ 	if (!vm->gpu->chargeMemory(vm, HEAP_CHUNK)) {
+ 		return false;
+@@ -2366,7 +2374,9 @@ VivaGPUAccelerator::mmuInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 	self->fastSync();       /* nothing armed while address spaces change (re-armed at the next kick) */
+ 	uint32_t stat = self->rd(MMU_INT_STAT);
+ 	for (uint32_t as = 0; as < self->fASCount; as++) {
+-		uint32_t bits = stat & ((1u << as) | (1u << (16 + as)));
++		const uint32_t pageFault = 1u << as;
++		const uint32_t busFault = 1u << (16 + as);
++		const uint32_t bits = stat & (pageFault | busFault);
+ 		if (bits == 0) {
+ 			continue;
+ 		}
+@@ -2376,7 +2386,7 @@ VivaGPUAccelerator::mmuInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 		self->wr(MMU_INT_CLEAR, bits);  /* before the flush resumes the GPU: a new fault must not be lost */
+ 		VivaGPUVM *vm = self->fAS[as];
+ 		bool handled = false;
+-		if (vm != NULL && (bits & (1u << as)) && (fs & 0xf8) == 0xc0) {
++		if (vm != NULL && bits == pageFault && (fs & 0xf8) == 0xc0) {
+ 			VivaGPUBO *heap = self->findHeapBO(vm, addr);
+ 			if (heap != NULL && heap->growHeap(addr)) {
+ 				self->fHeapGrows++;
+@@ -2398,7 +2408,7 @@ VivaGPUAccelerator::mmuInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 					vm->describe(addr, what, sizeof(what));
+ 				}
+ 				IOLog("VIVA GPU: MMU %s on AS%u at 0x%llx: status 0x%08x (%s, %s access, source 0x%04x), %s%s%s\n",
+-				    (bits & (1u << as)) ? "fault" : "bus error", as, addr, fs, jsStatusName(fs & 0xff),
++			    (bits & busFault) ? "bus error" : "fault", as, addr, fs, jsStatusName(fs & 0xff),
+ 				    ((fs >> 8) & 3) == 1 ? "execute" : ((fs >> 8) & 3) == 2 ? "read" :
+ 				    ((fs >> 8) & 3) == 3 ? "write" : "atomic", fs >> 16, what, vm != NULL ? ", " : "",
+ 				    vm != NULL ? vm->proc : "");
+@@ -2409,7 +2419,7 @@ VivaGPUAccelerator::mmuInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 			 * next job reprograms it.
+ 			 */
+ 			self->asDisable((int)as);
+-			self->wr(MMU_INT_MASK, self->rd(MMU_INT_MASK) & ~((1u << as) | (1u << (16 + as))));
++			self->wr(MMU_INT_MASK, self->rd(MMU_INT_MASK) & ~(pageFault | busFault));
+ 			if (vm != NULL) {
+ 				vm->asFaulted = true;
+ 			}

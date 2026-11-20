@@ -1,0 +1,158 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 16549d2..09e8f1b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -141,7 +141,7 @@ public:
+ 	volatile uint32_t *fMutex;
+ 	volatile uint32_t *fMbox;     /* shim kicker mailbox */
+ 	uint32_t      fKickSeq;
+-	void presentLocked(const uint8_t *rec);
++	void presentLocked(const uint8_t *rec, SweetSurface *const *surfaces);
+ 	bool fPanelBusyReported;
+ 	bool panelReady(void);        /* fPresentLock held */
+ 	void fadePanel(void);
+@@ -434,19 +434,44 @@ AppleCLCD::present(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	const bool displayOn = !fPowerOff;
+ 	IOLockUnlock(fLock);
+-	if (displayOn && panelReady()) {
+-		presentLocked(rec);
+-		panelKick();
++	if (displayOn) {
++		IOReturn status = kIOReturnBusy;
++		if (panelReady()) {
++			const uint32_t mask = get32(rec, 0x104);
++			SweetSurface *surfaces[SWEET_FB_LAYERS] = {};
++			for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++				const uint32_t id = get32(rec, 0x54 + 4 * layer);
++				if ((mask & (1u << layer)) && id != 0) {
++					surfaces[layer] = sweet_surface_copy(id);
++					if (surfaces[layer] == fSurface) {
++						OSSafeReleaseNULL(surfaces[layer]);
++					}
++				}
++			}
++			SweetSurface **frame = surfaces;
++			status = viva_gpu_copy_display_frame(frame, SWEET_FB_LAYERS, ^{
++				presentLocked(rec, frame);
++			});
++			for (SweetSurface *s : surfaces) {
++				OSSafeReleaseNULL(s);
++			}
++			if (status == kIOReturnSuccess) {
++				panelKick();
++			}
++		}
++		if (status == kIOReturnBusy) {
++			/* Retry the most recent swap at the next eligible tick. */
++			IOLockLock(fLock);
++			fDirty = true;
++			IOLockUnlock(fLock);
++		}
+ 	}
+ 	IOLockUnlock(fPresentLock);
+ }
+ 
+ void
+-AppleCLCD::presentLocked(const uint8_t *rec)
++AppleCLCD::presentLocked(const uint8_t *rec, SweetSurface *const *surfaces)
+ {
+-	uint32_t mask = get32(rec, 0x104);
+-
+-
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+@@ -465,21 +490,17 @@ AppleCLCD::presentLocked(const uint8_t *rec)
+ 		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
+ 		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
+ 
+-		if (!(mask & (1u << layer)) || id == 0) {
++		SweetSurface *s = surfaces[layer];
++		if (s == NULL) {
+ 			continue;
+ 		}
+-		SweetSurface *s = sweet_surface_copy(id);
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+-			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+-			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
++			    get32(rec, 0x50), layer, id, s->width, s->height,
++			    s->pixelFormat, s->bytesPerRow, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+-		if (s == NULL || s == fSurface) {
+-			OSSafeReleaseNULL(s);
+-			continue;
+-		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+@@ -524,6 +545,7 @@ AppleCLCD::presentLocked(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			sweet_surface_before_cpu_access(s);
+ 			uint64_t dst_pa = (uint64_t)fPhys + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
+ 			const uint32_t *src0p = (const uint32_t *)(src + s->offset +
+ 			    (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4);
+@@ -548,7 +570,6 @@ AppleCLCD::presentLocked(const uint8_t *rec)
+ 				    *(const uint32_t *)(fPixels + (uint64_t)(fHeight / 2) * fRowBytes + (uint64_t)(fWidth / 2) * 4));
+ 			}
+ 		}
+-		s->release();
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index acb775d..cb84b25 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -83,6 +83,7 @@ uint64_t sweet_surface_before_cpu_access(SweetSurface *surface);
+ void sweet_surface_device_wrote(SweetSurface *surface);
+ bool viva_gpu_surface_idle(SweetSurface *surface, uint64_t *jobs);
+ IOReturn viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs);
++IOReturn viva_gpu_copy_display_frame(SweetSurface *const *surfaces, uint32_t count, void (^copy)(void));
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 3efe420..1a14eb1 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -3424,6 +3424,34 @@ VivaGPUAccelerator::checkSelftest(void)
+ }
+ 
+ /* K0c: the display (AppleCLCD) and IOSurfaceLock wait for the GPU's writes to a surface. */
++IOReturn
++viva_gpu_copy_display_frame(SweetSurface *const *surfaces, uint32_t count, void (^copy)(void))
++{
++	VivaGPUAccelerator *gpu = gVivaGPU;
++	if (gpu == NULL || gpu->gate() == NULL) {
++		copy();
++		return kIOReturnSuccess;
++	}
++	return gpu->gate()->runActionBlock(^IOReturn {
++		for (uint32_t i = 0; i < count; i++) {
++			SweetSurface *s = surfaces[i];
++			if (s == NULL) {
++				continue;
++			}
++			VivaGPUFence *f = OSDynamicCast(VivaGPUFence, s->gpuFence);
++			if (f != NULL && !f->signalled) {
++				return kIOReturnBusy;
++			}
++			if (f != NULL && f->error != kIOReturnSuccess) {
++				return kIOReturnIOError;
++			}
++		}
++		/* Keep GPU submission gated while the CPU snapshots the frame. */
++		copy();
++		return kIOReturnSuccess;
++	});
++}
++
+ bool
+ viva_gpu_surface_idle(SweetSurface *surface, uint64_t *jobs)
+ {
