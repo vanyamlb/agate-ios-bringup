@@ -1,0 +1,79 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -144,6 +144,8 @@
+ 	uint32_t      fKickSeq;
+ 	void presentLocked(const uint8_t *rec, SweetSurface *const *surfaces);
+ 	bool fPanelBusyReported;
++	bool fTeSync;                 /* 0548: TE_RDY cleared before every DSI_START (EXT_TE_EN waits for the panel) */
++	uint32_t fTeTimeouts;
+ 	bool panelReady(void);        /* fPresentLock held */
+ 	void fadePanel(void);
+ 	void panelKick(void);
+@@ -270,6 +272,34 @@
+ 		absolutetime_to_nanoseconds(lastChange ? lastChange - t0 : 0, &ns1);
+ 		IOLog("AGATE DSI INTSTA 40 ms idle: bits seen %#x, %u changes (first %llu us, last %llu us)\n", seen, changes,
+ 		    ns0 / 1000, ns1 / 1000);
++		/*
++		 * 0548: TE_RDY (INTSTA bit 2) stays latched, so with EXT_TE_EN (TXRX_CTRL bit 9, set by LK) DSI_START
++		 * never waits for the panel: frames land anywhere in its scan-out (a tear line that moves). Clear the
++		 * flag like mtk_dsi does (write 0 to it) and time its next rises: the panel's TE rate.
++		 */
++		{
++			uint64_t rises[8] = {}, start = mach_absolute_time();
++			uint32_t n = 0;
++			fDsi[0x0c / 4] = fDsi[0x0c / 4] & ~0x16u;
++			for (int i = 0; i < 1000 && n < 8; i++) {          /* up to 50 ms */
++				if (fDsi[0x0c / 4] & 0x4u) {
++					rises[n++] = mach_absolute_time();
++					fDsi[0x0c / 4] = fDsi[0x0c / 4] & ~0x4u;
++				}
++				IODelay(50);
++			}
++			uint64_t periodNs = 0, firstNs = 0;
++			if (n >= 2) {
++				absolutetime_to_nanoseconds((rises[n - 1] - rises[0]) / (n - 1), &periodNs);
++			}
++			if (n >= 1) {
++				absolutetime_to_nanoseconds(rises[0] - start, &firstNs);
++			}
++			fTeSync = n >= 2 && periodNs > 4000000 && periodNs < 25000000 && (fDsi[0x18 / 4] & (1u << 9));
++			IOLog("AGATE DSI TE: %u rises in 50 ms, first after %llu us, period %llu us (%llu Hz), EXT_TE_EN %u -> TE sync %s\n",
++			    n, firstNs / 1000, periodNs / 1000, periodNs ? 1000000000ull / periodNs : 0,
++			    (fDsi[0x18 / 4] >> 9) & 1, fTeSync ? "ON" : "off (old behaviour)");
++		}
+ 	}
+ 	{
+ 		/* 0547: this core's clock, ~1 dependent add per cycle on A55/A78 */
+@@ -418,6 +448,7 @@
+ 	/* DSI_INTSTA bit 31 indicates an in-flight transfer. */
+ 	for (int i = 0; i < 400; i++) {
+ 		if ((fDsi[0x0c / 4] & 0x80000000u) == 0) {
++			fTeTimeouts = 0;
+ 			return true;
+ 		}
+ 		IODelay(100);
+@@ -425,6 +456,11 @@
+ 	if (!fPanelBusyReported) {
+ 		fPanelBusyReported = true;
+ 		IOLog("SWEET FB: skipping panel write while DSI is busy\n");
++	}
++	if (fTeSync && ++fTeTimeouts >= 3) {
++		/* 0548: the panel's TE stopped arriving: start frames without waiting, as before */
++		fTeSync = false;
++		IOLog("AGATE DSI TE: DSI stayed busy 40 ms three times; TE sync off\n");
+ 	}
+ 	return false;
+ }
+@@ -464,6 +500,11 @@
+ 		fMbox[1] = ++fKickSeq;
+ 	}
+ 	__asm__ __volatile__("dsb sy" ::: "memory");
++	if (fTeSync) {
++		/* 0548: forget the latched TE so DSI_START waits for the panel's next one (scan-out start) */
++		fDsi[0x0c / 4] = fDsi[0x0c / 4] & ~0x16u;
++		__asm__ __volatile__("dsb sy" ::: "memory");
++	}
+ 	fMutex[0x20 / 4] = 1;           /* mutex0 EN */
+ 	fDsi[0] = 0;                    /* DSI_START 0 -> 1 */
+ 	fDsi[0] = 1;
