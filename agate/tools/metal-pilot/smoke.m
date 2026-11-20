@@ -27,7 +27,9 @@ extern char **environ;
 enum { side = 16, width = side * 4, bufferWords = 32 };
 enum { pass = 0, mismatch = 1, unavailable = 2, timeout = 3, workerError = 4, resultCount };
 typedef enum {
-    sentinel, bufferFill, imageFill, blit, clear, sample, blend, isa, noBounds, draw
+    sentinel, bufferFill, imageFill, blit, clear, sample, blend, isa, noBounds,
+    cpuCopy, singleRender, singleBlit, kernelWait, readCPUBuffer, readCPUImage,
+    sampleCPUImage, computeChain, privateRenderRead, draw
 } Operation;
 typedef struct {
     Operation operation;
@@ -44,7 +46,9 @@ static const MTLPixelFormat formats[] = {MTLPixelFormatRGBA8Unorm, MTLPixelForma
 static const char *const formatNames[] = {"rgba8", "bgra8", "srgb"};
 static const char *const operationNames[] = {
     "sentinel", "buffer-fill", "texture-write", "blit", "clear-only", "texture-sample", "additive-blend",
-    "direct-isa", "no-draw-bounds", "render"
+    "direct-isa", "no-draw-bounds", "cpu-texture-copy", "single-submit-draw", "single-submit-blit",
+    "kernel-wait-draw", "read-cpu-buffer", "read-cpu-texture", "sample-cpu-texture",
+    "gpu-write-read-texture", "private-render-compute-read", "render"
 };
 enum { vertexCount = sizeof(vertexFunctions) / sizeof(*vertexFunctions),
        formatCount = sizeof(formats) / sizeof(*formats),
@@ -59,7 +63,8 @@ static int logFD;
 static Test testAt(unsigned index)
 {
     if (index < draw) {
-        return (Test){.operation = index, .vertex = 1, .query = index == isa || index == noBounds};
+        return (Test){.operation = index, .vertex = 1,
+            .query = index == isa || index == noBounds || index == singleRender || index == kernelWait};
     }
     unsigned value = index - draw;
     return (Test){
@@ -103,10 +108,17 @@ static id<MTLTexture> newTexture(id<MTLDevice> device, MTLPixelFormat format,
     return [device newTextureWithDescriptor:descriptor];
 }
 
-static int inspectPixels(id<MTLTexture> target, Test test, uint64_t visible)
+static void makePattern(uint8_t pixels[side][side][4])
 {
-    uint8_t pixels[side][side][4] = {};
-    [target getBytes:pixels bytesPerRow:width fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0];
+    for (unsigned y = 0; y < side; ++y) {
+        for (unsigned x = 0; x < side; ++x) {
+            memcpy(pixels[y][x], ((x ^ y) & 1) ? red : blue, 4);
+        }
+    }
+}
+
+static int reportPixels(uint8_t pixels[side][side][4], Test test, uint64_t visible)
+{
     unsigned reds = 0, blues = 0, purples = 0, pattern = 0;
     for (unsigned y = 0; y < side; ++y) {
         for (unsigned x = 0; x < side; ++x) {
@@ -126,7 +138,12 @@ static int inspectPixels(id<MTLTexture> target, Test test, uint64_t visible)
     switch (test.operation) {
         case clear: valid = blues == side * side; break;
         case imageFill:
-        case blit: valid = pattern == side * side; break;
+        case blit:
+        case cpuCopy:
+        case singleBlit:
+        case readCPUImage:
+        case sampleCPUImage:
+        case computeChain: valid = pattern == side * side; break;
         default: {
             BOOL blended = test.operation == blend;
             const uint8_t *expected = blended ? magenta : red;
@@ -142,6 +159,13 @@ static int inspectPixels(id<MTLTexture> target, Test test, uint64_t visible)
     return valid && (!test.query || (visible != UINT64_MAX && visible > 0)) ? pass : mismatch;
 }
 
+static int inspectPixels(id<MTLTexture> target, Test test, uint64_t visible)
+{
+    uint8_t pixels[side][side][4] = {};
+    [target getBytes:pixels bytesPerRow:width fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0];
+    return reportPixels(pixels, test, visible);
+}
+
 static int copyPattern(id<MTLDevice> device, id<MTLCommandBuffer> commands, Test test)
 {
     id<MTLTexture> input = newTexture(device, formats[0], side, MTLStorageModeShared, MTLTextureUsageShaderRead);
@@ -151,11 +175,7 @@ static int copyPattern(id<MTLDevice> device, id<MTLCommandBuffer> commands, Test
         return reportUnavailable(@"blit allocation", nil);
     }
     uint8_t pixels[side][side][4];
-    for (unsigned y = 0; y < side; ++y) {
-        for (unsigned x = 0; x < side; ++x) {
-            memcpy(pixels[y][x], ((x ^ y) & 1) ? red : blue, 4);
-        }
-    }
+    makePattern(pixels);
     [input replaceRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0 withBytes:pixels bytesPerRow:width];
     MTLOrigin corner = MTLOriginMake(0, 0, 0);
     [encoder copyFromTexture:input sourceSlice:0 sourceLevel:0 sourceOrigin:corner sourceSize:MTLSizeMake(side, side, 1)
@@ -165,26 +185,86 @@ static int copyPattern(id<MTLDevice> device, id<MTLCommandBuffer> commands, Test
     return result == pass ? inspectPixels(target, test, 0) : result;
 }
 
-static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBuffer> commands, Test test)
+static id<MTLComputeCommandEncoder> computeEncoder(id<MTLDevice> device, id<MTLLibrary> library,
+    id<MTLCommandBuffer> commands, NSString *name)
 {
-    BOOL image = test.operation == imageFill;
-    BOOL single = test.operation == sentinel;
-    NSString *function = image ? @"write_texture" : single ? @"write_sentinel" : @"fill_buffer";
-    id<MTLFunction> shader = [library newFunctionWithName:function];
+    id<MTLFunction> shader = [library newFunctionWithName:name];
     NSError *error = nil;
     id<MTLComputePipelineState> pipeline = shader ? [device newComputePipelineStateWithFunction:shader error:&error] : nil;
     id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
     if (!pipeline || !encoder) {
-        return reportUnavailable(@"compute pipeline", error);
+        reportUnavailable(name, error);
+        return nil;
     }
     [encoder setComputePipelineState:pipeline];
+    return encoder;
+}
+
+static void imageThreads(id<MTLComputeCommandEncoder> encoder)
+{
+    [encoder dispatchThreadgroups:MTLSizeMake(2, 2, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+}
+
+static int inspectImageThroughCompute(id<MTLDevice> device, id<MTLLibrary> library,
+    id<MTLCommandBuffer> commands, id<MTLTexture> image, Test test)
+{
+    NSString *function = test.operation == sampleCPUImage ? @"sample_texture" : @"read_texture";
+    id<MTLComputeCommandEncoder> encoder = computeEncoder(device, library, commands, function);
+    id<MTLBuffer> output = [device newBufferWithLength:side * width options:MTLResourceStorageModeShared];
+    uint8_t (*pixels)[side][4] = output.contents;
+    if (!encoder || !pixels) {
+        return reportUnavailable(@"compute readback", nil);
+    }
+    memset(pixels, 0xa5, side * width);
+    [encoder setTexture:image atIndex:0];
+    [encoder setBuffer:output offset:0 atIndex:0];
+    imageThreads(encoder);
+    [encoder endEncoding];
+    int result = complete(commands);
+    return result == pass ? reportPixels(pixels, test, UINT64_MAX) : result;
+}
+
+static int verifyTextureInput(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBuffer> commands, Test test)
+{
+    BOOL generated = test.operation == computeChain;
+    MTLTextureUsage usage = MTLTextureUsageShaderRead | (generated ? MTLTextureUsageShaderWrite : 0);
+    id<MTLTexture> image = newTexture(device, formats[0], side, MTLStorageModeShared, usage);
+    if (!image) {
+        return reportUnavailable(@"source texture", nil);
+    }
+    if (generated) {
+        id<MTLComputeCommandEncoder> encoder = computeEncoder(device, library, commands, @"write_texture");
+        if (!encoder) {
+            return unavailable;
+        }
+        [encoder setTexture:image atIndex:0];
+        imageThreads(encoder);
+        [encoder endEncoding];
+    } else {
+        uint8_t pixels[side][side][4];
+        makePattern(pixels);
+        [image replaceRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0 withBytes:pixels bytesPerRow:width];
+    }
+    return inspectImageThroughCompute(device, library, commands, image, test);
+}
+
+static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBuffer> commands, Test test)
+{
+    BOOL image = test.operation == imageFill;
+    BOOL single = test.operation == sentinel;
+    BOOL cpuInput = test.operation == readCPUBuffer;
+    NSString *function = image ? @"write_texture" : single ? @"write_sentinel" : cpuInput ? @"verify_buffer" : @"fill_buffer";
+    id<MTLComputeCommandEncoder> encoder = computeEncoder(device, library, commands, function);
+    if (!encoder) {
+        return unavailable;
+    }
     if (image) {
         id<MTLTexture> target = newTexture(device, formats[0], side, MTLStorageModeShared, MTLTextureUsageShaderWrite);
         if (!target) {
             return reportUnavailable(@"compute texture", nil);
         }
         [encoder setTexture:target atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(2, 2, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        imageThreads(encoder);
         [encoder endEncoding];
         int result = complete(commands);
         return result == pass ? inspectPixels(target, test, 0) : result;
@@ -196,7 +276,18 @@ static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLComman
         return reportUnavailable(@"compute buffer", nil);
     }
     memset(words, 0xa5, count * sizeof(*words));
-    [encoder setBuffer:output offset:0 atIndex:0];
+    if (cpuInput) {
+        uint32_t pattern[bufferWords];
+        for (unsigned index = 0; index < bufferWords; ++index) {
+            pattern[index] = 0x12345678u ^ (index * 257u);
+        }
+        id<MTLBuffer> input = [device newBufferWithBytes:pattern length:sizeof(pattern) options:MTLResourceStorageModeShared];
+        if (!input) {
+            return reportUnavailable(@"CPU input buffer", nil);
+        }
+        [encoder setBuffer:input offset:0 atIndex:0];
+    }
+    [encoder setBuffer:output offset:0 atIndex:cpuInput ? 1 : 0];
     [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(count, 1, 1)];
     [encoder endEncoding];
     int result = complete(commands);
@@ -206,6 +297,9 @@ static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLComman
     unsigned matches = 0;
     for (unsigned index = 0; index < count; ++index) {
         uint32_t expected = single ? 0xc0ffee42u : 0x12345678u ^ (index * 257u);
+        if (cpuInput) {
+            expected ^= 0xfeedbeefu;
+        }
         matches += words[index] == expected;
     }
     dprintf(logFD, "AGATE MATRIX buffer case=%03u matches=%u/%u first=%#x\n",
@@ -216,7 +310,10 @@ static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLComman
 static int runDraw(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBuffer> commands, Test test)
 {
     MTLPixelFormat format = formats[test.format];
-    id<MTLTexture> target = newTexture(device, format, side, MTLStorageModeShared, MTLTextureUsageRenderTarget);
+    BOOL computeRead = test.operation == privateRenderRead;
+    MTLStorageMode storage = computeRead ? MTLStorageModePrivate : MTLStorageModeShared;
+    MTLTextureUsage usage = MTLTextureUsageRenderTarget | (computeRead ? MTLTextureUsageShaderRead : 0);
+    id<MTLTexture> target = newTexture(device, format, side, storage, usage);
     MTLRenderPassDescriptor *renderPass = [MTLRenderPassDescriptor renderPassDescriptor];
     renderPass.colorAttachments[0].texture = target;
     renderPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
@@ -315,6 +412,9 @@ static int runDraw(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBu
     }
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
+    if (computeRead) {
+        return inspectImageThroughCompute(device, library, commands, target, test);
+    }
     int result = complete(commands);
     return result == pass ? inspectPixels(target, test, samples ? *samples : UINT64_MAX) : result;
 }
@@ -343,6 +443,15 @@ static int runCase(Test test)
     if (test.operation == noBounds) {
         setenv("VMG_NO_DRAW_BOUNDS", "1", 1);
     }
+    if (test.operation == cpuCopy) {
+        setenv("VMG_CPU_TEXTURE_COPY", "1", 1);
+    }
+    if (test.operation == singleRender || test.operation == singleBlit) {
+        setenv("VGPU_NO_SUBMIT_BATCH", "1", 1);
+    }
+    if (test.operation == kernelWait) {
+        setenv("VGPU_NO_LOCAL_WAIT", "1", 1);
+    }
     NSBundle *bundle = [NSBundle bundleWithPath:@"/Developer/VivaMTLDriver.bundle"];
     if (![bundle loadAndReturnError:&error]) {
         return reportUnavailable(@"G77 Metal plug-in", error);
@@ -360,13 +469,23 @@ static int runCase(Test test)
         return reportUnavailable(@"command buffer", nil);
     }
     commands.label = @(operationNames[test.operation]);
-    if (test.operation <= imageFill) {
-        return runCompute(device, library, commands, test);
+    switch (test.operation) {
+        case sentinel:
+        case bufferFill:
+        case imageFill:
+        case readCPUBuffer:
+            return runCompute(device, library, commands, test);
+        case blit:
+        case cpuCopy:
+        case singleBlit:
+            return copyPattern(device, commands, test);
+        case readCPUImage:
+        case sampleCPUImage:
+        case computeChain:
+            return verifyTextureInput(device, library, commands, test);
+        default:
+            return runDraw(device, library, commands, test);
     }
-    if (test.operation == blit) {
-        return copyPattern(device, commands, test);
-    }
-    return runDraw(device, library, commands, test);
 }
 
 static int runWorker(const char *binary, unsigned index)

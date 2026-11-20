@@ -72,3 +72,30 @@ kernel void write_texture(texture2d<float, access::write> target [[texture(0)]],
 {
     target.write(((index.x ^ index.y) & 1u) ? float4(1, 0, 0, 1) : float4(0, 0, 1, 1), index);
 }
+
+kernel void verify_buffer(const device uint *input [[buffer(0)]], device uint *result [[buffer(1)]],
+                          uint index [[thread_position_in_grid]])
+{
+    result[index] = input[index] ^ 0xfeedbeefu;
+}
+
+uint packColor(float4 color)
+{
+    uint4 rgba = uint4(round(saturate(color) * 255.0f));
+    return rgba.x | (rgba.y << 8) | (rgba.z << 16) | (rgba.w << 24);
+}
+
+kernel void read_texture(texture2d<float, access::read> source [[texture(0)]],
+                         device uint *result [[buffer(0)]], uint2 index [[thread_position_in_grid]])
+{
+    result[index.y * source.get_width() + index.x] = packColor(source.read(index));
+}
+
+kernel void sample_texture(texture2d<float> source [[texture(0)]],
+                           device uint *result [[buffer(0)]], uint2 index [[thread_position_in_grid]])
+{
+    constexpr sampler point(coord::normalized, filter::nearest, address::clamp_to_edge);
+    float2 dimensions = float2(source.get_width(), source.get_height());
+    float2 uv = (float2(index) + 0.5f) / dimensions;
+    result[index.y * source.get_width() + index.x] = packColor(source.sample(point, uv, level(0)));
+}
