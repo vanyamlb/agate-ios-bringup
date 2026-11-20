@@ -1,0 +1,74 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -155,6 +155,7 @@
+ 	uint32_t fStatFrames, fStatBusy, fStatLines;    /* 0556: per-second present statistics */
+ 	IOTimerEventSource *fKeys;    /* 0557: side / volume-down keys from MT6359P TOPSTATUS every 30 ms */
+ 	int fKeyPower, fKeyDown;
++	uint16_t fKeyIdle;            /* 0559: TOPSTATUS at rest; a key is down while its bit differs */
+ 	uint32_t fKeyLog;
+ 	static void keysFired(OSObject *owner, IOTimerEventSource *sender);
+ 	/* 0558: double-buffered panel memory: copy into the back buffer at swap, flip OVL0 L1 at the next TE */
+@@ -570,24 +571,29 @@
+ 		const uint64_t size = (uint64_t)fHeight * fRowBytes;
+ 		fOvl = (volatile uint32_t *)ml_io_map(0x14000000, 0x1000);
+ 		const uint32_t l1 = fOvl != NULL ? fOvl[0xf60 / 4] : 0;
+-		if (fOvl != NULL && l1 == (uint32_t)fPhys) {
+-			fBackMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000FFFFF000ULL);
+-		}
++		/*
++		 * 0559: xnu97 found no 10 MB contiguous block below 4 GiB. LK reserves 0x7b020000..0x7d800000 for the
++		 * display (FDT mblock-20-framebuffer, "mediatek,framebuffer"); the shim's panel buffer is at its end and
++		 * the early-console buffer at its start. The back buffer goes right below the panel buffer.
++		 */
+ 		uint64_t pa = 0;
+-		if (fBackMem != NULL) {
+-			pa = fBackMem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+-			if (pa != 0 && (pa >> 32) == 0 && (pa & 0xfff) == 0 && fBackMem->getBytesNoCopy() != NULL) {
+-				memcpy(fBackMem->getBytesNoCopy(), (const void *)fPixels, size);
+-				flush_dcache64((addr64_t)(uintptr_t)fBackMem->getBytesNoCopy(), (uint32_t)size, FALSE);
+-				__asm__ __volatile__("dsb sy" ::: "memory");
+-				fBufVA[0] = fPixels;
+-				fBufPA[0] = fPhys;
+-				fBufVA[1] = (uintptr_t)fBackMem->getBytesNoCopy();
+-				fBufPA[1] = pa;
+-				fFront = 0;
+-				fDouble = true;
+-			}
++		SweetSurface *back = NULL;
++		const uint64_t span = (size + 0xfffull) & ~0xfffull;
++		if (fOvl != NULL && l1 == (uint32_t)fPhys && fPhys >= 0x7b020000ull + 0xa00000ull + span &&
++		    fPhys + span <= 0x7d800000ull) {
++			pa = fPhys - span;
++			back = sweet_surface_create_physical(pa, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++		}
++		if (back != NULL && back->kernelAddress() != 0) {
++			memcpy((void *)back->kernelAddress(), (const void *)fPixels, size);
++			flush_dcache64((addr64_t)back->kernelAddress(), (uint32_t)size, FALSE);
++			__asm__ __volatile__("dsb sy" ::: "memory");
++			fBufVA[0] = fPixels;
++			fBufPA[0] = fPhys;
++			fBufVA[1] = back->kernelAddress();
++			fBufPA[1] = pa;
++			fFront = 0;
++			fDouble = true;
+ 		}
+ 		IOLog("AGATE FB double buffer: %s (OVL0 L1 ADDR %#x, panel %#llx, back %#llx, %llu bytes)\n",
+ 		    fDouble ? "ON" : "off", l1, fPhys, pa, size);
+@@ -614,9 +620,13 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint16_t st = 0;
+ 	if (agate_pmic_topstatus(&st)) {
+-		const int power = !(st & 0x2), down = !(st & 0x8);
+ 		if (fb->fKeyLog == 0) {
+-			/* first reading: take it as the idle state, send nothing (a wrong polarity cannot hold a key) */
++			fb->fKeyIdle = st;
++		}
++		/* 0559: xnu97 read 0x6 at rest: PWRKEY bit 1 set, HOMEKEY bit 3 clear; down = differs from rest */
++		const int power = ((st ^ fb->fKeyIdle) & 0x2) != 0, down = ((st ^ fb->fKeyIdle) & 0x8) != 0;
++		if (fb->fKeyLog == 0) {
++			/* first reading: the idle state, nothing sent */
+ 			fb->fKeyLog = 1;
+ 			fb->fKeyPower = power;
+ 			fb->fKeyDown = down;
