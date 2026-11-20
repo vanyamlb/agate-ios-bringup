@@ -1,0 +1,98 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,7 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" int cpu_number(void);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -237,7 +238,49 @@
+ 		fMbox = (volatile uint32_t *)ml_io_map(AGATE_MBOX_PA, 0x1000);
+ 		IOLog("SWEET FB: agate kernel-driven DSI frames (dsi %p mutex %p mbox %p)\n",
+ 		    (void *)fDsi, (void *)fMutex, (void *)fMbox);
++		/* 0547: read-only, what LK left: DSI0 (TE setup in TXRX_CTRL 0x18 / MODE_CTRL 0x14) and mutex0 */
++		for (uint32_t off = 0; off < 0x200; off += 0x20) {
++			IOLog("AGATE DSI +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", off,
++			    fDsi[off / 4], fDsi[off / 4 + 1], fDsi[off / 4 + 2], fDsi[off / 4 + 3],
++			    fDsi[off / 4 + 4], fDsi[off / 4 + 5], fDsi[off / 4 + 6], fDsi[off / 4 + 7]);
++		}
++		for (uint32_t off = 0; off < 0x100; off += 0x20) {
++			IOLog("AGATE MUTEX +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", off,
++			    fMutex[off / 4], fMutex[off / 4 + 1], fMutex[off / 4 + 2], fMutex[off / 4 + 3],
++			    fMutex[off / 4 + 4], fMutex[off / 4 + 5], fMutex[off / 4 + 6], fMutex[off / 4 + 7]);
++		}
++		/* INTSTA over 40 ms with no kick of ours: which bits come by themselves (TE at 60/120 Hz?) */
++		uint32_t seen = 0, changes = 0, last = fDsi[0x0c / 4];
++		uint64_t t0 = mach_absolute_time(), firstChange = 0, lastChange = 0;
++		for (int i = 0; i < 400; i++) {
++			const uint32_t v = fDsi[0x0c / 4];
++			seen |= v;
++			if (v != last) {
++				changes++;
++				lastChange = mach_absolute_time();
++				if (firstChange == 0) {
++					firstChange = lastChange;
++				}
++				last = v;
++			}
++			IODelay(100);
++		}
++		uint64_t ns0 = 0, ns1 = 0;
++		absolutetime_to_nanoseconds(firstChange ? firstChange - t0 : 0, &ns0);
++		absolutetime_to_nanoseconds(lastChange ? lastChange - t0 : 0, &ns1);
++		IOLog("AGATE DSI INTSTA 40 ms idle: bits seen %#x, %u changes (first %llu us, last %llu us)\n", seen, changes,
++		    ns0 / 1000, ns1 / 1000);
+ 	}
++	{
++		/* 0547: this core's clock, ~1 dependent add per cycle on A55/A78 */
++		uint64_t x = 1, t0 = mach_absolute_time(), ns = 0;
++		for (uint32_t i = 0; i < 50000000u; i++) {
++			__asm__ __volatile__("add %0, %0, #1" : "+r"(x));
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		IOLog("AGATE CPU: 50M dependent adds in %llu us on cpu %d (~%llu MHz)\n", ns / 1000, cpu_number(),
++		    ns ? 50000000ull * 1000 / ns : 0);
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -449,14 +492,36 @@
+ 				}
+ 			}
+ 			SweetSurface **frame = surfaces;
++			const uint64_t c0 = mach_absolute_time();
+ 			status = viva_gpu_copy_display_frame(frame, SWEET_FB_LAYERS, ^{
+ 				presentLocked(rec, frame);
+ 			});
++			const uint64_t c1 = mach_absolute_time();
+ 			for (SweetSurface *s : surfaces) {
+ 				OSSafeReleaseNULL(s);
+ 			}
+ 			if (status == kIOReturnSuccess) {
+ 				panelKick();
++				static uint32_t timed;
++				if (fDsi != NULL && timed < 40) {
++					/* 0547: how long the panel transfer takes (DSI_INTSTA bit 31 busy) */
++					timed++;
++					const uint32_t before = fDsi[0x0c / 4];
++					uint64_t t1 = mach_absolute_time(), done = 0;
++					for (int i = 0; i < 1000 && done == 0; i++) {
++						if ((fDsi[0x0c / 4] & 0x80000000u) == 0) {
++							done = mach_absolute_time();
++						} else {
++							IODelay(50);
++						}
++					}
++					uint64_t copyNs = 0, xferNs = 0;
++					absolutetime_to_nanoseconds(c1 - c0, &copyNs);
++					absolutetime_to_nanoseconds(done ? done - t1 : 0, &xferNs);
++					IOLog("AGATE FB timing %u: copy %llu us, DSI transfer %llu us%s, INTSTA %#x -> %#x\n", timed,
++					    copyNs / 1000, xferNs / 1000, done ? "" : " (still busy after 50 ms)", before,
++					    fDsi[0x0c / 4]);
++				}
+ 			}
+ 		}
+ 		if (status == kIOReturnBusy) {
