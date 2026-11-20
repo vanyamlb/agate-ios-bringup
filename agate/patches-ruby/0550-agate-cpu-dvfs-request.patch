@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -312,6 +312,43 @@
+ 		IOLog("AGATE CPU: 50M dependent adds in %llu us on cpu %d (~%llu MHz)\n", ns / 1000, cpu_number(),
+ 		    ns ? 50000000ull * 1000 / ns : 0);
+ 	}
++	{
++		/*
++		 * 0550: CPU DVFS. MT6893 hybrid DVFS (agate 4.14 mtk_cpufreq_hybrid.c): CSRAM at 0x11bc00, the
++		 * scheduler's request per cluster (0 LL A55, 1 L A78, 2 B A78) at +0x3a4 as (counter << 4) | OPP index
++		 * (0 = fastest of 16), the current index at +0x354, SCHED_DIS at +0x2bc, PPM base/limit at +0x320.
++		 * agatecpuopp (default 4: LL 1.53, L 1.99, B 2.13 GHz; >= 16: leave as is).
++		 */
++		volatile uint32_t *csram = (volatile uint32_t *)ml_io_map(0x0011bc00, 0x1400);
++		uint32_t opp = 4;
++		PE_parse_boot_argn("agatecpuopp", &opp, sizeof(opp));
++		if (csram != NULL) {
++			IOLog("AGATE DVFS: cur idx %u %u %u %u, sched %#x %#x %#x %#x, sched-dis %#x, ppm %#x %#x %#x %#x\n",
++			    csram[0x354 / 4], csram[0x358 / 4], csram[0x35c / 4], csram[0x360 / 4],
++			    csram[0x3a4 / 4], csram[0x3a8 / 4], csram[0x3ac / 4], csram[0x3b0 / 4], csram[0x2bc / 4],
++			    csram[0x320 / 4], csram[0x324 / 4], csram[0x328 / 4], csram[0x32c / 4]);
++			for (uint32_t off = 0x10; off < 0x90; off += 0x20) {
++				IOLog("AGATE DVFS tbl +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", off,
++				    csram[off / 4], csram[off / 4 + 1], csram[off / 4 + 2], csram[off / 4 + 3],
++				    csram[off / 4 + 4], csram[off / 4 + 5], csram[off / 4 + 6], csram[off / 4 + 7]);
++			}
++			if (opp < 16) {
++				for (uint32_t c = 0; c < 3; c++) {
++					csram[0x3a4 / 4 + c] = (1u << 4) | opp;
++				}
++				__asm__ __volatile__("dsb sy" ::: "memory");
++				IODelay(30000);
++				uint64_t x = 1, t0 = mach_absolute_time(), ns = 0;
++				for (uint32_t i = 0; i < 50000000u; i++) {
++					__asm__ __volatile__("add %0, %0, #1" : "+r"(x));
++				}
++				absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++				IOLog("AGATE DVFS: asked OPP %u; cur idx now %u %u %u %u; 50M adds in %llu us on cpu %d (~%llu MHz)\n",
++				    opp, csram[0x354 / 4], csram[0x358 / 4], csram[0x35c / 4], csram[0x360 / 4], ns / 1000,
++				    cpu_number(), ns ? 50000000ull * 1000 / ns : 0);
++			}
++		}
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
