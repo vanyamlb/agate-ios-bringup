@@ -1,281 +1,456 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
+#if !AGATE_MATRIX_HOST
 #include "viva_gpu_uapi.h"
-
-/* The iOS SDK ships the IOKit library without these discovery declarations. */
-extern CFMutableDictionaryRef IOServiceMatching(const char *className);
-extern mach_port_t IOServiceGetMatchingService(mach_port_t primaryPort, CFDictionaryRef matching);
-extern kern_return_t IOObjectRelease(mach_port_t object);
-extern kern_return_t IOServiceOpen(mach_port_t service, task_t task, uint32_t type, mach_port_t *connection);
-extern kern_return_t IOServiceClose(mach_port_t connection);
-extern kern_return_t IOConnectCallStructMethod(mach_port_t connection, uint32_t selector,
-    const void *input, size_t inputSize, void *output, size_t *outputSize);
-
+extern CFMutableDictionaryRef IOServiceMatching(const char *);
+extern mach_port_t IOServiceGetMatchingService(mach_port_t, CFDictionaryRef);
+extern kern_return_t IOObjectRelease(mach_port_t);
 @protocol AgateMetalDeviceFactory
 - (id<MTLDevice>)initWithAcceleratorPort:(mach_port_t)port;
 @end
+#endif
 
-static int consoleFD;
+extern char **environ;
 
-static int fail(NSString *detail)
+enum { side = 16, width = side * 4, bufferWords = 32 };
+enum { pass = 0, mismatch = 1, unavailable = 2, timeout = 3, workerError = 4, resultCount };
+typedef enum {
+    sentinel, bufferFill, imageFill, blit, clear, sample, blend, isa, noBounds, draw
+} Operation;
+typedef struct {
+    Operation operation;
+    unsigned vertex;
+    unsigned format;
+    BOOL clamp;
+    BOOL depth;
+    BOOL query;
+} Test;
+
+static NSString *const vertexFunctions[] = {@"vs_near", @"vs_middle", @"vs_color", @"vs_buffer"};
+static const char *const vertexNames[] = {"near", "middle", "varying", "buffer"};
+static const MTLPixelFormat formats[] = {MTLPixelFormatRGBA8Unorm, MTLPixelFormatBGRA8Unorm, MTLPixelFormatRGBA8Unorm_sRGB};
+static const char *const formatNames[] = {"rgba8", "bgra8", "srgb"};
+static const char *const operationNames[] = {
+    "sentinel", "buffer-fill", "texture-write", "blit", "clear-only", "texture-sample", "additive-blend",
+    "direct-isa", "no-draw-bounds", "render"
+};
+enum { vertexCount = sizeof(vertexFunctions) / sizeof(*vertexFunctions),
+       formatCount = sizeof(formats) / sizeof(*formats),
+       testCount = draw + vertexCount * formatCount * 2 * 2 * 2 };
+static const char *const resultNames[] = {"pass", "mismatch", "unavailable", "timeout", "worker-error"};
+static const uint8_t red[4] = {255, 0, 0, 255};
+static const uint8_t blue[4] = {0, 0, 255, 255};
+static const uint8_t magenta[4] = {255, 0, 255, 255};
+static unsigned caseNumber;
+static int logFD;
+
+static Test testAt(unsigned index)
 {
-    dprintf(consoleFD, "AGATE METAL: FAIL %s\n", detail.UTF8String);
-    return 1;
-}
-
-static void timedOut(int signalNumber)
-{
-    (void)signalNumber;
-    const char message[] = "AGATE METAL: FAIL last stage timed out\n";
-    (void)write(consoleFD, message, sizeof(message) - 1);
-    _exit(124);
-}
-
-static mach_port_t waitForGPU(void)
-{
-    for (unsigned second = 0; second < 180; second++) {
-        mach_port_t service = IOServiceGetMatchingService(MACH_PORT_NULL,
-            IOServiceMatching(VGPU_SERVICE_CLASS));
-        if (service != MACH_PORT_NULL) {
-            return service;
-        }
-        sleep(1);
+    if (index < draw) {
+        return (Test){.operation = index, .vertex = 1, .query = index == isa || index == noBounds};
     }
-    return MACH_PORT_NULL;
+    unsigned value = index - draw;
+    return (Test){
+        .operation = draw, .vertex = (value / 8) % vertexCount, .format = value / (8 * vertexCount),
+        .clamp = (value & 4) != 0, .depth = (value & 2) != 0, .query = (value & 1) != 0
+    };
 }
 
-static BOOL checkGPUConnection(mach_port_t service)
+static int reportUnavailable(NSString *what, NSError *error)
 {
-    mach_port_t connection = MACH_PORT_NULL;
-    dprintf(consoleFD, "AGATE METAL: opening G77 IOKit connection\n");
-    kern_return_t status = IOServiceOpen(service, mach_task_self(), VGPU_CLIENT_TYPE, &connection);
-    if (status != KERN_SUCCESS) {
-        dprintf(consoleFD, "AGATE METAL: FAIL IOServiceOpen returned %#x\n", status);
-        return NO;
-    }
-    dprintf(consoleFD, "AGATE METAL: reading G77 driver version\n");
-    struct vgpu_version input = {}, version = {};
-    size_t length = sizeof(version);
-    status = IOConnectCallStructMethod(connection, VGPU_SEL_GET_VERSION,
-        &input, sizeof(input), &version, &length);
-    const BOOL valid = status == KERN_SUCCESS && length == sizeof(version) &&
-        version.major == VGPU_UAPI_MAJOR && version.gpu_id == 0x90800011;
-    dprintf(consoleFD, "AGATE METAL: %s G77 version %#x, ABI %u.%u, status %#x\n",
-        valid ? "verified" : "FAIL", version.gpu_id, version.major, version.minor, status);
-    dprintf(consoleFD, "AGATE METAL: closing diagnostic IOKit connection\n");
-    kern_return_t closeStatus = IOServiceClose(connection);
-    if (closeStatus != KERN_SUCCESS) {
-        dprintf(consoleFD, "AGATE METAL: FAIL IOServiceClose returned %#x\n", closeStatus);
-        return NO;
-    }
-    return valid;
+    dprintf(logFD, "AGATE MATRIX error case=%03u item=%s detail=%.92s\n", caseNumber,
+        what.UTF8String, error.localizedDescription.UTF8String ?: "-");
+    return unavailable;
 }
 
-static BOOL complete(id<MTLCommandBuffer> commands)
+static int complete(id<MTLCommandBuffer> commands)
 {
-    dispatch_semaphore_t completion = dispatch_semaphore_create(0);
+    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
     [commands addCompletedHandler:^(__unused id<MTLCommandBuffer> buffer) {
-        dispatch_semaphore_signal(completion);
+        dispatch_semaphore_signal(finished);
     }];
     [commands commit];
-    if (dispatch_semaphore_wait(completion, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC))) {
-        fail(@"GPU completion timed out");
-        return NO;
+    if (dispatch_semaphore_wait(finished, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC))) {
+        return timeout;
     }
     if (commands.status != MTLCommandBufferStatusCompleted) {
-        fail(commands.error.localizedDescription ?: @"GPU command buffer failed");
-        return NO;
+        dprintf(logFD, "AGATE MATRIX error case=%03u item=command status=%ld detail=%.92s\n",
+            caseNumber, (long)commands.status, commands.error.localizedDescription.UTF8String ?: "-");
+        return workerError;
     }
-    return YES;
+    return pass;
 }
 
-static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString *label,
-                          NSString *vertexFunction, NSString *fragmentFunction)
+static id<MTLTexture> newTexture(id<MTLDevice> device, MTLPixelFormat format,
+                                NSUInteger dimension, MTLStorageMode storage, MTLTextureUsage usage)
 {
-    enum { side = 16 };
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+        width:dimension height:dimension mipmapped:NO];
+    descriptor.storageMode = storage;
+    descriptor.usage = usage;
+    return [device newTextureWithDescriptor:descriptor];
+}
+
+static int inspectPixels(id<MTLTexture> target, Test test, uint64_t visible)
+{
+    uint8_t pixels[side][side][4] = {};
+    [target getBytes:pixels bytesPerRow:width fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0];
+    unsigned reds = 0, blues = 0, purples = 0, pattern = 0;
+    for (unsigned y = 0; y < side; ++y) {
+        for (unsigned x = 0; x < side; ++x) {
+            uint8_t *pixel = pixels[y][x];
+            if (test.format == 1) {
+                uint8_t b = pixel[0];
+                pixel[0] = pixel[2];
+                pixel[2] = b;
+            }
+            reds += memcmp(pixel, red, 4) == 0;
+            blues += memcmp(pixel, blue, 4) == 0;
+            purples += memcmp(pixel, magenta, 4) == 0;
+            pattern += memcmp(pixel, ((x ^ y) & 1) ? red : blue, 4) == 0;
+        }
+    }
+    BOOL valid;
+    switch (test.operation) {
+        case clear: valid = blues == side * side; break;
+        case imageFill:
+        case blit: valid = pattern == side * side; break;
+        default: {
+            BOOL blended = test.operation == blend;
+            const uint8_t *expected = blended ? magenta : red;
+            unsigned painted = blended ? purples : reds;
+            valid = painted > 0 && painted + blues == side * side &&
+                memcmp(pixels[side / 2][side / 2], expected, 4) == 0 && memcmp(pixels[0][0], blue, 4) == 0;
+        }
+    }
+    const char *queryResult = !test.query ? "off" : visible == UINT64_MAX ? "missing" : "counted";
+    dprintf(logFD, "AGATE MATRIX pixels case=%03u r=%u b=%u m=%u checker=%u visibility=%s samples=%llu\n",
+        caseNumber, reds, blues, purples, pattern, queryResult,
+        (unsigned long long)(test.query && visible != UINT64_MAX ? visible : 0));
+    return valid && (!test.query || (visible != UINT64_MAX && visible > 0)) ? pass : mismatch;
+}
+
+static int copyPattern(id<MTLDevice> device, id<MTLCommandBuffer> commands, Test test)
+{
+    id<MTLTexture> input = newTexture(device, formats[0], side, MTLStorageModeShared, MTLTextureUsageShaderRead);
+    id<MTLTexture> target = newTexture(device, formats[0], side, MTLStorageModeShared, MTLTextureUsageShaderRead);
+    id<MTLBlitCommandEncoder> encoder = [commands blitCommandEncoder];
+    if (!input || !target || !encoder) {
+        return reportUnavailable(@"blit allocation", nil);
+    }
+    uint8_t pixels[side][side][4];
+    for (unsigned y = 0; y < side; ++y) {
+        for (unsigned x = 0; x < side; ++x) {
+            memcpy(pixels[y][x], ((x ^ y) & 1) ? red : blue, 4);
+        }
+    }
+    [input replaceRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0 withBytes:pixels bytesPerRow:width];
+    MTLOrigin corner = MTLOriginMake(0, 0, 0);
+    [encoder copyFromTexture:input sourceSlice:0 sourceLevel:0 sourceOrigin:corner sourceSize:MTLSizeMake(side, side, 1)
+        toTexture:target destinationSlice:0 destinationLevel:0 destinationOrigin:corner];
+    [encoder endEncoding];
+    int result = complete(commands);
+    return result == pass ? inspectPixels(target, test, 0) : result;
+}
+
+static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBuffer> commands, Test test)
+{
+    BOOL image = test.operation == imageFill;
+    BOOL single = test.operation == sentinel;
+    NSString *function = image ? @"write_texture" : single ? @"write_sentinel" : @"fill_buffer";
+    id<MTLFunction> shader = [library newFunctionWithName:function];
     NSError *error = nil;
-    MTLRenderPipelineDescriptor *options = [MTLRenderPipelineDescriptor new];
-    options.label = label;
-    options.vertexFunction = [library newFunctionWithName:vertexFunction];
-    options.fragmentFunction = [library newFunctionWithName:fragmentFunction];
-    if (!options.vertexFunction || !options.fragmentFunction) {
-        return fail(@"missing triangle shader functions");
+    id<MTLComputePipelineState> pipeline = shader ? [device newComputePipelineStateWithFunction:shader error:&error] : nil;
+    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+    if (!pipeline || !encoder) {
+        return reportUnavailable(@"compute pipeline", error);
     }
-    options.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-    dprintf(consoleFD, "AGATE METAL: creating the render pipeline for %s\n", label.UTF8String);
-    id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:options error:&error];
-    if (!pipeline) {
-        return fail(error.localizedDescription ?: @"render pipeline");
+    [encoder setComputePipelineState:pipeline];
+    if (image) {
+        id<MTLTexture> target = newTexture(device, formats[0], side, MTLStorageModeShared, MTLTextureUsageShaderWrite);
+        if (!target) {
+            return reportUnavailable(@"compute texture", nil);
+        }
+        [encoder setTexture:target atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(2, 2, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [encoder endEncoding];
+        int result = complete(commands);
+        return result == pass ? inspectPixels(target, test, 0) : result;
     }
+    unsigned count = single ? 1 : bufferWords;
+    id<MTLBuffer> output = [device newBufferWithLength:count * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    uint32_t *words = output.contents;
+    if (!words) {
+        return reportUnavailable(@"compute buffer", nil);
+    }
+    memset(words, 0xa5, count * sizeof(*words));
+    [encoder setBuffer:output offset:0 atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(count, 1, 1)];
+    [encoder endEncoding];
+    int result = complete(commands);
+    if (result != pass) {
+        return result;
+    }
+    unsigned matches = 0;
+    for (unsigned index = 0; index < count; ++index) {
+        uint32_t expected = single ? 0xc0ffee42u : 0x12345678u ^ (index * 257u);
+        matches += words[index] == expected;
+    }
+    dprintf(logFD, "AGATE MATRIX buffer case=%03u matches=%u/%u first=%#x\n",
+        caseNumber, matches, count, words[0]);
+    return matches == count ? pass : mismatch;
+}
 
-    MTLTextureDescriptor *textureOptions = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:side height:side mipmapped:NO];
-    textureOptions.storageMode = MTLStorageModeShared;
-    textureOptions.usage = MTLTextureUsageRenderTarget;
-    id<MTLTexture> target = [device newTextureWithDescriptor:textureOptions];
-    id<MTLCommandQueue> queue = [device newCommandQueue];
-    id<MTLCommandBuffer> commands = [queue commandBuffer];
-    if (!target || !commands) {
-        return fail(@"texture or command buffer allocation");
+static int runDraw(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBuffer> commands, Test test)
+{
+    MTLPixelFormat format = formats[test.format];
+    id<MTLTexture> target = newTexture(device, format, side, MTLStorageModeShared, MTLTextureUsageRenderTarget);
+    MTLRenderPassDescriptor *renderPass = [MTLRenderPassDescriptor renderPassDescriptor];
+    renderPass.colorAttachments[0].texture = target;
+    renderPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
+    renderPass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    renderPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLBuffer> visibility = nil;
+    uint64_t *samples = NULL;
+    if (test.query) {
+        visibility = [device newBufferWithLength:sizeof(uint64_t) options:MTLResourceStorageModeShared];
+        samples = visibility.contents;
+        if (!samples) {
+            return reportUnavailable(@"visibility buffer", nil);
+        }
+        *samples = UINT64_MAX;
+        renderPass.visibilityResultBuffer = visibility;
     }
-    commands.label = label;
-
-    id<MTLBuffer> visibility = [device newBufferWithLength:sizeof(uint64_t) options:MTLResourceStorageModeShared];
-    uint64_t *samples = visibility.contents;
-    if (!samples) {
-        return fail(@"visibility result buffer allocation");
+    id<MTLDepthStencilState> depthState = nil;
+    if (test.depth) {
+        renderPass.depthAttachment.texture = newTexture(device, MTLPixelFormatDepth32Float, side,
+            MTLStorageModePrivate, MTLTextureUsageRenderTarget);
+        renderPass.depthAttachment.loadAction = MTLLoadActionClear;
+        renderPass.depthAttachment.storeAction = MTLStoreActionDontCare;
+        renderPass.depthAttachment.clearDepth = 1.0;
+        MTLDepthStencilDescriptor *depth = [MTLDepthStencilDescriptor new];
+        depth.depthCompareFunction = MTLCompareFunctionLess;
+        depth.depthWriteEnabled = YES;
+        depthState = [device newDepthStencilStateWithDescriptor:depth];
+        if (!renderPass.depthAttachment.texture || !depthState) {
+            return reportUnavailable(@"depth attachment", nil);
+        }
     }
-    *samples = UINT64_MAX;
-
-    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass.colorAttachments[0].texture = target;
-    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
-    pass.visibilityResultBuffer = visibility;
-    id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
+    if (!target) {
+        return reportUnavailable(@"color target", nil);
+    }
+    id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:renderPass];
     if (!encoder) {
-        return fail(@"render encoder");
+        return reportUnavailable(@"render encoder", nil);
+    }
+    if (test.operation == clear) {
+        [encoder endEncoding];
+        int result = complete(commands);
+        return result == pass ? inspectPixels(target, test, 0) : result;
+    }
+
+    MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
+    descriptor.colorAttachments[0].pixelFormat = format;
+    if (test.depth) {
+        descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    }
+    NSString *fragment = test.operation == sample ? @"fs_texture" : test.vertex == 2 ? @"fs_color" : @"fs_solid";
+    descriptor.vertexFunction = [library newFunctionWithName:vertexFunctions[test.vertex]];
+    descriptor.fragmentFunction = [library newFunctionWithName:fragment];
+    if (test.operation == blend) {
+        descriptor.colorAttachments[0].blendingEnabled = YES;
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
+    }
+    if (test.vertex == 3) {
+        const float xy[][2] = {{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.0f, 0.8f}};
+        id<MTLBuffer> input = [device newBufferWithBytes:xy length:sizeof(xy) options:MTLResourceStorageModeShared];
+        if (!input) {
+            return reportUnavailable(@"vertex input buffer", nil);
+        }
+        MTLVertexDescriptor *layout = [MTLVertexDescriptor vertexDescriptor];
+        layout.attributes[0].format = MTLVertexFormatFloat2;
+        layout.layouts[0].stride = sizeof(xy[0]);
+        descriptor.vertexDescriptor = layout;
+        [encoder setVertexBuffer:input offset:0 atIndex:0];
+    }
+    if (test.operation == sample) {
+        id<MTLTexture> source = newTexture(device, formats[0], 1, MTLStorageModeShared, MTLTextureUsageShaderRead);
+        if (!source) {
+            return reportUnavailable(@"sample source texture", nil);
+        }
+        [source replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:red bytesPerRow:4];
+        [encoder setFragmentTexture:source atIndex:0];
+    }
+    NSError *error = nil;
+    id<MTLRenderPipelineState> pipeline = descriptor.vertexFunction && descriptor.fragmentFunction ?
+        [device newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
+    if (!pipeline) {
+        return reportUnavailable(@"render pipeline", error);
     }
     [encoder setRenderPipelineState:pipeline];
     [encoder setViewport:(MTLViewport){0, 0, side, side, 0, 1}];
     [encoder setScissorRect:(MTLScissorRect){0, 0, side, side}];
     [encoder setCullMode:MTLCullModeNone];
-    [encoder setVisibilityResultMode:MTLVisibilityResultModeCounting offset:0];
+    [encoder setDepthClipMode:test.clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+    if (depthState) {
+        [encoder setDepthStencilState:depthState];
+    }
+    if (test.query) {
+        [encoder setVisibilityResultMode:MTLVisibilityResultModeCounting offset:0];
+    }
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
-
-    dprintf(consoleFD, "AGATE METAL: submitting the off-screen render for %s\n", label.UTF8String);
-    if (!complete(commands)) {
-        return 1;
-    }
-    if (*samples == UINT64_MAX) {
-        dprintf(consoleFD, "AGATE METAL: %s visibility result not written\n", label.UTF8String);
-    } else {
-        dprintf(consoleFD, "AGATE METAL: %s visible samples=%llu\n", label.UTF8String, (unsigned long long)*samples);
-    }
-    uint8_t pixels[side][side][4] = {};
-    [target getBytes:pixels bytesPerRow:sizeof(pixels[0]) fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0];
-    const uint8_t *center = pixels[side / 2][side / 2], *corner = pixels[0][0];
-    const uint8_t red[] = {255, 0, 0, 255}, blue[] = {0, 0, 255, 255};
-    unsigned redPixels = 0, bluePixels = 0;
-    for (unsigned y = 0; y < side; y++) {
-        for (unsigned x = 0; x < side; x++) {
-            redPixels += memcmp(pixels[y][x], red, sizeof(red)) == 0;
-            bluePixels += memcmp(pixels[y][x], blue, sizeof(blue)) == 0;
-        }
-    }
-    BOOL passed = memcmp(center, red, sizeof(red)) == 0 && memcmp(corner, blue, sizeof(blue)) == 0;
-    dprintf(consoleFD, "AGATE METAL: %s %s pixel readback, center=(%u,%u,%u,%u) corner=(%u,%u,%u,%u) red=%u blue=%u\n",
-        label.UTF8String, passed ? "PASS" : "FAIL", center[0], center[1], center[2], center[3],
-        corner[0], corner[1], corner[2], corner[3], redPixels, bluePixels);
-    return passed ? 0 : 1;
+    int result = complete(commands);
+    return result == pass ? inspectPixels(target, test, samples ? *samples : UINT64_MAX) : result;
 }
 
-static int computeSentinel(id<MTLDevice> device, id<MTLLibrary> library)
+static int runCase(Test test)
 {
-    id<MTLFunction> function = [library newFunctionWithName:@"write_sentinel"];
-    if (!function) {
-        return fail(@"missing compute shader");
-    }
     NSError *error = nil;
-    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
-    if (!pipeline) {
-        return fail(error.localizedDescription ?: @"compute pipeline");
+#if AGATE_MATRIX_HOST
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    const char *path = getenv("AGATE_MATRIX_SHADER");
+    if (!path) {
+        return reportUnavailable(@"AGATE_MATRIX_SHADER", nil);
     }
-    id<MTLBuffer> result = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    uint32_t *value = result.contents;
-    if (!value) {
-        return fail(@"compute result buffer allocation");
+    NSString *source = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:&error];
+    id<MTLLibrary> library = source ? [device newLibraryWithSource:source options:nil error:&error] : nil;
+#else
+    setenv("VMG_NO_AIR_CACHE", "1", 1);
+    setenv("VMG_NO_SHM_STATS", "1", 1);
+    setenv("VMG_DRIVER", "panfrost", 1);
+    setenv("VGPU_BACKEND", "iokit", 1);
+    setenv("VGPU_NO_TRAP", "1", 1);
+    if (test.operation == isa) {
+        setenv("VMG_ISA", "1", 1);
+        setenv("VMG_ISA_STRICT", "1", 1);
     }
-    *value = 0xbaadbaadu;
+    if (test.operation == noBounds) {
+        setenv("VMG_NO_DRAW_BOUNDS", "1", 1);
+    }
+    NSBundle *bundle = [NSBundle bundleWithPath:@"/Developer/VivaMTLDriver.bundle"];
+    if (![bundle loadAndReturnError:&error]) {
+        return reportUnavailable(@"G77 Metal plug-in", error);
+    }
+    id<AgateMetalDeviceFactory> factory = (id)[[bundle classNamed:@"VMDevice"] alloc];
+    id<MTLDevice> device = (id)[factory initWithAcceleratorPort:MACH_PORT_NULL];
+    id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/Developer/triangle.metallib"] error:&error];
+#endif
+    if (!device || !library) {
+        return reportUnavailable(@"Metal device or library", error);
+    }
     id<MTLCommandQueue> queue = [device newCommandQueue];
     id<MTLCommandBuffer> commands = [queue commandBuffer];
-    commands.label = @"compute-sentinel";
-    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
-    if (!encoder) {
-        return fail(@"compute encoder");
+    if (!commands) {
+        return reportUnavailable(@"command buffer", nil);
     }
-    [encoder setComputePipelineState:pipeline];
-    [encoder setBuffer:result offset:0 atIndex:0];
-    MTLSize oneThread = MTLSizeMake(1, 1, 1);
-    [encoder dispatchThreadgroups:oneThread threadsPerThreadgroup:oneThread];
-    [encoder endEncoding];
-    if (!complete(commands)) {
-        return 1;
+    commands.label = @(operationNames[test.operation]);
+    if (test.operation <= imageFill) {
+        return runCompute(device, library, commands, test);
     }
-    BOOL passed = *value == 0xc0ffee42u;
-    dprintf(consoleFD, "AGATE METAL: compute-sentinel %s value=%#x\n", passed ? "PASS" : "FAIL", *value);
-    return passed ? 0 : 1;
+    if (test.operation == blit) {
+        return copyPattern(device, commands, test);
+    }
+    return runDraw(device, library, commands, test);
 }
 
-static int render(id<MTLDevice> device)
+static int runWorker(const char *binary, unsigned index)
 {
-    NSError *error = nil;
-    NSURL *shader = [NSURL fileURLWithPath:@"/Developer/triangle.metallib"];
-    dprintf(consoleFD, "AGATE METAL: loading the precompiled shader library\n");
-    id<MTLLibrary> library = [device newLibraryWithURL:shader error:&error];
-    if (!library) {
-        return fail(error.localizedDescription ?: @"precompiled shader library");
+    char number[16];
+    snprintf(number, sizeof(number), "%u", index);
+    char *argv[] = {(char *)binary, "--case", number, NULL};
+    pid_t pid;
+    if (posix_spawn(&pid, binary, NULL, NULL, argv, environ) != 0) {
+        return workerError;
     }
-
-    int compute = computeSentinel(device, library);
-    int nearPlane = renderTriangle(device, library, @"near-plane", @"vs_near", @"fs_solid");
-    int midDepth = renderTriangle(device, library, @"mid-depth", @"vs_middle", @"fs_solid");
-    int colorVarying = renderTriangle(device, library, @"color-varying", @"vs_color", @"fs_color");
-    return compute || nearPlane || midDepth || colorVarying;
+    const uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 10 * NSEC_PER_SEC;
+    int status;
+    while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline) {
+        pid_t observed = waitpid(pid, &status, WNOHANG);
+        if (observed == pid) {
+            return WIFEXITED(status) && WEXITSTATUS(status) < resultCount ? WEXITSTATUS(status) : workerError;
+        }
+        if (observed < 0 && errno != EINTR) {
+            return workerError;
+        }
+        usleep(20000);
+    }
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return timeout;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    @autoreleasepool {
-        /* The Agate kernel tees these writes when sweetnull names this process. */
-        consoleFD = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (consoleFD < 0) {
-            consoleFD = STDERR_FILENO;
-        }
-        dprintf(consoleFD, "AGATE METAL: waiting for the G77 test accelerator\n");
-        mach_port_t service = waitForGPU();
-        if (service == MACH_PORT_NULL) {
-            return fail(@"accelerator unavailable after 180 seconds");
-        }
-        signal(SIGALRM, timedOut);
-        alarm(60);
-        BOOL connected = checkGPUConnection(service);
-        IOObjectRelease(service);
-        if (!connected) {
-            return 1;
-        }
-        setenv("VMG_NO_AIR_CACHE", "1", 1);
-        setenv("VMG_NO_SHM_STATS", "1", 1);
-        setenv("VMG_TRACE_FRAME", "0", 1);
-        setenv("VMG_DRIVER", "panfrost", 1);
-        setenv("VGPU_BACKEND", "iokit", 1);
-        setenv("VGPU_NO_TRAP", "1", 1);
-        setenv("TSMTL_LOG", "1", 1);
-        NSBundle *bundle = [NSBundle bundleWithPath:@"/Developer/VivaMTLDriver.bundle"];
-        NSError *error = nil;
-        dprintf(consoleFD, "AGATE METAL: loading the plug-in\n");
-        if (![bundle loadAndReturnError:&error]) {
-            return fail(error.localizedDescription ?: @"could not load the RAM-volume bundle");
-        }
-        dprintf(consoleFD, "AGATE METAL: initializing VMDevice\n");
-        alarm(60);
-        Class deviceClass = [bundle classNamed:@"VMDevice"];
-        id<AgateMetalDeviceFactory> factory = (id)[deviceClass alloc];
-        id<MTLDevice> device = (id)[factory initWithAcceleratorPort:MACH_PORT_NULL];
-        if (!device) {
-            return fail(@"the RAM-volume plug-in could not open the G77");
-        }
-        dprintf(consoleFD, "AGATE METAL: device %s\n", device.name.UTF8String);
-        alarm(60);
-        return render(device);
+#if AGATE_MATRIX_HOST
+    logFD = STDOUT_FILENO;
+    const char *worker = argv[0];
+#else
+    logFD = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (logFD < 0) {
+        logFD = STDERR_FILENO;
     }
+    const char *worker = "/Developer/metal-smoke";
+#endif
+    if (argc == 3 && strcmp(argv[1], "--case") == 0) {
+        char *end;
+        unsigned long index = strtoul(argv[2], &end, 10);
+        if (*end || end == argv[2] || index >= testCount) {
+            return workerError;
+        }
+        caseNumber = (unsigned)index;
+        @autoreleasepool {
+            return runCase(testAt(caseNumber));
+        }
+    }
+    if (argc != 1) {
+        return workerError;
+    }
+    dprintf(logFD, "AGATE MATRIX start tests=%u\n", testCount);
+#if !AGATE_MATRIX_HOST
+    mach_port_t gpu = MACH_PORT_NULL;
+    for (unsigned second = 0; second < 180 && gpu == MACH_PORT_NULL; ++second) {
+        gpu = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching(VGPU_SERVICE_CLASS));
+        if (gpu == MACH_PORT_NULL) {
+            sleep(1);
+        }
+    }
+    if (gpu == MACH_PORT_NULL) {
+        dprintf(logFD, "AGATE MATRIX abort GPU unavailable\n");
+        return unavailable;
+    }
+    IOObjectRelease(gpu);
+#endif
+
+    unsigned results[resultCount] = {};
+    for (unsigned index = 0; index < testCount; ++index) {
+        Test description = testAt(index);
+        dprintf(logFD, "AGATE MATRIX case=%03u op=%s vertex=%s format=%s clamp=%d depth=%d query=%d\n", index,
+            operationNames[description.operation], vertexNames[description.vertex], formatNames[description.format],
+            description.clamp, description.depth, description.query);
+        int result = runWorker(worker, index);
+        ++results[result];
+        dprintf(logFD, "AGATE MATRIX result case=%03u status=%s\n", index, resultNames[result]);
+    }
+#if !AGATE_MATRIX_HOST
+    sync();
+#endif
+    dprintf(logFD, "AGATE MATRIX end tests=%u pass=%u mismatch=%u unavailable=%u timeout=%u worker_error=%u\n",
+        testCount, results[pass], results[mismatch], results[unavailable], results[timeout], results[workerError]);
+    return results[pass] == testCount ? pass : mismatch;
 }
