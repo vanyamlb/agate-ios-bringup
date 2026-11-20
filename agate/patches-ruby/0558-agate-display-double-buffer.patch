@@ -1,0 +1,144 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>   /* 0558 */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -156,6 +157,14 @@
+ 	int fKeyPower, fKeyDown;
+ 	uint32_t fKeyLog;
+ 	static void keysFired(OSObject *owner, IOTimerEventSource *sender);
++	/* 0558: double-buffered panel memory: copy into the back buffer at swap, flip OVL0 L1 at the next TE */
++	IOBufferMemoryDescriptor *fBackMem;
++	uintptr_t fBufVA[2];
++	uint64_t fBufPA[2];
++	uint32_t fFront, fFlipIdx, fFlips;
++	bool fDouble, fFlipPending;
++	volatile uint32_t *fOvl;
++	uint64_t fTeLastAbs;
+ 	uint32_t fVsyncUs;            /* 0554: the panel's measured TE period once TE sync is on (0: 60 Hz) */
+ 	bool panelReady(void);        /* fPresentLock held */
+ 	void fadePanel(void);
+@@ -551,6 +560,38 @@
+ 	 * 0557: the agate port had no MediaTek key driver (the inherited one reads a Qualcomm PMIC), so the
+ 	 * side button did nothing. Poll MT6359P TOPSTATUS like Android's mtk-pmic-keys does on interrupt.
+ 	 */
++	if (fTeSync && fDsi != NULL && fMutex != NULL && (fPhys >> 32) == 0) {
++		/*
++		 * 0558: the user saw app open/close stutter. AGATE FPS (xnu96): each present held backboardd for the
++		 * previous 14 ms DSI transfer plus the TE wait (up to ~25 ms a frame). With a second buffer the swap only
++		 * copies (1-3 ms) into the buffer DSI is not reading; the vsync tick, aligned just before TE, points
++		 * OVL0 layer 1 (0x14000000 + 0xf60, where the shim put the panel buffer) at it and starts DSI.
++		 */
++		const uint64_t size = (uint64_t)fHeight * fRowBytes;
++		fOvl = (volatile uint32_t *)ml_io_map(0x14000000, 0x1000);
++		const uint32_t l1 = fOvl != NULL ? fOvl[0xf60 / 4] : 0;
++		if (fOvl != NULL && l1 == (uint32_t)fPhys) {
++			fBackMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000FFFFF000ULL);
++		}
++		uint64_t pa = 0;
++		if (fBackMem != NULL) {
++			pa = fBackMem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++			if (pa != 0 && (pa >> 32) == 0 && (pa & 0xfff) == 0 && fBackMem->getBytesNoCopy() != NULL) {
++				memcpy(fBackMem->getBytesNoCopy(), (const void *)fPixels, size);
++				flush_dcache64((addr64_t)(uintptr_t)fBackMem->getBytesNoCopy(), (uint32_t)size, FALSE);
++				__asm__ __volatile__("dsb sy" ::: "memory");
++				fBufVA[0] = fPixels;
++				fBufPA[0] = fPhys;
++				fBufVA[1] = (uintptr_t)fBackMem->getBytesNoCopy();
++				fBufPA[1] = pa;
++				fFront = 0;
++				fDouble = true;
++			}
++		}
++		IOLog("AGATE FB double buffer: %s (OVL0 L1 ADDR %#x, panel %#llx, back %#llx, %llu bytes)\n",
++		    fDouble ? "ON" : "off", l1, fPhys, pa, size);
++	}
+ 	fKeys = IOTimerEventSource::timerEventSource(this, &AppleCLCD::keysFired);
+ 	if (fKeys != NULL && fWorkLoop->addEventSource(fKeys) == kIOReturnSuccess) {
+ 		fKeys->setTimeoutMS(2000);
+@@ -601,6 +642,21 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++	if (fb->fDouble && fb->fFlipPending) {
++		/* 0558: flip to the frame the last swap copied, at the panel's TE (panelKick waits for it) */
++		IOLockLock(fb->fPresentLock);
++		if (fb->fFlipPending && !fb->fPowerOff && fb->panelReady()) {
++			fb->fOvl[0xf60 / 4] = (uint32_t)fb->fBufPA[fb->fFlipIdx];
++			__asm__ __volatile__("dsb sy" ::: "memory");
++			fb->panelKick();
++			fb->fTeLastAbs = mach_absolute_time();
++			fb->fFront = fb->fFlipIdx;
++			fb->fPixels = fb->fBufVA[fb->fFront];
++			fb->fFlipPending = false;
++			fb->fFlips++;
++		}
++		IOLockUnlock(fb->fPresentLock);
++	}
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
+@@ -637,7 +693,15 @@
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(fb->fVsyncUs ? fb->fVsyncUs : SWEET_FB_VSYNC_US);
++	uint32_t next = fb->fVsyncUs ? fb->fVsyncUs : SWEET_FB_VSYNC_US;
++	if (fb->fDouble && fb->fTeLastAbs != 0) {
++		/* 0558: tick ~1.5 ms before the predicted TE so the flip spins only briefly */
++		uint64_t sinceNs = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - fb->fTeLastAbs, &sinceNs);
++		const uint32_t phase = (uint32_t)((sinceNs / 1000) % next);
++		next = next - phase > 1500 ? next - phase - 1500 : next - phase + next - 1500;
++	}
++	sender->setTimeoutUS(next);
+ }
+ 
+ void
+@@ -824,7 +888,7 @@
+ 	if (displayOn) {
+ 		IOReturn status = kIOReturnBusy;
+ 		const uint64_t r0 = mach_absolute_time();
+-		const bool ready = panelReady();
++		const bool ready = fDouble || panelReady();
+ 		{
+ 			uint64_t ns = 0;
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - r0, &ns);
+@@ -847,11 +911,18 @@
+ 				}
+ 			}
+ 			SweetSurface **frame = surfaces;
++			const uint32_t target = fDouble ? 1 - fFront : 0;
++			if (fDouble) {
++				fPixels = fBufVA[target];       /* presentLocked draws into fPixels */
++			}
+ 			const uint64_t c0 = mach_absolute_time();
+ 			status = viva_gpu_copy_display_frame(frame, SWEET_FB_LAYERS, ^{
+ 				presentLocked(rec, frame);
+ 			});
+ 			const uint64_t c1 = mach_absolute_time();
++			if (fDouble) {
++				fPixels = fBufVA[fFront];
++			}
+ 			{
+ 				uint64_t ns = 0;
+ 				absolutetime_to_nanoseconds(c1 - c0, &ns);
+@@ -862,7 +933,10 @@
+ 			for (SweetSurface *s : surfaces) {
+ 				OSSafeReleaseNULL(s);
+ 			}
+-			if (status == kIOReturnSuccess) {
++			if (status == kIOReturnSuccess && fDouble) {
++				fFlipIdx = target;              /* shown at the next TE by vsyncFired */
++				fFlipPending = true;
++			} else if (status == kIOReturnSuccess) {
+ 				panelKick();
+ 				static uint32_t timed;
+ 				if (fDsi != NULL && timed < 40) {
