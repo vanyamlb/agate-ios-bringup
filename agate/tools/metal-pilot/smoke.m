@@ -78,8 +78,26 @@ static BOOL checkGPUConnection(mach_port_t service)
     return valid;
 }
 
+static BOOL complete(id<MTLCommandBuffer> commands)
+{
+    dispatch_semaphore_t completion = dispatch_semaphore_create(0);
+    [commands addCompletedHandler:^(__unused id<MTLCommandBuffer> buffer) {
+        dispatch_semaphore_signal(completion);
+    }];
+    [commands commit];
+    if (dispatch_semaphore_wait(completion, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC))) {
+        fail(@"GPU completion timed out");
+        return NO;
+    }
+    if (commands.status != MTLCommandBufferStatusCompleted) {
+        fail(commands.error.localizedDescription ?: @"GPU command buffer failed");
+        return NO;
+    }
+    return YES;
+}
+
 static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString *label,
-                          NSString *vertexFunction, BOOL explicitState)
+                          NSString *vertexFunction, BOOL useVertexBuffer)
 {
     enum { side = 16 };
     NSError *error = nil;
@@ -90,10 +108,12 @@ static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString
     if (!options.vertexFunction || !options.fragmentFunction) {
         return fail(@"missing triangle shader functions");
     }
-    MTLVertexDescriptor *layout = [MTLVertexDescriptor vertexDescriptor];
-    layout.attributes[0].format = MTLVertexFormatFloat2;
-    layout.layouts[0].stride = 2 * sizeof(float);
-    options.vertexDescriptor = layout;
+    if (useVertexBuffer) {
+        MTLVertexDescriptor *layout = [MTLVertexDescriptor vertexDescriptor];
+        layout.attributes[0].format = MTLVertexFormatFloat2;
+        layout.layouts[0].stride = 2 * sizeof(float);
+        options.vertexDescriptor = layout;
+    }
     options.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     dprintf(consoleFD, "AGATE METAL: creating the render pipeline for %s\n", label.UTF8String);
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:options error:&error];
@@ -115,7 +135,7 @@ static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString
 
     const float vertices[][2] = {{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.0f, 0.8f}};
     id<MTLBuffer> vertexBuffer = nil;
-    if (explicitState) {
+    if (useVertexBuffer) {
         vertexBuffer = [device newBufferWithBytes:vertices length:sizeof(vertices) options:MTLResourceStorageModeShared];
         if (!vertexBuffer) {
             return fail(@"vertex buffer allocation");
@@ -132,28 +152,18 @@ static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString
         return fail(@"render encoder");
     }
     [encoder setRenderPipelineState:pipeline];
-    if (explicitState) {
-        [encoder setViewport:(MTLViewport){0, 0, side, side, 0, 1}];
-        [encoder setScissorRect:(MTLScissorRect){0, 0, side, side}];
-        [encoder setCullMode:MTLCullModeNone];
+    [encoder setViewport:(MTLViewport){0, 0, side, side, 0, 1}];
+    [encoder setScissorRect:(MTLScissorRect){0, 0, side, side}];
+    [encoder setCullMode:MTLCullModeNone];
+    if (useVertexBuffer) {
         [encoder setVertexBuffer:vertexBuffer offset:0 atIndex:0];
-    } else {
-        [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
     }
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
 
-    dispatch_semaphore_t completion = dispatch_semaphore_create(0);
-    [commands addCompletedHandler:^(__unused id<MTLCommandBuffer> buffer) {
-        dispatch_semaphore_signal(completion);
-    }];
     dprintf(consoleFD, "AGATE METAL: submitting the off-screen render for %s\n", label.UTF8String);
-    [commands commit];
-    if (dispatch_semaphore_wait(completion, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC))) {
-        return fail(@"render completion timed out");
-    }
-    if (commands.status != MTLCommandBufferStatusCompleted) {
-        return fail(commands.error.localizedDescription ?: @"GPU command buffer failed");
+    if (!complete(commands)) {
+        return 1;
     }
     uint8_t pixels[side][side][4] = {};
     [target getBytes:pixels bytesPerRow:sizeof(pixels[0]) fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0];
@@ -173,6 +183,43 @@ static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString
     return passed ? 0 : 1;
 }
 
+static int computeSentinel(id<MTLDevice> device, id<MTLLibrary> library)
+{
+    id<MTLFunction> function = [library newFunctionWithName:@"write_sentinel"];
+    if (!function) {
+        return fail(@"missing compute shader");
+    }
+    NSError *error = nil;
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline) {
+        return fail(error.localizedDescription ?: @"compute pipeline");
+    }
+    id<MTLBuffer> result = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    uint32_t *value = result.contents;
+    if (!value) {
+        return fail(@"compute result buffer allocation");
+    }
+    *value = 0xbaadbaadu;
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> commands = [queue commandBuffer];
+    commands.label = @"compute-sentinel";
+    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+    if (!encoder) {
+        return fail(@"compute encoder");
+    }
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:result offset:0 atIndex:0];
+    MTLSize oneThread = MTLSizeMake(1, 1, 1);
+    [encoder dispatchThreadgroups:oneThread threadsPerThreadgroup:oneThread];
+    [encoder endEncoding];
+    if (!complete(commands)) {
+        return 1;
+    }
+    BOOL passed = *value == 0xc0ffee42u;
+    dprintf(consoleFD, "AGATE METAL: compute-sentinel %s value=%#x\n", passed ? "PASS" : "FAIL", *value);
+    return passed ? 0 : 1;
+}
+
 static int render(id<MTLDevice> device)
 {
     NSError *error = nil;
@@ -183,10 +230,10 @@ static int render(id<MTLDevice> device)
         return fail(error.localizedDescription ?: @"precompiled shader library");
     }
 
-    int baseline = renderTriangle(device, library, @"baseline", @"vs", NO);
-    int position = renderTriangle(device, library, @"explicit-position", @"vs_with_position", NO);
+    int compute = computeSentinel(device, library);
     int vertexBuffer = renderTriangle(device, library, @"vertex-buffer", @"vs_with_position", YES);
-    return baseline && position && vertexBuffer;
+    int generated = renderTriangle(device, library, @"vertex-id", @"vs_generated", NO);
+    return compute || vertexBuffer || generated;
 }
 
 int main(void)
