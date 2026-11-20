@@ -1,0 +1,53 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6886,10 +6886,15 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET) && CONFIG_BASESYSTEMROOT
+ 	int agate_gpu_mode = 0;
+-	if (PE_parse_boot_argn("agategpu", &agate_gpu_mode, sizeof(agate_gpu_mode)) && agate_gpu_mode == 7) {
++	if (PE_parse_boot_argn("agategpu", &agate_gpu_mode, sizeof(agate_gpu_mode)) &&
++	    (agate_gpu_mode == 7 || agate_gpu_mode == 6)) {
++		/* 7: the pilot volume at /Developer. 6 (0545): the same volume as a read-only union mount over
++		 * /System/Library/Extensions, so Metal itself finds VivaMTLDriver.bundle next to Apple's bundles
++		 * (nothing is written to the iOS volume), and the system suite runs on the system Metal device. */
++		const char *where = agate_gpu_mode == 6 ? "/System/Library/Extensions" : "/Developer";
+ 		vfs_context_t ctx = vfs_context_kernel();
+ 		vnode_t developer;
+-		error = vnode_lookup("/Developer", VNODE_LOOKUP_NOFOLLOW, &developer, ctx);
++		error = vnode_lookup(where, VNODE_LOOKUP_NOFOLLOW, &developer, ctx);
+ 		if (!error) {
+ 			if (vnode_isvroot(developer) || !vnode_isdir(developer)) {
+ 				error = EBUSY;
+@@ -6901,13 +6906,15 @@
+ 			 * mounts the boot ADT's RAMDisk at /Developer and keeps / on UFS. */
+ 			char device[] = "/dev/md0";
+ 			char *device_path = device;
+-			error = kernel_mount("hfs", NULLVP, NULLVP, "/Developer", &device_path, 0,
+-			    MNT_RDONLY | MNT_DONTBROWSE | MNT_NOSUID | MNT_NODEV,
++			error = kernel_mount("hfs", NULLVP, NULLVP, where, &device_path, 0,
++			    MNT_RDONLY | MNT_DONTBROWSE | MNT_NOSUID | MNT_NODEV | (agate_gpu_mode == 6 ? MNT_UNION : 0),
+ 			    KERNEL_MOUNT_NOAUTH | KERNEL_MOUNT_BASESYSTEMROOT, ctx);
+ 		}
+ 		if (!error) {
+-			printf("AGATE METAL: mounted diagnostic RAM volume read-only\n");
+-			error = load_init_program_at_path(p, (user_addr_t)scratch_addr, "/Developer/metal-init");
++			printf("AGATE METAL: mounted diagnostic RAM volume read-only%s\n",
++			    agate_gpu_mode == 6 ? " (union over /System/Library/Extensions)" : "");
++			error = load_init_program_at_path(p, (user_addr_t)scratch_addr, agate_gpu_mode == 6 ?
++			    "/System/Library/Extensions/metal-init" : "/Developer/metal-init");
+ 			if (!error) {
+ 				return;
+ 			}
+diff --git a/bsd/dev/ruby_probe.c b/bsd/dev/ruby_probe.c
+--- a/bsd/dev/ruby_probe.c
++++ b/bsd/dev/ruby_probe.c
+@@ -774,7 +774,7 @@
+ 		printf("RUBY WDT: not mapped\n");
+ 		return 1;
+ 	}
+-	if (PE_parse_boot_argn("agategpu", &agate_gpu_mode, sizeof(agate_gpu_mode)) && agate_gpu_mode == 7) {
++	if (PE_parse_boot_argn("agategpu", &agate_gpu_mode, sizeof(agate_gpu_mode)) && agate_gpu_mode >= 6) {
+ 		extern bool agate_rtc_mark_fastboot(void);
+ 		if (!agate_rtc_mark_fastboot()) {
+ 			printf("RUBY WDT: Agate RTC Fastboot marker could not be verified\n");
