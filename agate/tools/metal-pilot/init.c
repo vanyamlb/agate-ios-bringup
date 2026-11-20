@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 /* This signed program runs once from the diagnostic RAM volume.
@@ -18,7 +19,13 @@ int main(int argc, char **argv)
                 close(fd);
             }
         }
-        execl("/Developer/metal-smoke", "metal-smoke", (char *)NULL);
+        /* agategpu=7 starts /Developer/metal-init (pilot), agategpu=6 the copy in /System/Library/Extensions,
+         * where the volume is a union mount and Metal finds the driver itself. */
+        if (strncmp(argv[0], "/Developer/", 11) == 0) {
+            execl("/Developer/metal-smoke", "metal-smoke", (char *)NULL);
+        } else {
+            execl("/System/Library/Extensions/metal-smoke", "metal-smoke", "--system-suite", (char *)NULL);
+        }
         dprintf(STDERR_FILENO, "AGATE METAL: starting metal-smoke failed\n");
         _exit(127);
     }

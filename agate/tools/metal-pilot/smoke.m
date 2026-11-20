@@ -638,11 +638,15 @@ static int runCase(Test test, BOOL systemDevice)
     }
 }
 
+static BOOL systemSuite;
+
 static int runWorker(const char *binary, unsigned index)
 {
     char number[16];
     snprintf(number, sizeof(number), "%u", index);
-    char *argv[] = {(char *)binary, "--case", number, NULL};
+    char *pilotArgv[] = {(char *)binary, "--case", number, NULL};
+    char *systemArgv[] = {(char *)binary, "--system-device", "--case", number, NULL};
+    char **argv = systemSuite ? systemArgv : pilotArgv;
     pid_t pid;
     if (posix_spawn(&pid, binary, NULL, NULL, argv, environ) != 0) {
         return workerError;
@@ -676,7 +680,10 @@ int main(int argc, char **argv)
     if (logFD < 0) {
         logFD = STDERR_FILENO;
     }
-    const char *worker = "/Developer/metal-smoke";
+    /* agategpu=6: the RAM volume is a read-only union mount over /System/Library/Extensions, the driver is found
+     * by Metal itself (MetalPluginName) and every case runs on MTLCreateSystemDefaultDevice(). */
+    systemSuite = argc == 2 && strcmp(argv[1], "--system-suite") == 0;
+    const char *worker = systemSuite ? "/System/Library/Extensions/metal-smoke" : "/Developer/metal-smoke";
 #endif
     if (argc == caseArg + 2 && strcmp(argv[caseArg], "--case") == 0) {
         char *end;
@@ -690,10 +697,16 @@ int main(int argc, char **argv)
             return runCase(testAt(caseNumber), systemDevice);
         }
     }
-    if (argc != 1) {
+    if (argc != 1 && !systemSuite) {
         return workerError;
     }
     dprintf(logFD, "AGATE MATRIX start tests=%u\n", testCount);
+    if (systemSuite) {
+        /* no shader cache or statistics files on the iOS volume */
+        setenv("VMG_NO_AIR_CACHE", "1", 1);
+        setenv("VMG_NO_SHM_STATS", "1", 1);
+        dprintf(logFD, "AGATE MATRIX mode=system-device worker=%s\n", worker);
+    }
 #if !AGATE_MATRIX_HOST
     mach_port_t gpu = MACH_PORT_NULL;
     for (unsigned second = 0; second < 180 && gpu == MACH_PORT_NULL; ++second) {
