@@ -1,0 +1,101 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -40,6 +40,8 @@
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" int cpu_number(void);
+ extern "C" bool agate_vsram_proc1(int sel, uint16_t *rg, uint16_t *da);
++extern "C" bool agate_pmic_topstatus(uint16_t *status);
++extern "C" void sweet_hid_key(int key, int down);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -150,6 +152,10 @@
+ 	uint32_t fTeMisses;
+ 	uint64_t fStatStart, fStatReadyNs, fStatCopyNs, fStatTeNs, fStatReadyMax, fStatCopyMax, fStatTeMax;
+ 	uint32_t fStatFrames, fStatBusy, fStatLines;    /* 0556: per-second present statistics */
++	IOTimerEventSource *fKeys;    /* 0557: side / volume-down keys from MT6359P TOPSTATUS every 30 ms */
++	int fKeyPower, fKeyDown;
++	uint32_t fKeyLog;
++	static void keysFired(OSObject *owner, IOTimerEventSource *sender);
+ 	uint32_t fVsyncUs;            /* 0554: the panel's measured TE period once TE sync is on (0: 60 Hz) */
+ 	bool panelReady(void);        /* fPresentLock held */
+ 	void fadePanel(void);
+@@ -540,6 +546,15 @@
+ 				    agateCpuKhz(apmixed[0x21c / 4], mcucfg[0x2b0 / 4]) / 1000);
+ 			}
+ 		}
++	}
++	/*
++	 * 0557: the agate port had no MediaTek key driver (the inherited one reads a Qualcomm PMIC), so the
++	 * side button did nothing. Poll MT6359P TOPSTATUS like Android's mtk-pmic-keys does on interrupt.
++	 */
++	fKeys = IOTimerEventSource::timerEventSource(this, &AppleCLCD::keysFired);
++	if (fKeys != NULL && fWorkLoop->addEventSource(fKeys) == kIOReturnSuccess) {
++		fKeys->setTimeoutMS(2000);
++		IOLog("AGATE KEYS: side and volume-down keys from MT6359P TOPSTATUS\n");
+ 	}
+ 	fVsync->setTimeoutUS(fVsyncUs ? fVsyncUs : SWEET_FB_VSYNC_US);
+ 
+@@ -553,6 +568,36 @@
+ }
+ 
+ void
++AppleCLCD::keysFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	uint16_t st = 0;
++	if (agate_pmic_topstatus(&st)) {
++		const int power = !(st & 0x2), down = !(st & 0x8);
++		if (fb->fKeyLog == 0) {
++			/* first reading: take it as the idle state, send nothing (a wrong polarity cannot hold a key) */
++			fb->fKeyLog = 1;
++			fb->fKeyPower = power;
++			fb->fKeyDown = down;
++			IOLog("AGATE KEYS: first TOPSTATUS %#x (side %d volume-down %d taken as released)\n", st, power, down);
++		} else if (power != fb->fKeyPower || down != fb->fKeyDown) {
++			if (fb->fKeyLog++ < 200) {
++				IOLog("AGATE KEYS: TOPSTATUS %#x side %d volume-down %d\n", st, power, down);
++			}
++			if (power != fb->fKeyPower) {
++				sweet_hid_key(0, power);
++			}
++			if (down != fb->fKeyDown) {
++				sweet_hid_key(2, down);
++			}
++			fb->fKeyPower = power;
++			fb->fKeyDown = down;
++		}
++	}
++	sender->setTimeoutMS(30);
++}
++
++void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+--- a/bsd/dev/agate_conninfra/agate_conninfra.c
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -260,6 +260,21 @@
+ 	return ok;
+ }
+ 
++/*
++ * 0557: MT6359P TOPSTATUS (0x2a) for the side and volume-down keys: agate mtk-pmic-keys reads
++ * PWRKEY_DEB bit 1 and HOMEKEY_DEB bit 3 (0 = pressed). Over SWINF_2 like the RTC/VSRAM helpers.
++ */
++bool
++agate_pmic_topstatus(uint16_t *status)
++{
++	if (!pw_acquire()) {
++		return false;
++	}
++	const bool ok = pw_read(0x2a, status) == 0;
++	pw_release();
++	return ok;
++}
++
+ #define VCN13_CON0  0x1c1c
+ #define VCN18_CON0  0x1c2e
+ #define LDO_EN      0x0001
