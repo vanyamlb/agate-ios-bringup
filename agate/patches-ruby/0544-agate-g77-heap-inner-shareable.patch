@@ -1,0 +1,69 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -198,6 +198,10 @@
+ #define PTE_PAGE                3ull
+ #define PTE_AP_UNPRIV           (1ull << 6)
+ #define PTE_SH_IS               (3ull << 8)
++/* Software-only (stripped before the PTE is written): keep PTE_SH_IS on G77. agate r32p1 maps the tiler heap
++ * BASE_MEM_COHERENT_LOCAL -> KBASE_REG_SHARE_IN -> SHARE_INNER_BITS; on v9 the tiler reads the positions the shader
++ * cores write into the heap within the same Malloc Vertex job and sees them only through inner-shareable memory. */
++#define PTE_SW_INNER_SHARED     (1ull << 63)
+ #define PTE_AF                  (1ull << 10)
+ #define PTE_NG                  (1ull << 11)
+ #define PTE_XN                  (3ull << 53)
+@@ -640,9 +644,10 @@
+ 			}
+ 			uint32_t first = (uint32_t)(cur >> 12) & 511, n = 0;
+ 			while (off < seg && first + n < 512) {
+-				const uint64_t entry = ((pa + off) & PTE_ADDR) | pte | PTE_PAGE;
++				const uint64_t entry = ((pa + off) & PTE_ADDR) | (pte & ~PTE_SW_INNER_SHARED) | PTE_PAGE;
+ 				if (g77) {
+-					setG77Pte(l3, first + n, entry & ~(PTE_SH_IS | PTE_NG | (1ull << 53)));
++					const uint64_t strip = PTE_NG | (1ull << 53) | ((pte & PTE_SW_INNER_SHARED) ? 0 : PTE_SH_IS);
++					setG77Pte(l3, first + n, entry & ~strip);
+ 				} else {
+ 					l3[first + n] = entry;
+ 				}
+@@ -842,7 +847,8 @@
+ 		return false;
+ 	}
+ 	cacheBuffer(c, 0, len, kVivaCacheFlush);
+-	if (!vm->map(va + (uint64_t)idx * HEAP_CHUNK, c, 0, len, PTE_AP_UNPRIV | PTE_SH_IS | PTE_AF | PTE_NG | PTE_XN)) {
++	if (!vm->map(va + (uint64_t)idx * HEAP_CHUNK, c, 0, len, PTE_AP_UNPRIV | PTE_SH_IS | PTE_AF | PTE_NG | PTE_XN |
++	    (coherentLocal ? PTE_SW_INNER_SHARED : 0))) {
+ 		c->release();
+ 		vm->gpu->chargeMemory(vm, -(int64_t)HEAP_CHUNK);
+ 		return false;
+@@ -2380,14 +2386,17 @@
+ VivaGPUAccelerator::pilotHeapCreated(VivaGPUBO *b)
+ {
+ 	static uint32_t created;
+-	uint32_t pre = 0;
++	uint32_t pre = 0, sh = 1;
+ 	PE_parse_boot_argn("agateheappre", &pre, sizeof(pre));
++	PE_parse_boot_argn("agateheapsh", &sh, sizeof(sh));       /* 0544: 1 (default) every heap, 2 every second, 0 none */
+ 	const uint32_t n = created++;
++	b->coherentLocal = sh == 1 || (sh == 2 && (n & 1) != 0);
+ 	const bool commit = pre == 1 || (pre == 2 && (n & 1) != 0);
+ 	const bool ok = commit && b->growHeap(b->va);
+ 	if (n < 200) {
+-		IOLog("AGATE G77 heap %u of %s[%d]: va %#llx, %llu MiB, chunk 0 %s\n", n, b->vm->proc, b->vm->pid, b->va,
+-		    b->vaSize >> 20, !commit ? "lazy (on fault)" : ok ? "PRE-MAPPED" : "pre-map FAILED");
++		IOLog("AGATE G77 heap %u of %s[%d]: va %#llx, %llu MiB, chunk 0 %s, %s\n", n, b->vm->proc, b->vm->pid, b->va,
++		    b->vaSize >> 20, !commit ? "lazy (on fault)" : ok ? "PRE-MAPPED" : "pre-map FAILED",
++		    b->coherentLocal ? "INNER-SHAREABLE" : "non-shareable (old)");
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -173,6 +173,7 @@
+ 	VivaGPUFence       *busy;       /* fence of the last job using it (it signals after every earlier one) */
+ 	IOBufferMemoryDescriptor **chunks;      /* heap: one per 2 MiB of VA, NULL until the GPU faults on it */
+ 	uint32_t            chunkCount;
++	bool                coherentLocal;  /* 0544: heap chunks inner shareable on G77 (kbase BASE_MEM_COHERENT_LOCAL) */
+ 	SweetSurface       *surface;
+ 	IOMemoryMap        *kmap;       /* kernel mapping for cache maintenance (non-buffer memory) */
+ };
