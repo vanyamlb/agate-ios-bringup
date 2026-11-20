@@ -1,0 +1,62 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 41b8c03..3efe420 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -2161,6 +2161,46 @@ VivaGPUAccelerator::jobStarted(uint32_t slot, VivaGPUJob *job, uint64_t at, bool
+ 	}
+ }
+ 
++/* Mesa Valhall v9 packs Vertex Array at byte 136 of Malloc Vertex Job.
++ * The driver emits a zero array address; the GPU fills it during allocation.
++ * Sample only the retained command BO, and never follow the GPU's pointers. */
++static void
++logPilotVertexWriteback(const VivaGPUJob *job)
++{
++	constexpr unsigned typeWord = 4;
++	constexpr unsigned mallocVertexType = 11;
++	constexpr unsigned vertexArrayWord = 136 / sizeof(uint32_t);
++	uint32_t words[vertexArrayWord + 3];
++	if (job->bos == NULL || (job->jc & 127u) != 0) {
++		return;
++	}
++	for (unsigned int i = 0; i < job->bos->getCount(); i++) {
++		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
++		if (bo->kind != kVivaBONormal || bo->vm != job->vm || bo->memOffset != 0 || job->jc < bo->va) {
++			continue;
++		}
++		IOBufferMemoryDescriptor *memory = OSDynamicCast(IOBufferMemoryDescriptor, bo->memory);
++		if (memory == NULL || memory->getBytesNoCopy() == NULL) {
++			continue;
++		}
++		const uint64_t offset = job->jc - bo->va;
++		const uint64_t limit = MIN(bo->size, memory->getLength());
++		if (offset > limit || limit - offset < sizeof(words)) {
++			continue;
++		}
++		cacheBuffer(memory, offset, sizeof(words), kVivaCacheFlush);
++		memcpy(words, (const uint8_t *)memory->getBytesNoCopy() + offset, sizeof(words));
++		if (((words[typeWord] >> 1) & 0x7fu) == mallocVertexType) {
++			const bool allocated = ((words[vertexArrayWord] & ~0x3fu) | words[vertexArrayWord + 1]) != 0;
++			const uint32_t strides = words[vertexArrayWord + 2];
++			IOLog("AGATE GPU: pilot vertex writeback status %#x packet-address %u packet-stride %u attribute-stride %u\n",
++			    words[0], (unsigned)allocated, strides & 0xffffu, strides >> 16);
++		}
++		return;
++	}
++	IOLog("AGATE GPU: pilot vertex writeback command BO unavailable\n");
++}
++
+ void
+ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status, uint64_t at)
+ {
+@@ -2179,6 +2219,10 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status,
+ 		fExecSum += at - job->startAt;
+ 	}
+ 	stateUpdate(at);
++	if (fMode == 7 && fJobs <= 32 && slot == 1 && error == kIOReturnSuccess &&
++	    strcmp(job->vm->proc, "metal-smoke") == 0) {
++		logPilotVertexWriteback(job);
++	}
+ 	if (fMode == 7 && fJobs <= 8) {
+ 		const uint32_t tilerReady = fPowered ? rd(GPU_TILER_READY_LO) : 0;
+ 		IOLog("AGATE GPU: pilot job slot %u req %#x done status %#x error %#x "

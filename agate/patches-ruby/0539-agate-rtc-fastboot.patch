@@ -1,0 +1,171 @@
+diff --git a/bsd/dev/agate_conninfra/agate_conninfra.c b/bsd/dev/agate_conninfra/agate_conninfra.c
+index 7090e02..75b2703 100644
+--- a/bsd/dev/agate_conninfra/agate_conninfra.c
++++ b/bsd/dev/agate_conninfra/agate_conninfra.c
+@@ -116,6 +116,29 @@ consys_reg_mng_dump_cpupcr(enum conn_dump_cpupcr_type t, int times, unsigned lon
+ #define PW_FSM_WFVLDCLR 6
+ 
+ static vm_offset_t ac_pw;
++static uint32_t ac_pw_busy;
++
++static void
++pw_release(void)
++{
++	__atomic_store_n(&ac_pw_busy, 0, __ATOMIC_RELEASE);
++}
++
++static bool
++pw_acquire(void)
++{
++	if (__atomic_exchange_n(&ac_pw_busy, 1, __ATOMIC_ACQUIRE)) {
++		return false;
++	}
++	if (ac_pw == 0) {
++		ac_pw = ml_io_map(PW_PA, 0x1000);
++	}
++	if (ac_pw == 0) {
++		pw_release();
++		return false;
++	}
++	return true;
++}
+ 
+ static int
+ pw_wait(uint32_t fsm)
+@@ -154,6 +177,63 @@ pw_write(uint16_t adr, uint16_t val)
+ 	return pw_wait(PW_FSM_IDLE);
+ }
+ 
++/* MT6359P RTC on the live agate FDT: base 0x580, BBPU at +0x08,
++ * PDN1 at +0x34, PROT at +0x3c, WRTGR at +0x42. Android sets PDN1[13]. */
++#define AGATE_RTC_BBPU      0x0588u
++#define AGATE_RTC_PDN1      0x05b4u
++#define AGATE_RTC_PROT      0x05bcu
++#define AGATE_RTC_WRTGR     0x05c2u
++#define AGATE_RTC_CBUSY     (1u << 6)
++#define AGATE_RTC_FASTBOOT  (1u << 13)
++
++static bool
++ac_rtc_wait_idle(void)
++{
++	for (unsigned attempt = 0; attempt < 250; ++attempt) {
++		uint16_t bbpu;
++		if (pw_read(AGATE_RTC_BBPU, &bbpu)) {
++			return false;
++		}
++		if (!(bbpu & AGATE_RTC_CBUSY)) {
++			return true;
++		}
++		delay(1000);
++	}
++	return false;
++}
++
++static bool
++ac_rtc_commit(uint16_t reg, uint16_t value)
++{
++	return pw_write(reg, value) == 0 && pw_write(AGATE_RTC_WRTGR, 1) == 0 && ac_rtc_wait_idle();
++}
++
++/* Only the gated agate bootloader-restart command calls this. The shared
++ * SWINF_2 owner also covers Wi-Fi's one-time PMIC supply setup. */
++bool
++agate_rtc_mark_fastboot(void)
++{
++	uint16_t before, after;
++	if (!pw_acquire()) {
++		return false;
++	}
++	bool marked = false;
++	if (ac_rtc_wait_idle() && pw_read(AGATE_RTC_PDN1, &before) == 0) {
++		if (before & AGATE_RTC_FASTBOOT) {
++			marked = true;
++		} else {
++			const uint16_t target = before | AGATE_RTC_FASTBOOT;
++			marked = ac_rtc_commit(AGATE_RTC_PROT, 0x586a) &&
++			    ac_rtc_commit(AGATE_RTC_PROT, 0x9136) &&
++			    ac_rtc_commit(AGATE_RTC_PDN1, target);
++			const bool protected = ac_rtc_commit(AGATE_RTC_PROT, 0);
++			marked = marked && protected && pw_read(AGATE_RTC_PDN1, &after) == 0 && after == target;
++		}
++	}
++	pw_release();
++	return marked;
++}
++
+ #define VCN13_CON0  0x1c1c
+ #define VCN18_CON0  0x1c2e
+ #define LDO_EN      0x0001
+@@ -1115,8 +1195,7 @@ agate_conninfra_a2a(int step)
+ 	if (ac_map()) {
+ 		return -1;
+ 	}
+-	ac_pw = ml_io_map(PW_PA, 0x1000);
+-	if (!ac_pw) {
++	if (!pw_acquire()) {
+ 		return -1;
+ 	}
+ 	extern void agate_gpu_vsram_probe(int (*read_reg)(uint16_t, uint16_t *));
+@@ -1140,6 +1219,7 @@ agate_conninfra_a2a(int step)
+ 	/* the Wi-Fi's 3.3 V supplies (consys_hw_wifi_power_ctl when the Wi-Fi is turned on) */
+ 	ac_vcn33("VCN33_1", 0x1be2, 0x1be6, 0x1bea, 0x1bf4, 0x1f98);
+ 	ac_vcn33("VCN33_2", 0x1c08, 0x1c0c, 0x1c10, 0x1c1a, 0x1f9c);
++	pw_release();
+ 	/* POS part 2 */
+ 	consys_set_if_pinmux_mt6893(1);
+ 	STEP("conninfra_on_power", consys_conninfra_on_power_ctrl_mt6893(1));
+diff --git a/bsd/dev/ruby_probe.c b/bsd/dev/ruby_probe.c
+index a7cf26d..5d89c07 100644
+--- a/bsd/dev/ruby_probe.c
++++ b/bsd/dev/ruby_probe.c
+@@ -98,6 +98,8 @@ extern int sweet_goodix_cmd(char *cmd);
+ #define PR_WDT_MODE_AUTO  (1u << 4)
+ #define PR_WDT_SWRST_KEY 0x1209u
+ #define PR_BOOT_BOOTLOADER 3u
++#define PR_AGATE_WDT_BYPASS_PWRKEY (1u << 13)
++#define PR_AGATE_WDT_MODE_CLEAR ((1u << 3) | (1u << 4) | (1u << 6) | (1u << 7))
+ 
+ /*
+  * R0 read-only map.  These offsets are taken from the vendor drivers:
+@@ -772,6 +774,23 @@ pr_reboot_bootloader(void)
+ 		printf("RUBY WDT: not mapped\n");
+ 		return 1;
+ 	}
++	if (PE_parse_boot_argn("agategpu", &agate_gpu_mode, sizeof(agate_gpu_mode)) && agate_gpu_mode == 7) {
++		extern bool agate_rtc_mark_fastboot(void);
++		if (!agate_rtc_mark_fastboot()) {
++			printf("RUBY WDT: Agate RTC Fastboot marker could not be verified\n");
++			return 1;
++		}
++		/* Match agate Android 4.14's wd_api.c and wdt_v2: RTC selects
++		 * Fastboot. NONRST2 bit 13 is clear for a bootloader reset. */
++		pr_wr32(pr.wdt, PR_WDT_RST, PR_WDT_RST_ALT);
++		old = pr_rd32(pr.wdt, PR_WDT_NONRST2);
++		pr_wr32(pr.wdt, PR_WDT_NONRST2, old & ~PR_AGATE_WDT_BYPASS_PWRKEY);
++		mode = pr_rd32(pr.wdt, PR_WDT_MODE) & (0x00ffffffu & ~PR_AGATE_WDT_MODE_CLEAR);
++		pr_wr32(pr.wdt, PR_WDT_MODE, mode | PR_WDT_MODE_KEY | PR_WDT_MODE_EXTEN);
++		printf("RUBY WDT: Agate RTC Fastboot marker verified; TOPRGU reset\n");
++		pr_wr32(pr.wdt, PR_WDT_SWRST, PR_WDT_SWRST_KEY);
++		return 1;
++	}
+ 	old = pr_rd32(pr.wdt, PR_WDT_NONRST2);
+ 	new = (old & ~0xfu) | PR_BOOT_BOOTLOADER;
+ 	pr_wr32(pr.wdt, PR_WDT_NONRST2, new);
+@@ -782,14 +801,9 @@ pr_reboot_bootloader(void)
+ 		printf("RUBY WDT: bootloader mode readback failed\n");
+ 		return 1;
+ 	}
+-	if (PE_parse_boot_argn("agategpu", &agate_gpu_mode, sizeof(agate_gpu_mode)) && agate_gpu_mode == 7) {
+-		/* Agate's pilot rebooted to XNU via PSCI after writing NONRST2. Use MT6893's TOPRGU restart. */
+-		printf("RUBY WDT: Agate diagnostic TOPRGU reset\n");
+-	} else {
+-		printf("RUBY WDT: psci system reset\n");
+-		pr_psci_system_reset();
+-		printf("RUBY WDT: psci returned; swrst fallback\n");
+-	}
++	printf("RUBY WDT: psci system reset\n");
++	pr_psci_system_reset();
++	printf("RUBY WDT: psci returned; swrst fallback\n");
+ 	pr_wr32(pr.wdt, PR_WDT_RST, PR_WDT_RST_ALT);
+ 	mode = PR_WDT_MODE_KEY | PR_WDT_MODE_EXTEN | PR_WDT_MODE_AUTO;
+ 	pr_wr32(pr.wdt, PR_WDT_MODE, mode);

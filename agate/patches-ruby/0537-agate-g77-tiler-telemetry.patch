@@ -1,0 +1,30 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index e7aa00f..41b8c03 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -2180,8 +2180,12 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status,
+ 	}
+ 	stateUpdate(at);
+ 	if (fMode == 7 && fJobs <= 8) {
+-		IOLog("AGATE GPU: pilot job slot %u req %#x done status %#x error %#x\n",
+-		    slot, job->requirements, status, error);
++		const uint32_t tilerReady = fPowered ? rd(GPU_TILER_READY_LO) : 0;
++		IOLog("AGATE GPU: pilot job slot %u req %#x done status %#x error %#x "
++		    "tiler %#x/%#llx powered %u heap-replays %llu mmu-faults %llu\n",
++		    slot, job->requirements, status, error, tilerReady,
++		    (unsigned long long)fTilerPresent, (unsigned)fPowered,
++		    (unsigned long long)fHeapGrows, (unsigned long long)fMmuFaults);
+ 	}
+ 	if (error != kIOReturnSuccess) {
+ 		fJobFaults++;
+@@ -2332,6 +2336,10 @@ VivaGPUAccelerator::mmuInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 			VivaGPUBO *heap = self->findHeapBO(vm, addr);
+ 			if (heap != NULL && heap->growHeap(addr)) {
+ 				self->fHeapGrows++;
++				if (self->fMode == 7 && self->fHeapGrows <= 8) {
++					IOLog("AGATE GPU: tiler heap replay AS%u chunk %llu status %#x\n",
++					    as, (unsigned long long)((addr - heap->va) / HEAP_CHUNK), fs);
++				}
+ 				handled = true;
+ 			}
+ 		}
