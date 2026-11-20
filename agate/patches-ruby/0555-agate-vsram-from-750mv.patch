@@ -1,0 +1,12 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -505,7 +505,7 @@
+ 		for (int t = 0; at1459 && t < 100 && !(sram = agate_vsram_proc1(-1, &rg, &da)); t++) {
+ 			IODelay(1000);
+ 		}
+-		if (!at1459 || !sram || da < 0x38 || da > 0x60) {
++		if (!at1459 || !sram || da < 0x20 || da > 0x60) {      /* 0555: LK leaves Vsram_proc1 at 750 mV (0x28) */
+ 			IOLog("AGATE CPUBOOST2: not applied (from 1459 MHz %u, vsram read %u, vsram sel %#x/%#x)\n", at1459, sram, rg, da);
+ 		} else {
+ 			bool ok = agate_vsram_proc1(0x50, &rg, &da) && da == 0x50;          /* 1000 mV */
