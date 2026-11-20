@@ -1,0 +1,214 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -2207,8 +2207,171 @@
+ 		return;
+ 	}
+ 	IOLog("AGATE GPU: pilot vertex writeback command BO unavailable\n");
++}
++
++/*
++ * 0542 (agategpu=7, metal-smoke only): where does the triangle stop? The head descriptor of the first vertex/tiler
++ * and fragment chains, decoded by Mesa's v9.xml layout and dumped raw, the tiler context and heap descriptor they
++ * point at, and whether the tiler wrote anything into heap chunk 0 after each vertex/tiler chain. Read-only: the
++ * CPU reads the retained BOs after a cache clean+invalidate and never writes them.
++ */
++static unsigned gPilotHeadDumps[2], gPilotHeapProbes;
++
++static bool
++pilotRead(const VivaGPUJob *job, uint64_t gva, void *dst, uint32_t len)
++{
++	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
++		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
++		if (bo->kind != kVivaBONormal || bo->vm != job->vm || bo->memOffset != 0 || gva < bo->va) {
++			continue;
++		}
++		IOBufferMemoryDescriptor *memory = OSDynamicCast(IOBufferMemoryDescriptor, bo->memory);
++		if (memory == NULL || memory->getBytesNoCopy() == NULL) {
++			continue;
++		}
++		const uint64_t offset = gva - bo->va;
++		const uint64_t limit = MIN(bo->size, memory->getLength());
++		if (offset >= limit || limit - offset < len) {
++			continue;
++		}
++		cacheBuffer(memory, offset, len, kVivaCacheFlush);
++		memcpy(dst, (const uint8_t *)memory->getBytesNoCopy() + offset, len);
++		return true;
++	}
++	return false;
++}
++
++static void
++pilotHex(const char *what, const uint32_t *w, unsigned n)
++{
++	for (unsigned i = 0; i < n; i += 8) {
++		IOLog("AGATE G77 %s +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", what, i * 4,
++		    w[i], i + 1 < n ? w[i + 1] : 0, i + 2 < n ? w[i + 2] : 0, i + 3 < n ? w[i + 3] : 0,
++		    i + 4 < n ? w[i + 4] : 0, i + 5 < n ? w[i + 5] : 0, i + 6 < n ? w[i + 6] : 0, i + 7 < n ? w[i + 7] : 0);
++	}
++}
++
++static inline uint64_t
++pilotQ(const uint32_t *w, unsigned i)
++{
++	return (uint64_t)w[i] | (uint64_t)w[i + 1] << 32;
+ }
+ 
++static void
++pilotDumpHead(const VivaGPUJob *job, uint32_t slot)
++{
++	uint32_t w[96];
++	const unsigned n = slot == 1 ? 96 : 16;
++	if (!pilotRead(job, job->jc, w, n * 4)) {
++		IOLog("AGATE G77 head slot %u: chain %#llx not in a readable BO of the job\n", slot, job->jc);
++		return;
++	}
++	const uint32_t type = (w[4] >> 1) & 0x7f;
++	IOLog("AGATE G77 head slot %u pid %d chain %#llx: type %u status %#x next %#llx\n", slot, job->vm->pid,
++	    job->jc, type, w[0], pilotQ(w, 6));
++	pilotHex(slot == 1 ? "vtx" : "frag", w, n);
++	if (slot == 1 && (type == 11 || type == 7)) {
++		IOLog("AGATE G77 draw: mode %u index-type %u prim-flags %#x base-vertex %d instance-offset %u count %u "
++		    "instances %u alloc %#x tiler %#llx scissor %u,%u-%u,%u indices %#llx\n",
++		    w[8] & 0xff, (w[8] >> 8) & 7, w[8], (int)w[9], w[10], w[11], w[12], w[13], pilotQ(w, 14),
++		    w[26] & 0xffff, w[26] >> 16, w[27] & 0xffff, w[27] >> 16, pilotQ(w, 30));
++		IOLog("AGATE G77 dcd: flags0 %#x flags1 %#x varray %08x %08x %08x z %08x..%08x zs %#llx blend %#llx "
++		    "occlusion %#llx frag-shader %#llx\n", w[32], w[33], w[34], w[35], w[36], w[38], w[39],
++		    pilotQ(w, 42), pilotQ(w, 44), pilotQ(w, 46), pilotQ(w, 58));
++		if (type == 11) {
++			IOLog("AGATE G77 env: position res %#llx shader %#llx tls %#llx fau %#llx (%u); varying res %#llx "
++			    "shader %#llx tls %#llx fau %#llx (%u)\n", pilotQ(w, 72), pilotQ(w, 74), pilotQ(w, 76),
++			    pilotQ(w, 78), w[65] & 0xff, pilotQ(w, 88), pilotQ(w, 90), pilotQ(w, 92), pilotQ(w, 94),
++			    w[81] & 0xff);
++		}
++		uint32_t t[48];
++		const uint64_t tiler = pilotQ(w, 14);
++		if (tiler != 0 && pilotRead(job, tiler, t, sizeof(t))) {
++			IOLog("AGATE G77 tiler context: polygon-list %#llx hierarchy %#x fb %ux%u layers %u heap %#llx\n",
++			    pilotQ(t, 0), t[2] & 0x1fff, (t[3] & 0xffff) + 1, (t[3] >> 16) + 1, (t[4] & 0xff) + 1,
++			    pilotQ(t, 6));
++			pilotHex("tctx", t, 16);
++			uint32_t h[8];
++			if (pilotQ(t, 6) != 0 && pilotRead(job, pilotQ(t, 6), h, sizeof(h))) {
++				IOLog("AGATE G77 tiler heap: word0 %#x size %u base %#llx bottom %#llx top %#llx\n", h[0], h[1],
++				    pilotQ(h, 2), pilotQ(h, 4), pilotQ(h, 6));
++			} else {
++				IOLog("AGATE G77 tiler heap descriptor unreadable\n");
++			}
++		} else {
++			IOLog("AGATE G77 tiler context %#llx unreadable\n", tiler);
++		}
++	} else if (slot == 0 && type == 9) {
++		const uint64_t fb = pilotQ(w, 10) & ~63ull;
++		IOLog("AGATE G77 fragment: bounds %u,%u-%u,%u fbd %#llx (rt %u)\n", w[8] & 0xfff, (w[8] >> 16) & 0xfff,
++		    w[9] & 0xfff, (w[9] >> 16) & 0xfff, fb, ((w[10] >> 2) & 0xf) + 1);
++		uint32_t f[32];
++		if (fb != 0 && pilotRead(job, fb, f, sizeof(f))) {
++			pilotHex("fbd", f, 32);
++		}
++	}
++}
++
++/* After a vertex/tiler chain: did the tiler write into the first heap chunk? */
++static void
++pilotHeapProbe(const VivaGPUJob *job)
++{
++	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
++		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
++		if (bo->kind != kVivaBOHeap || bo->vm != job->vm) {
++			continue;
++		}
++		IOBufferMemoryDescriptor *c = bo->chunkCount > 0 ? bo->chunks[0] : NULL;
++		uint32_t mapped = 0;
++		for (uint32_t k = 0; k < bo->chunkCount; k++) {
++			mapped += bo->chunks[k] != NULL;
++		}
++		if (c == NULL || c->getBytesNoCopy() == NULL) {
++			IOLog("AGATE G77 heap after JS1 pid %d: heap %#llx chunk 0 not mapped (%u of %u chunks mapped)\n",
++			    job->vm->pid, bo->va, mapped, bo->chunkCount);
++			return;
++		}
++		const uint32_t len = (uint32_t)c->getLength();
++		cacheBuffer(c, 0, len, kVivaCacheFlush);
++		const uint32_t *p = (const uint32_t *)c->getBytesNoCopy();
++		uint32_t nonzero = 0, first = UINT32_MAX, last = 0;
++		for (uint32_t k = 0; k < len / 4; k++) {
++			if (p[k] != 0) {
++				nonzero++;
++				first = MIN(first, k);
++				last = k;
++			}
++		}
++		IOLog("AGATE G77 heap after JS1 pid %d: heap %#llx, %u of %u chunks mapped, chunk 0: %u nonzero words "
++		    "(first +%#x last +%#x)\n", job->vm->pid, bo->va, mapped, bo->chunkCount, nonzero,
++		    first == UINT32_MAX ? 0 : first * 4, last * 4);
++		if (nonzero != 0) {
++			pilotHex("heap0", p + first, MIN(16u, len / 4 - first));
++		}
++		return;
++	}
++	IOLog("AGATE G77 heap after JS1 pid %d: no heap BO in the job\n", job->vm->pid);
++}
++
++/*
++ * 0542: agateheappre=1 maps the first 2 MiB chunk of every tiler heap when it is created, =2 of every second heap
++ * (one heap per Metal process: an A/B across the cases of one run), 0/absent: on the GPU's first fault (as before).
++ */
++void
++VivaGPUAccelerator::pilotHeapCreated(VivaGPUBO *b)
++{
++	static uint32_t created;
++	uint32_t pre = 0;
++	PE_parse_boot_argn("agateheappre", &pre, sizeof(pre));
++	const uint32_t n = created++;
++	const bool commit = pre == 1 || (pre == 2 && (n & 1) != 0);
++	const bool ok = commit && b->growHeap(b->va);
++	if (n < 200) {
++		IOLog("AGATE G77 heap %u of %s[%d]: va %#llx, %llu MiB, chunk 0 %s\n", n, b->vm->proc, b->vm->pid, b->va,
++		    b->vaSize >> 20, !commit ? "lazy (on fault)" : ok ? "PRE-MAPPED" : "pre-map FAILED");
++	}
++}
++
+ void
+ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status, uint64_t at)
+ {
+@@ -2230,6 +2393,16 @@
+ 	if (fMode == 7 && fJobs <= 32 && slot == 1 && error == kIOReturnSuccess &&
+ 	    strcmp(job->vm->proc, "metal-smoke") == 0) {
+ 		logPilotVertexWriteback(job);
++	}
++	if (fMode == 7 && slot < 2 && error == kIOReturnSuccess && strcmp(job->vm->proc, "metal-smoke") == 0) {
++		if (gPilotHeadDumps[slot] < (slot == 1 ? 3u : 2u)) {
++			gPilotHeadDumps[slot]++;
++			pilotDumpHead(job, slot);
++		}
++		if (slot == 1 && gPilotHeapProbes < 60) {
++			gPilotHeapProbes++;
++			pilotHeapProbe(job);
++		}
+ 	}
+ 	if (fMode == 7 && fJobs <= 8) {
+ 		const uint32_t tilerReady = fPowered ? rd(GPU_TILER_READY_LO) : 0;
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -253,6 +253,7 @@
+ 	VivaGPUBO *findHeapBO(VivaGPUVM *vm, uint64_t va);
+ 	void heapAdd(VivaGPUBO *bo);
+ 	void heapRemove(VivaGPUBO *bo);
++	void pilotHeapCreated(VivaGPUBO *bo);     /* 0542: agateheappre */
+ 	/* GPU memory accounting: false = over the per-process or global limit (nothing charged). */
+ 	bool chargeMemory(VivaGPUVM *vm, int64_t bytes);
+ 	void vmLink(VivaGPUVM *vm);
+diff --git a/iokit/Kernel/arm/VivaGPUUserClient.cpp b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+--- a/iokit/Kernel/arm/VivaGPUUserClient.cpp
++++ b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+@@ -583,6 +583,7 @@
+ 		}
+ 		if (heap) {
+ 			fGPU->heapAdd(b);
++			fGPU->pilotHeapCreated(b);
+ 		} else if (!fVM->map(b->va, b->memory, 0, size, VivaGPUVM::leafAttrs(exec))) {
+ 			b->release();
+ 			return kIOReturnNoMemory;
