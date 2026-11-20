@@ -1,4 +1,6 @@
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurface.h>
+#import <IOSurface/IOSurfaceObjC.h>
 #import <Metal/Metal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,11 +28,12 @@ extern kern_return_t IORegistryEntryGetRegistryEntryID(mach_port_t, uint64_t *);
 extern char **environ;
 
 enum { side = 16, width = side * 4, bufferWords = 32 };
+enum { surfaceStride = 256 };
 enum { pass = 0, mismatch = 1, unavailable = 2, timeout = 3, workerError = 4, resultCount };
 typedef enum {
     sentinel, bufferFill, imageFill, blit, clear, sample, blend, isa, noBounds,
     cpuCopy, singleRender, singleBlit, kernelWait, readCPUBuffer, readCPUImage,
-    sampleCPUImage, computeChain, privateRenderRead, draw, runtimeCompile
+    sampleCPUImage, computeChain, privateRenderRead, draw, runtimeCompile, surfaceWrite, surfaceRender
 } Operation;
 typedef struct {
     Operation operation;
@@ -49,12 +52,18 @@ static const char *const operationNames[] = {
     "sentinel", "buffer-fill", "texture-write", "blit", "clear-only", "texture-sample", "additive-blend",
     "direct-isa", "no-draw-bounds", "cpu-texture-copy", "single-submit-draw", "single-submit-blit",
     "kernel-wait-draw", "read-cpu-buffer", "read-cpu-texture", "sample-cpu-texture",
-    "gpu-write-read-texture", "private-render-compute-read", "render", "runtime-compile"
+    "gpu-write-read-texture", "private-render-compute-read", "render", "runtime-compile",
+    "iosurface-compute-write", "iosurface-render"
+};
+static const Test finalCases[] = {
+    {.operation = runtimeCompile},
+    {.operation = surfaceWrite, .format = 1},
+    {.operation = surfaceRender, .vertex = 1, .format = 1, .query = YES},
 };
 enum { vertexCount = sizeof(vertexFunctions) / sizeof(*vertexFunctions),
        formatCount = sizeof(formats) / sizeof(*formats),
        drawCaseEnd = draw + vertexCount * formatCount * 2 * 2 * 2,
-       testCount = drawCaseEnd + 1 };
+       testCount = drawCaseEnd + sizeof(finalCases) / sizeof(*finalCases) };
 static const char *const resultNames[] = {"pass", "mismatch", "unavailable", "timeout", "worker-error"};
 static const uint8_t red[4] = {255, 0, 0, 255};
 static const uint8_t blue[4] = {0, 0, 255, 255};
@@ -64,8 +73,8 @@ static int logFD;
 
 static Test testAt(unsigned index)
 {
-    if (index == drawCaseEnd) {
-        return (Test){.operation = runtimeCompile};
+    if (index >= drawCaseEnd) {
+        return finalCases[index - drawCaseEnd];
     }
     if (index < draw) {
         return (Test){.operation = index, .vertex = 1,
@@ -113,6 +122,28 @@ static id<MTLTexture> newTexture(id<MTLDevice> device, MTLPixelFormat format,
     return [device newTextureWithDescriptor:descriptor];
 }
 
+static id<MTLTexture> newSurfaceTexture(id<MTLDevice> device, MTLPixelFormat format,
+    MTLTextureUsage usage, IOSurface **backing)
+{
+    IOSurface *surface = [[IOSurface alloc] initWithProperties:@{
+        (__bridge NSString *)kIOSurfaceWidth: @(side),
+        (__bridge NSString *)kIOSurfaceHeight: @(side),
+        (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
+        (__bridge NSString *)kIOSurfaceBytesPerRow: @(surfaceStride),
+        (__bridge NSString *)kIOSurfaceAllocSize: @(side * surfaceStride),
+        (__bridge NSString *)kIOSurfacePixelFormat: @(0x42475241u),
+    }];
+    if (!surface) {
+        return nil;
+    }
+    *backing = surface;
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+        width:side height:side mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = usage;
+    return [device newTextureWithDescriptor:descriptor iosurface:(__bridge IOSurfaceRef)surface plane:0];
+}
+
 static void makePattern(uint8_t pixels[side][side][4])
 {
     for (unsigned y = 0; y < side; ++y) {
@@ -143,6 +174,7 @@ static int reportPixels(uint8_t pixels[side][side][4], Test test, uint64_t visib
     switch (test.operation) {
         case clear: valid = blues == side * side; break;
         case imageFill:
+        case surfaceWrite:
         case blit:
         case cpuCopy:
         case singleBlit:
@@ -168,6 +200,32 @@ static int inspectPixels(id<MTLTexture> target, Test test, uint64_t visible)
 {
     uint8_t pixels[side][side][4] = {};
     [target getBytes:pixels bytesPerRow:width fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0];
+    return reportPixels(pixels, test, visible);
+}
+
+static int inspectSurfacePixels(IOSurface *surface, Test test, uint64_t visible)
+{
+    IOSurfaceRef shared = (__bridge IOSurfaceRef)surface;
+    kern_return_t status = IOSurfaceLock(shared, kIOSurfaceLockReadOnly, NULL);
+    if (status != KERN_SUCCESS) {
+        dprintf(logFD, "AGATE MATRIX error case=%03u item=IOSurfaceLock status=%#x\n",
+            caseNumber, (unsigned)status);
+        return unavailable;
+    }
+    uint8_t pixels[side][side][4];
+    const uint8_t *source = IOSurfaceGetBaseAddress(shared);
+    const size_t stride = IOSurfaceGetBytesPerRow(shared);
+    const BOOL mapped = source != NULL && stride >= width &&
+        IOSurfaceGetAllocSize(shared) / side >= stride;
+    if (mapped) {
+        for (unsigned y = 0; y < side; ++y) {
+            memcpy(pixels[y], source + y * stride, width);
+        }
+    }
+    status = IOSurfaceUnlock(shared, kIOSurfaceLockReadOnly, NULL);
+    if (status != KERN_SUCCESS || !mapped) {
+        return reportUnavailable(@"IOSurface mapping or unlock", nil);
+    }
     return reportPixels(pixels, test, visible);
 }
 
@@ -255,7 +313,7 @@ static int verifyTextureInput(id<MTLDevice> device, id<MTLLibrary> library, id<M
 
 static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBuffer> commands, Test test)
 {
-    BOOL image = test.operation == imageFill;
+    BOOL image = test.operation == imageFill || test.operation == surfaceWrite;
     BOOL single = test.operation == sentinel || test.operation == runtimeCompile;
     BOOL cpuInput = test.operation == readCPUBuffer;
     NSString *function = image ? @"write_texture" : single ? @"write_sentinel" : cpuInput ? @"verify_buffer" : @"fill_buffer";
@@ -264,15 +322,22 @@ static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLComman
         return unavailable;
     }
     if (image) {
-        id<MTLTexture> target = newTexture(device, formats[0], side, MTLStorageModeShared, MTLTextureUsageShaderWrite);
+        IOSurface *surface = nil;
+        id<MTLTexture> target = test.operation == surfaceWrite ?
+            newSurfaceTexture(device, formats[test.format], MTLTextureUsageShaderWrite, &surface) :
+            newTexture(device, formats[0], side, MTLStorageModeShared, MTLTextureUsageShaderWrite);
         if (!target) {
-            return reportUnavailable(@"compute texture", nil);
+            return reportUnavailable(test.operation == surfaceWrite ?
+                (surface ? @"compute IOSurface import" : @"compute IOSurface allocation") : @"compute texture", nil);
         }
         [encoder setTexture:target atIndex:0];
         imageThreads(encoder);
         [encoder endEncoding];
         int result = complete(commands);
-        return result == pass ? inspectPixels(target, test, 0) : result;
+        if (result != pass) {
+            return result;
+        }
+        return surface ? inspectSurfacePixels(surface, test, 0) : inspectPixels(target, test, 0);
     }
     unsigned count = single ? 1 : bufferWords;
     id<MTLBuffer> output = [device newBufferWithLength:count * sizeof(uint32_t) options:MTLResourceStorageModeShared];
@@ -316,9 +381,15 @@ static int runDraw(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBu
 {
     MTLPixelFormat format = formats[test.format];
     BOOL computeRead = test.operation == privateRenderRead;
+    BOOL imported = test.operation == surfaceRender;
     MTLStorageMode storage = computeRead ? MTLStorageModePrivate : MTLStorageModeShared;
     MTLTextureUsage usage = MTLTextureUsageRenderTarget | (computeRead ? MTLTextureUsageShaderRead : 0);
-    id<MTLTexture> target = newTexture(device, format, side, storage, usage);
+    IOSurface *surface = nil;
+    id<MTLTexture> target = imported ? newSurfaceTexture(device, format, usage, &surface) :
+        newTexture(device, format, side, storage, usage);
+    if (!target && imported) {
+        return reportUnavailable(surface ? @"render IOSurface import" : @"render IOSurface allocation", nil);
+    }
     MTLRenderPassDescriptor *renderPass = [MTLRenderPassDescriptor renderPassDescriptor];
     renderPass.colorAttachments[0].texture = target;
     renderPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
@@ -421,7 +492,11 @@ static int runDraw(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBu
         return inspectImageThroughCompute(device, library, commands, target, test);
     }
     int result = complete(commands);
-    return result == pass ? inspectPixels(target, test, samples ? *samples : UINT64_MAX) : result;
+    if (result != pass) {
+        return result;
+    }
+    const uint64_t visible = samples ? *samples : UINT64_MAX;
+    return surface ? inspectSurfacePixels(surface, test, visible) : inspectPixels(target, test, visible);
 }
 
 static id<MTLLibrary> newRuntimeLibrary(id<MTLDevice> device, NSError **error)
@@ -548,6 +623,7 @@ static int runCase(Test test, BOOL systemDevice)
         case runtimeCompile:
         case bufferFill:
         case imageFill:
+        case surfaceWrite:
         case readCPUBuffer:
             return runCompute(device, library, commands, test);
         case blit:

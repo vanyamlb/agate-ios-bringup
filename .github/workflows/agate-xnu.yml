@@ -31,7 +31,7 @@ jobs:
           "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror \
             agate/tools/metal-pilot/init.c -o pilot/metal-init
           "$CC" -isysroot "$SDK" -target arm64-apple-ios16.0 -Oz -Wall -Wextra -Werror -fobjc-arc -Iuapi \
-            agate/tools/metal-pilot/smoke.m -framework Foundation -framework Metal -framework IOKit -o pilot/metal-smoke
+            agate/tools/metal-pilot/smoke.m -framework Foundation -framework Metal -framework IOSurface -framework IOKit -o pilot/metal-smoke
           cd pilot
           for f in metal-init metal-smoke; do
             codesign -s - --force "$f"
