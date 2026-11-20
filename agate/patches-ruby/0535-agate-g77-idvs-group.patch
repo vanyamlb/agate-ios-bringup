@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 5f65199..e7aa00f 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -120,6 +120,7 @@ extern "C" void agate_gpu_runtime_off(void);
+ #define GPU_STACK_READY_LO      0xe10
+ #define GPU_STACK_PWRON_LO      0xe20
+ #define GPU_STACK_PWROFF_LO     0xe30
++#define GPU_JM_CONFIG           0xf00
+ #define GPU_SHADER_CONFIG       0xf04
+ 
+ #define GPU_IRQ_FAULT           (1u << 0)
+@@ -129,6 +130,9 @@ extern "C" void agate_gpu_runtime_off(void);
+ #define GPU_CMD_HARD_RESET      0x02
+ #define COHERENCY_NONE          31
+ #define SC_VAR_ALGORITHM        (1u << 29)
++#define JM_IDVS_GROUP_SIZE_SHIFT 16
++#define JM_IDVS_GROUP_SIZE_MASK  (0x3fu << JM_IDVS_GROUP_SIZE_SHIFT)
++#define AGATE_IDVS_GROUP_SIZE    0xfu
+ 
+ #define JOB_INT_RAWSTAT         0x1000
+ #define JOB_INT_CLEAR           0x1004
+@@ -1436,6 +1440,15 @@ VivaGPUAccelerator::maliInit(char **out, char *end)
+ 	}
+ 	/* TTRX_2968/TTRX_3162 also applies to G77 r0p1 in agate's r32p1 driver. */
+ 	wr(GPU_SHADER_CONFIG, rd(GPU_SHADER_CONFIG) | SC_VAR_ALGORITHM);
++	/* Xiaomi's r32p1 tTRx uses its default for agate, which has no DT override. */
++	const uint32_t jmConfig = rd(GPU_JM_CONFIG);
++	const uint32_t jmTarget = (jmConfig & ~JM_IDVS_GROUP_SIZE_MASK) |
++	    (AGATE_IDVS_GROUP_SIZE << JM_IDVS_GROUP_SIZE_SHIFT);
++	if (jmTarget != jmConfig) {
++		wr(GPU_JM_CONFIG, jmTarget);
++	}
++	say(out, end, "G77 JM_CONFIG IDVS group: before %#x, readback %#x, expected %#x\n",
++	    jmConfig, rd(GPU_JM_CONFIG), jmTarget);
+ 	wr(GPU_COHERENCY_ENABLE, COHERENCY_NONE);
+ 	uint32_t jobMask = 0, mmuMask = 0;
+ 	for (uint32_t js = 0; js < 3; js++) {
+@@ -2166,6 +2179,10 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status,
+ 		fExecSum += at - job->startAt;
+ 	}
+ 	stateUpdate(at);
++	if (fMode == 7 && fJobs <= 8) {
++		IOLog("AGATE GPU: pilot job slot %u req %#x done status %#x error %#x\n",
++		    slot, job->requirements, status, error);
++	}
+ 	if (error != kIOReturnSuccess) {
+ 		fJobFaults++;
+ 		if (fJobFaults <= 32) {
