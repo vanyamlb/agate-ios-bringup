@@ -29,7 +29,7 @@ enum { pass = 0, mismatch = 1, unavailable = 2, timeout = 3, workerError = 4, re
 typedef enum {
     sentinel, bufferFill, imageFill, blit, clear, sample, blend, isa, noBounds,
     cpuCopy, singleRender, singleBlit, kernelWait, readCPUBuffer, readCPUImage,
-    sampleCPUImage, computeChain, privateRenderRead, draw
+    sampleCPUImage, computeChain, privateRenderRead, draw, runtimeCompile
 } Operation;
 typedef struct {
     Operation operation;
@@ -48,11 +48,12 @@ static const char *const operationNames[] = {
     "sentinel", "buffer-fill", "texture-write", "blit", "clear-only", "texture-sample", "additive-blend",
     "direct-isa", "no-draw-bounds", "cpu-texture-copy", "single-submit-draw", "single-submit-blit",
     "kernel-wait-draw", "read-cpu-buffer", "read-cpu-texture", "sample-cpu-texture",
-    "gpu-write-read-texture", "private-render-compute-read", "render"
+    "gpu-write-read-texture", "private-render-compute-read", "render", "runtime-compile"
 };
 enum { vertexCount = sizeof(vertexFunctions) / sizeof(*vertexFunctions),
        formatCount = sizeof(formats) / sizeof(*formats),
-       testCount = draw + vertexCount * formatCount * 2 * 2 * 2 };
+       drawCaseEnd = draw + vertexCount * formatCount * 2 * 2 * 2,
+       testCount = drawCaseEnd + 1 };
 static const char *const resultNames[] = {"pass", "mismatch", "unavailable", "timeout", "worker-error"};
 static const uint8_t red[4] = {255, 0, 0, 255};
 static const uint8_t blue[4] = {0, 0, 255, 255};
@@ -62,6 +63,9 @@ static int logFD;
 
 static Test testAt(unsigned index)
 {
+    if (index == drawCaseEnd) {
+        return (Test){.operation = runtimeCompile};
+    }
     if (index < draw) {
         return (Test){.operation = index, .vertex = 1,
             .query = index == isa || index == noBounds || index == singleRender || index == kernelWait};
@@ -251,7 +255,7 @@ static int verifyTextureInput(id<MTLDevice> device, id<MTLLibrary> library, id<M
 static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBuffer> commands, Test test)
 {
     BOOL image = test.operation == imageFill;
-    BOOL single = test.operation == sentinel;
+    BOOL single = test.operation == sentinel || test.operation == runtimeCompile;
     BOOL cpuInput = test.operation == readCPUBuffer;
     NSString *function = image ? @"write_texture" : single ? @"write_sentinel" : cpuInput ? @"verify_buffer" : @"fill_buffer";
     id<MTLComputeCommandEncoder> encoder = computeEncoder(device, library, commands, function);
@@ -419,17 +423,31 @@ static int runDraw(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBu
     return result == pass ? inspectPixels(target, test, samples ? *samples : UINT64_MAX) : result;
 }
 
+static id<MTLLibrary> newRuntimeLibrary(id<MTLDevice> device, NSError **error)
+{
+    mach_port_t bootstrap = MACH_PORT_NULL;
+    kern_return_t status = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bootstrap);
+    BOOL hasBootstrap = status == KERN_SUCCESS && MACH_PORT_VALID(bootstrap);
+    dprintf(logFD, "AGATE MATRIX compiler case=%03u bootstrap=%s mach_status=%d\n",
+        caseNumber, hasBootstrap ? "present" : "missing", status);
+    if (hasBootstrap) {
+        mach_port_deallocate(mach_task_self(), bootstrap);
+    }
+
+    NSString *source = @"#include <metal_stdlib>\n"
+        "kernel void write_sentinel(device uint *out [[buffer(0)]]) { out[0] = 0xc0ffee42u; }";
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:error];
+    NSError *failure = library ? nil : *error;
+    dprintf(logFD, "AGATE MATRIX compiler case=%03u library=%s domain=%s code=%ld\n",
+        caseNumber, library ? "ready" : "failed", failure.domain.UTF8String ?: "-", (long)failure.code);
+    return library;
+}
+
 static int runCase(Test test)
 {
     NSError *error = nil;
 #if AGATE_MATRIX_HOST
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    const char *path = getenv("AGATE_MATRIX_SHADER");
-    if (!path) {
-        return reportUnavailable(@"AGATE_MATRIX_SHADER", nil);
-    }
-    NSString *source = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:&error];
-    id<MTLLibrary> library = source ? [device newLibraryWithSource:source options:nil error:&error] : nil;
 #else
     setenv("VMG_NO_AIR_CACHE", "1", 1);
     setenv("VMG_NO_SHM_STATS", "1", 1);
@@ -458,10 +476,27 @@ static int runCase(Test test)
     }
     id<AgateMetalDeviceFactory> factory = (id)[[bundle classNamed:@"VMDevice"] alloc];
     id<MTLDevice> device = (id)[factory initWithAcceleratorPort:MACH_PORT_NULL];
-    id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/Developer/triangle.metallib"] error:&error];
 #endif
-    if (!device || !library) {
-        return reportUnavailable(@"Metal device or library", error);
+    if (!device) {
+        return reportUnavailable(@"Metal device", nil);
+    }
+    id<MTLLibrary> library;
+    if (test.operation == runtimeCompile) {
+        library = newRuntimeLibrary(device, &error);
+    } else {
+#if AGATE_MATRIX_HOST
+        const char *path = getenv("AGATE_MATRIX_SHADER");
+        if (!path) {
+            return reportUnavailable(@"AGATE_MATRIX_SHADER", nil);
+        }
+        NSString *source = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:&error];
+        library = source ? [device newLibraryWithSource:source options:nil error:&error] : nil;
+#else
+        library = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/Developer/triangle.metallib"] error:&error];
+#endif
+    }
+    if (!library) {
+        return reportUnavailable(test.operation == runtimeCompile ? @"runtime shader library" : @"Metal library", error);
     }
     id<MTLCommandQueue> queue = [device newCommandQueue];
     id<MTLCommandBuffer> commands = [queue commandBuffer];
@@ -471,6 +506,7 @@ static int runCase(Test test)
     commands.label = @(operationNames[test.operation]);
     switch (test.operation) {
         case sentinel:
+        case runtimeCompile:
         case bufferFill:
         case imageFill:
         case readCPUBuffer:
