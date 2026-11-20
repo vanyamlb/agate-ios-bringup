@@ -17,6 +17,7 @@
 extern CFMutableDictionaryRef IOServiceMatching(const char *);
 extern mach_port_t IOServiceGetMatchingService(mach_port_t, CFDictionaryRef);
 extern kern_return_t IOObjectRelease(mach_port_t);
+extern kern_return_t IORegistryEntryGetRegistryEntryID(mach_port_t, uint64_t *);
 @protocol AgateMetalDeviceFactory
 - (id<MTLDevice>)initWithAcceleratorPort:(mach_port_t)port;
 @end
@@ -443,17 +444,44 @@ static id<MTLLibrary> newRuntimeLibrary(id<MTLDevice> device, NSError **error)
     return library;
 }
 
-static int runCase(Test test)
+#if !AGATE_MATRIX_HOST
+static id<MTLDevice> newSystemG77(void)
+{
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) {
+        dprintf(logFD, "AGATE MATRIX device case=%03u system=missing\n", caseNumber);
+        return nil;
+    }
+
+    uint64_t registryID = 0;
+    mach_port_t service = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching(VGPU_SERVICE_CLASS));
+    if (service != MACH_PORT_NULL) {
+        if (IORegistryEntryGetRegistryEntryID(service, &registryID) != KERN_SUCCESS) {
+            registryID = 0;
+        }
+        IOObjectRelease(service);
+    }
+    BOOL matches = registryID != 0 && device.registryID == registryID;
+    dprintf(logFD, "AGATE MATRIX device case=%03u system=%.60s registry-match=%s\n",
+        caseNumber, device.name.UTF8String ?: "-", matches ? "yes" : "no");
+    return matches && [device.name hasPrefix:@"Mali-G77 MC9"] ? device : nil;
+}
+#endif
+
+static int runCase(Test test, BOOL systemDevice)
 {
     NSError *error = nil;
 #if AGATE_MATRIX_HOST
+    (void)systemDevice;
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
 #else
-    setenv("VMG_NO_AIR_CACHE", "1", 1);
-    setenv("VMG_NO_SHM_STATS", "1", 1);
-    setenv("VMG_DRIVER", "panfrost", 1);
-    setenv("VGPU_BACKEND", "iokit", 1);
-    setenv("VGPU_NO_TRAP", "1", 1);
+    if (!systemDevice) {
+        setenv("VMG_NO_AIR_CACHE", "1", 1);
+        setenv("VMG_NO_SHM_STATS", "1", 1);
+        setenv("VMG_DRIVER", "panfrost", 1);
+        setenv("VGPU_BACKEND", "iokit", 1);
+        setenv("VGPU_NO_TRAP", "1", 1);
+    }
     if (test.operation == isa) {
         setenv("VMG_ISA", "1", 1);
         setenv("VMG_ISA_STRICT", "1", 1);
@@ -470,15 +498,20 @@ static int runCase(Test test)
     if (test.operation == kernelWait) {
         setenv("VGPU_NO_LOCAL_WAIT", "1", 1);
     }
-    NSBundle *bundle = [NSBundle bundleWithPath:@"/Developer/VivaMTLDriver.bundle"];
-    if (![bundle loadAndReturnError:&error]) {
-        return reportUnavailable(@"G77 Metal plug-in", error);
+    id<MTLDevice> device;
+    if (systemDevice) {
+        device = newSystemG77();
+    } else {
+        NSBundle *bundle = [NSBundle bundleWithPath:@"/Developer/VivaMTLDriver.bundle"];
+        if (![bundle loadAndReturnError:&error]) {
+            return reportUnavailable(@"G77 Metal plug-in", error);
+        }
+        id<AgateMetalDeviceFactory> factory = (id)[[bundle classNamed:@"VMDevice"] alloc];
+        device = (id)[factory initWithAcceleratorPort:MACH_PORT_NULL];
     }
-    id<AgateMetalDeviceFactory> factory = (id)[[bundle classNamed:@"VMDevice"] alloc];
-    id<MTLDevice> device = (id)[factory initWithAcceleratorPort:MACH_PORT_NULL];
 #endif
     if (!device) {
-        return reportUnavailable(@"Metal device", nil);
+        return reportUnavailable(systemDevice ? @"system G77 Metal device" : @"Metal device", nil);
     }
     id<MTLLibrary> library;
     if (test.operation == runtimeCompile) {
@@ -492,7 +525,13 @@ static int runCase(Test test)
         NSString *source = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:&error];
         library = source ? [device newLibraryWithSource:source options:nil error:&error] : nil;
 #else
-        library = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/Developer/triangle.metallib"] error:&error];
+        NSURL *url = systemDevice ?
+            [NSBundle.mainBundle.executableURL.URLByDeletingLastPathComponent URLByAppendingPathComponent:@"triangle.metallib"] :
+            [NSURL fileURLWithPath:@"/Developer/triangle.metallib"];
+        if (!url) {
+            return reportUnavailable(@"location of triangle.metallib", nil);
+        }
+        library = [device newLibraryWithURL:url error:&error];
 #endif
     }
     if (!library) {
@@ -552,25 +591,28 @@ static int runWorker(const char *binary, unsigned index)
 
 int main(int argc, char **argv)
 {
+    BOOL systemDevice = argc == 4 && strcmp(argv[1], "--system-device") == 0;
+    int caseArg = systemDevice ? 2 : 1;
 #if AGATE_MATRIX_HOST
     logFD = STDOUT_FILENO;
     const char *worker = argv[0];
 #else
-    logFD = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    logFD = systemDevice ? STDOUT_FILENO : open("/dev/null", O_WRONLY | O_CLOEXEC);
     if (logFD < 0) {
         logFD = STDERR_FILENO;
     }
     const char *worker = "/Developer/metal-smoke";
 #endif
-    if (argc == 3 && strcmp(argv[1], "--case") == 0) {
+    if (argc == caseArg + 2 && strcmp(argv[caseArg], "--case") == 0) {
         char *end;
-        unsigned long index = strtoul(argv[2], &end, 10);
-        if (*end || end == argv[2] || index >= testCount) {
+        const char *number = argv[caseArg + 1];
+        unsigned long index = strtoul(number, &end, 10);
+        if (*end || end == number || index >= testCount) {
             return workerError;
         }
         caseNumber = (unsigned)index;
         @autoreleasepool {
-            return runCase(testAt(caseNumber));
+            return runCase(testAt(caseNumber), systemDevice);
         }
     }
     if (argc != 1) {
