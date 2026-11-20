@@ -1,6 +1,5 @@
 #import <Foundation/Foundation.h>
-#import <IOSurface/IOSurface.h>
-#import <IOSurface/IOSurfaceObjC.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -123,25 +122,26 @@ static id<MTLTexture> newTexture(id<MTLDevice> device, MTLPixelFormat format,
 }
 
 static id<MTLTexture> newSurfaceTexture(id<MTLDevice> device, MTLPixelFormat format,
-    MTLTextureUsage usage, IOSurface **backing)
+    MTLTextureUsage usage, id *backing)
 {
-    IOSurface *surface = [[IOSurface alloc] initWithProperties:@{
+    NSDictionary *properties = @{
         (__bridge NSString *)kIOSurfaceWidth: @(side),
         (__bridge NSString *)kIOSurfaceHeight: @(side),
         (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
         (__bridge NSString *)kIOSurfaceBytesPerRow: @(surfaceStride),
         (__bridge NSString *)kIOSurfaceAllocSize: @(side * surfaceStride),
         (__bridge NSString *)kIOSurfacePixelFormat: @(0x42475241u),
-    }];
+    };
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
     if (!surface) {
         return nil;
     }
-    *backing = surface;
+    *backing = CFBridgingRelease(surface);
     MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
         width:side height:side mipmapped:NO];
     descriptor.storageMode = MTLStorageModeShared;
     descriptor.usage = usage;
-    return [device newTextureWithDescriptor:descriptor iosurface:(__bridge IOSurfaceRef)surface plane:0];
+    return [device newTextureWithDescriptor:descriptor iosurface:surface plane:0];
 }
 
 static void makePattern(uint8_t pixels[side][side][4])
@@ -203,9 +203,8 @@ static int inspectPixels(id<MTLTexture> target, Test test, uint64_t visible)
     return reportPixels(pixels, test, visible);
 }
 
-static int inspectSurfacePixels(IOSurface *surface, Test test, uint64_t visible)
+static int inspectSurfacePixels(IOSurfaceRef shared, Test test, uint64_t visible)
 {
-    IOSurfaceRef shared = (__bridge IOSurfaceRef)surface;
     kern_return_t status = IOSurfaceLock(shared, kIOSurfaceLockReadOnly, NULL);
     if (status != KERN_SUCCESS) {
         dprintf(logFD, "AGATE MATRIX error case=%03u item=IOSurfaceLock status=%#x\n",
@@ -322,7 +321,7 @@ static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLComman
         return unavailable;
     }
     if (image) {
-        IOSurface *surface = nil;
+        id surface = nil;
         id<MTLTexture> target = test.operation == surfaceWrite ?
             newSurfaceTexture(device, formats[test.format], MTLTextureUsageShaderWrite, &surface) :
             newTexture(device, formats[0], side, MTLStorageModeShared, MTLTextureUsageShaderWrite);
@@ -337,7 +336,7 @@ static int runCompute(id<MTLDevice> device, id<MTLLibrary> library, id<MTLComman
         if (result != pass) {
             return result;
         }
-        return surface ? inspectSurfacePixels(surface, test, 0) : inspectPixels(target, test, 0);
+        return surface ? inspectSurfacePixels((__bridge IOSurfaceRef)surface, test, 0) : inspectPixels(target, test, 0);
     }
     unsigned count = single ? 1 : bufferWords;
     id<MTLBuffer> output = [device newBufferWithLength:count * sizeof(uint32_t) options:MTLResourceStorageModeShared];
@@ -384,7 +383,7 @@ static int runDraw(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBu
     BOOL imported = test.operation == surfaceRender;
     MTLStorageMode storage = computeRead ? MTLStorageModePrivate : MTLStorageModeShared;
     MTLTextureUsage usage = MTLTextureUsageRenderTarget | (computeRead ? MTLTextureUsageShaderRead : 0);
-    IOSurface *surface = nil;
+    id surface = nil;
     id<MTLTexture> target = imported ? newSurfaceTexture(device, format, usage, &surface) :
         newTexture(device, format, side, storage, usage);
     if (!target && imported) {
@@ -496,7 +495,7 @@ static int runDraw(id<MTLDevice> device, id<MTLLibrary> library, id<MTLCommandBu
         return result;
     }
     const uint64_t visible = samples ? *samples : UINT64_MAX;
-    return surface ? inspectSurfacePixels(surface, test, visible) : inspectPixels(target, test, visible);
+    return surface ? inspectSurfacePixels((__bridge IOSurfaceRef)surface, test, visible) : inspectPixels(target, test, visible);
 }
 
 static id<MTLLibrary> newRuntimeLibrary(id<MTLDevice> device, NSError **error)
