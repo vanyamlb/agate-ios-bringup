@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/ruby_probe.c b/bsd/dev/ruby_probe.c
+index df528a8..a7cf26d 100644
+--- a/bsd/dev/ruby_probe.c
++++ b/bsd/dev/ruby_probe.c
+@@ -761,7 +761,8 @@ pr_psci_system_reset(void)
+ static int
+ pr_reboot_bootloader(void)
+ {
+-	uint32_t old, new, mode;
++	uint32_t old, new, mode, readback;
++	int agate_gpu_mode = 0;
+ 
+ 	if (!pr.reboot_allowed) {
+ 		printf("RUBY WDT: reboot locked (rubyreboot=1)\n");
+@@ -774,11 +775,21 @@ pr_reboot_bootloader(void)
+ 	old = pr_rd32(pr.wdt, PR_WDT_NONRST2);
+ 	new = (old & ~0xfu) | PR_BOOT_BOOTLOADER;
+ 	pr_wr32(pr.wdt, PR_WDT_NONRST2, new);
++	readback = pr_rd32(pr.wdt, PR_WDT_NONRST2);
+ 	printf("RUBY WDT: boot mode old=%08x new=%08x read=%08x\n",
+-	    old, new, pr_rd32(pr.wdt, PR_WDT_NONRST2));
+-	printf("RUBY WDT: psci system reset\n");
+-	pr_psci_system_reset();
+-	printf("RUBY WDT: psci returned; swrst fallback\n");
++	    old, new, readback);
++	if ((readback & 0xfu) != PR_BOOT_BOOTLOADER) {
++		printf("RUBY WDT: bootloader mode readback failed\n");
++		return 1;
++	}
++	if (PE_parse_boot_argn("agategpu", &agate_gpu_mode, sizeof(agate_gpu_mode)) && agate_gpu_mode == 7) {
++		/* Agate's pilot rebooted to XNU via PSCI after writing NONRST2. Use MT6893's TOPRGU restart. */
++		printf("RUBY WDT: Agate diagnostic TOPRGU reset\n");
++	} else {
++		printf("RUBY WDT: psci system reset\n");
++		pr_psci_system_reset();
++		printf("RUBY WDT: psci returned; swrst fallback\n");
++	}
+ 	pr_wr32(pr.wdt, PR_WDT_RST, PR_WDT_RST_ALT);
+ 	mode = PR_WDT_MODE_KEY | PR_WDT_MODE_EXTEN | PR_WDT_MODE_AUTO;
+ 	pr_wr32(pr.wdt, PR_WDT_MODE, mode);
