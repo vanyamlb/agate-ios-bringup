@@ -536,9 +536,12 @@ static id<MTLDevice> newSystemG77(void)
         IOObjectRelease(service);
     }
     BOOL matches = registryID != 0 && device.registryID == registryID;
-    dprintf(logFD, "AGATE MATRIX device case=%03u system=%.60s registry-match=%s\n",
-        caseNumber, device.name.UTF8String ?: "-", matches ? "yes" : "no");
-    return matches && [device.name hasPrefix:@"Mali-G77 MC9"] ? device : nil;
+    /* xnu82: the system device is the G77 but reports another registry entry than the accelerator service
+     * (the plug-in's own choice); log both and accept the G77 by name. */
+    dprintf(logFD, "AGATE MATRIX device case=%03u system=%.60s registry-match=%s device-id=%#llx service-id=%#llx\n",
+        caseNumber, device.name.UTF8String ?: "-", matches ? "yes" : "no", (unsigned long long)device.registryID,
+        (unsigned long long)registryID);
+    return [device.name hasPrefix:@"Mali-G77 MC9"] ? device : nil;
 }
 #endif
 
