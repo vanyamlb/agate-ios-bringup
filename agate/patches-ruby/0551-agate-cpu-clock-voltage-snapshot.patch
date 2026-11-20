@@ -1,0 +1,107 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -183,6 +183,56 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++
++/* 0551: read-only CPU clock/voltage snapshot (agate 4.14 mtk_cpufreq_platform.c, mt6315 regulator). */
++static uint32_t
++agateCpuKhz(uint32_t con1, uint32_t ckdiv)
++{
++	const uint32_t posdiv = (con1 >> 24) & 7u;
++	uint32_t khz = (((con1 & 0x3fffffu) * 26u) >> 14) * 1000u;
++	khz = posdiv == 0 ? khz : posdiv == 1 ? khz / 2 : posdiv == 2 ? khz / 4 : posdiv == 3 ? khz / 8 : khz / 16;
++	const uint32_t sel = (ckdiv >> 17) & 0x1fu;
++	switch (sel) {
++	case 9: return khz * 3 / 4;
++	case 10: return khz / 2;
++	case 11: return khz / 4;
++	case 17: return khz * 4 / 5;
++	case 18: return khz * 3 / 5;
++	case 19: return khz * 2 / 5;
++	case 20: return khz / 5;
++	case 25: return khz * 5 / 6;
++	case 26: return khz * 4 / 6;
++	case 27: return khz / 2;
++	case 28: return khz / 3;
++	case 29: return khz / 6;
++	default: return khz;
++	}
++}
++
++/* One MT6315 byte read over PMIF AP SWINF_2 (as agate_gpu.c's agate_mt6315_read, any SID). */
++static bool
++agateMt6315Read(volatile uint32_t *pmif, uint32_t sid, uint16_t address, uint8_t *value)
++{
++	for (int i = 0; i < 200 && ((pmif[0x0ca8 / 4] >> 1) & 7u) != 0; i++) {
++		IODelay(50);
++	}
++	if (((pmif[0x0ca8 / 4] >> 1) & 7u) != 0) {
++		return false;
++	}
++	pmif[0x0c80 / 4] = (3u << 30) | (sid << 24) | address;
++	__asm__ __volatile__("dsb sy" ::: "memory");
++	for (int i = 0; i < 200 && ((pmif[0x0ca8 / 4] >> 1) & 7u) != 6; i++) {
++		IODelay(50);
++	}
++	if (((pmif[0x0ca8 / 4] >> 1) & 7u) != 6) {
++		return false;
++	}
++	*value = (uint8_t)pmif[0x0c94 / 4];
++	pmif[0x0ca4 / 4] = 1;
++	__asm__ __volatile__("dsb sy" ::: "memory");
++	return true;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -320,7 +370,7 @@
+ 		 * agatecpuopp (default 4: LL 1.53, L 1.99, B 2.13 GHz; >= 16: leave as is).
+ 		 */
+ 		volatile uint32_t *csram = (volatile uint32_t *)ml_io_map(0x0011bc00, 0x1400);
+-		uint32_t opp = 4;
++		uint32_t opp = 16;      /* 0551: off by default; xnu90 showed CSRAM DVFS is never initialised here */
+ 		PE_parse_boot_argn("agatecpuopp", &opp, sizeof(opp));
+ 		if (csram != NULL) {
+ 			IOLog("AGATE DVFS: cur idx %u %u %u %u, sched %#x %#x %#x %#x, sched-dis %#x, ppm %#x %#x %#x %#x\n",
+@@ -346,8 +396,37 @@
+ 				IOLog("AGATE DVFS: asked OPP %u; cur idx now %u %u %u %u; 50M adds in %llu us on cpu %d (~%llu MHz)\n",
+ 				    opp, csram[0x354 / 4], csram[0x358 / 4], csram[0x35c / 4], csram[0x360 / 4], ns / 1000,
+ 				    cpu_number(), ns ? 50000000ull * 1000 / ns : 0);
++			}
++		}
++	}
++	{
++		/* 0551: what LK left the CPU clusters at: ARMPLL CON1 + MCUCFG CKDIV1, MT6315 Vproc selectors */
++		volatile uint32_t *apmixed = (volatile uint32_t *)ml_io_map(0x1000c000, 0x1000);
++		volatile uint32_t *mcucfg = (volatile uint32_t *)ml_io_map(0x0c53a000, 0x1000);
++		volatile uint32_t *pmif = (volatile uint32_t *)ml_io_map(0x10027000, 0x1000);
++		if (apmixed != NULL && mcucfg != NULL) {
++			static const struct { const char *name; uint32_t con1, ckdiv; } pll[] = {
++				{ "LL", 0x20c, 0x2a0 }, { "L0", 0x22c, 0x2a4 }, { "L1", 0x23c, 0x2a8 }, { "L2", 0x24c, 0x2ac },
++				{ "B", 0x21c, 0x2b0 }, { "CCI", 0x25c, 0x2e0 },
++			};
++			for (const auto &p : pll) {
++				const uint32_t con1 = apmixed[p.con1 / 4], ckdiv = mcucfg[p.ckdiv / 4];
++				IOLog("AGATE CPUCLK %s: CON1 %#x CKDIV1 %#x -> %u MHz\n", p.name, con1, ckdiv,
++				    agateCpuKhz(con1, ckdiv) / 1000);
+ 			}
+ 		}
++		if (pmif != NULL) {
++			static const struct { const char *name; uint32_t sid; uint16_t vosel; } rail[] = {
++				{ "Vproc1 (L/B) MT6315-6 buck1", 6, 0x1449 }, { "Vproc2 (LL/CCI) MT6315-7 buck3", 7, 0x144d },
++				{ "VGPU MT6315-7 buck1", 7, 0x1449 },
++			};
++			for (const auto &r : rail) {
++				uint8_t lo = 0, en = 0;
++				const bool ok = agateMt6315Read(pmif, r.sid, r.vosel, &lo) && agateMt6315Read(pmif, r.sid, 0x1440, &en);
++				IOLog("AGATE CPUVOLT %s: %s selector %#x (%u.%02u mV) buck-en %#x\n", r.name, ok ? "read" : "READ FAILED",
++				    lo, lo * 625 / 100, lo * 625 % 100, en);
++			}
++		}
+ 	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
