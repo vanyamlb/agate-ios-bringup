@@ -1,0 +1,67 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -2257,16 +2257,23 @@
+ 	return (uint64_t)w[i] | (uint64_t)w[i + 1] << 32;
+ }
+ 
+-static void
++static int gPilotDrawPid = -1;
++
++static bool
+ pilotDumpHead(const VivaGPUJob *job, uint32_t slot)
+ {
+ 	uint32_t w[96];
+ 	const unsigned n = slot == 1 ? 96 : 16;
+ 	if (!pilotRead(job, job->jc, w, n * 4)) {
+-		IOLog("AGATE G77 head slot %u: chain %#llx not in a readable BO of the job\n", slot, job->jc);
+-		return;
++		return false;
+ 	}
+ 	const uint32_t type = (w[4] >> 1) & 0x7f;
++	if (slot == 1 ? (type != 11 && type != 7) : (type != 9 || job->vm->pid != gPilotDrawPid)) {
++		return false;       /* 0543: compute and the clears of other cases do not use up the dumps */
++	}
++	if (slot == 1) {
++		gPilotDrawPid = job->vm->pid;
++	}
+ 	IOLog("AGATE G77 head slot %u pid %d chain %#llx: type %u status %#x next %#llx\n", slot, job->vm->pid,
+ 	    job->jc, type, w[0], pilotQ(w, 6));
+ 	pilotHex(slot == 1 ? "vtx" : "frag", w, n);
+@@ -2291,6 +2298,17 @@
+ 			    pilotQ(t, 0), t[2] & 0x1fff, (t[3] & 0xffff) + 1, (t[3] >> 16) + 1, (t[4] & 0xff) + 1,
+ 			    pilotQ(t, 6));
+ 			pilotHex("tctx", t, 16);
++			uint32_t pl[64];
++			if (pilotQ(t, 0) != 0 && pilotRead(job, pilotQ(t, 0), pl, sizeof(pl))) {
++				unsigned nz = 0;
++				for (unsigned k = 0; k < 64; k++) {
++					nz += pl[k] != 0;
++				}
++				IOLog("AGATE G77 polygon list %#llx: %u of the first 64 words nonzero\n", pilotQ(t, 0), nz);
++				pilotHex("plist", pl, 64);
++			} else {
++				IOLog("AGATE G77 polygon list %#llx unreadable\n", pilotQ(t, 0));
++			}
+ 			uint32_t h[8];
+ 			if (pilotQ(t, 6) != 0 && pilotRead(job, pilotQ(t, 6), h, sizeof(h))) {
+ 				IOLog("AGATE G77 tiler heap: word0 %#x size %u base %#llx bottom %#llx top %#llx\n", h[0], h[1],
+@@ -2310,6 +2328,7 @@
+ 			pilotHex("fbd", f, 32);
+ 		}
+ 	}
++	return true;
+ }
+ 
+ /* After a vertex/tiler chain: did the tiler write into the first heap chunk? */
+@@ -2395,9 +2414,8 @@
+ 		logPilotVertexWriteback(job);
+ 	}
+ 	if (fMode == 7 && slot < 2 && error == kIOReturnSuccess && strcmp(job->vm->proc, "metal-smoke") == 0) {
+-		if (gPilotHeadDumps[slot] < (slot == 1 ? 3u : 2u)) {
++		if (gPilotHeadDumps[slot] < 3u && pilotDumpHead(job, slot)) {
+ 			gPilotHeadDumps[slot]++;
+-			pilotDumpHead(job, slot);
+ 		}
+ 		if (slot == 1 && gPilotHeapProbes < 60) {
+ 			gPilotHeapProbes++;
