@@ -1,0 +1,61 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -148,6 +148,7 @@
+ 	bool fTeSync;                 /* 0548: TE_RDY cleared before every DSI_START (EXT_TE_EN waits for the panel) */
+ 	uint32_t fTeTimeouts;
+ 	uint32_t fTeMisses;
++	uint32_t fVsyncUs;            /* 0554: the panel's measured TE period once TE sync is on (0: 60 Hz) */
+ 	bool panelReady(void);        /* fPresentLock held */
+ 	void fadePanel(void);
+ 	void panelKick(void);
+@@ -368,6 +369,9 @@
+ 				absolutetime_to_nanoseconds(rises[0] - start, &firstNs);
+ 			}
+ 			fTeSync = n >= 2 && periodNs > 4000000 && periodNs < 25000000 && (fDsi[0x18 / 4] & (1u << 9));
++			if (fTeSync) {
++				fVsyncUs = (uint32_t)(periodNs / 1000);     /* 0554: vsync ticks at the panel's own rate */
++			}
+ 			IOLog("AGATE DSI TE: %u rises in 50 ms, first after %llu us, period %llu us (%llu Hz), EXT_TE_EN %u -> TE sync %s\n",
+ 			    n, firstNs / 1000, periodNs / 1000, periodNs ? 1000000000ull / periodNs : 0,
+ 			    (fDsi[0x18 / 4] >> 9) & 1, fTeSync ? "ON" : "off (old behaviour)");
+@@ -535,7 +539,7 @@
+ 			}
+ 		}
+ 	}
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fVsync->setTimeoutUS(fVsyncUs ? fVsyncUs : SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -567,7 +571,7 @@
+ 	if (fb->fPowerOff) {
+ 		IOLockUnlock(fb->fLock);
+ 		fb->fadePanel();
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sender->setTimeoutUS(fb->fVsyncUs ? fb->fVsyncUs : SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && now - fb->fLastSwapAbs >= fb->fMinPresentAbs &&
+@@ -586,7 +590,7 @@
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(fb->fVsyncUs ? fb->fVsyncUs : SWEET_FB_VSYNC_US);
+ }
+ 
+ void
+@@ -636,7 +640,11 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fLastSwapAbs = now;
+-	due = !fPowerOff && now - fLastPresentAbs >= fMinPresentAbs;
++	/*
++	 * 0554: with TE sync every swap is shown: present() waits for the panel's next TE, which paces
++	 * backboardd like a real vsync. The minimum interval only dropped frames (16/33 ms judder).
++	 */
++	due = !fPowerOff && (fTeSync || now - fLastPresentAbs >= fMinPresentAbs);
+ 	fDirty = !due;
+ 	if (due) {
+ 		fLastPresentAbs = now;
