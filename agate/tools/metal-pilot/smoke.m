@@ -97,22 +97,16 @@ static BOOL complete(id<MTLCommandBuffer> commands)
 }
 
 static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString *label,
-                          NSString *vertexFunction, BOOL useVertexBuffer)
+                          NSString *vertexFunction, NSString *fragmentFunction)
 {
     enum { side = 16 };
     NSError *error = nil;
     MTLRenderPipelineDescriptor *options = [MTLRenderPipelineDescriptor new];
     options.label = label;
     options.vertexFunction = [library newFunctionWithName:vertexFunction];
-    options.fragmentFunction = [library newFunctionWithName:@"fs"];
+    options.fragmentFunction = [library newFunctionWithName:fragmentFunction];
     if (!options.vertexFunction || !options.fragmentFunction) {
         return fail(@"missing triangle shader functions");
-    }
-    if (useVertexBuffer) {
-        MTLVertexDescriptor *layout = [MTLVertexDescriptor vertexDescriptor];
-        layout.attributes[0].format = MTLVertexFormatFloat2;
-        layout.layouts[0].stride = 2 * sizeof(float);
-        options.vertexDescriptor = layout;
     }
     options.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     dprintf(consoleFD, "AGATE METAL: creating the render pipeline for %s\n", label.UTF8String);
@@ -133,20 +127,19 @@ static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString
     }
     commands.label = label;
 
-    const float vertices[][2] = {{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.0f, 0.8f}};
-    id<MTLBuffer> vertexBuffer = nil;
-    if (useVertexBuffer) {
-        vertexBuffer = [device newBufferWithBytes:vertices length:sizeof(vertices) options:MTLResourceStorageModeShared];
-        if (!vertexBuffer) {
-            return fail(@"vertex buffer allocation");
-        }
+    id<MTLBuffer> visibility = [device newBufferWithLength:sizeof(uint64_t) options:MTLResourceStorageModeShared];
+    uint64_t *samples = visibility.contents;
+    if (!samples) {
+        return fail(@"visibility result buffer allocation");
     }
+    *samples = UINT64_MAX;
 
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = target;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
+    pass.visibilityResultBuffer = visibility;
     id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
     if (!encoder) {
         return fail(@"render encoder");
@@ -155,15 +148,18 @@ static int renderTriangle(id<MTLDevice> device, id<MTLLibrary> library, NSString
     [encoder setViewport:(MTLViewport){0, 0, side, side, 0, 1}];
     [encoder setScissorRect:(MTLScissorRect){0, 0, side, side}];
     [encoder setCullMode:MTLCullModeNone];
-    if (useVertexBuffer) {
-        [encoder setVertexBuffer:vertexBuffer offset:0 atIndex:0];
-    }
+    [encoder setVisibilityResultMode:MTLVisibilityResultModeCounting offset:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
 
     dprintf(consoleFD, "AGATE METAL: submitting the off-screen render for %s\n", label.UTF8String);
     if (!complete(commands)) {
         return 1;
+    }
+    if (*samples == UINT64_MAX) {
+        dprintf(consoleFD, "AGATE METAL: %s visibility result not written\n", label.UTF8String);
+    } else {
+        dprintf(consoleFD, "AGATE METAL: %s visible samples=%llu\n", label.UTF8String, (unsigned long long)*samples);
     }
     uint8_t pixels[side][side][4] = {};
     [target getBytes:pixels bytesPerRow:sizeof(pixels[0]) fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0];
@@ -231,9 +227,10 @@ static int render(id<MTLDevice> device)
     }
 
     int compute = computeSentinel(device, library);
-    int vertexBuffer = renderTriangle(device, library, @"vertex-buffer", @"vs_with_position", YES);
-    int generated = renderTriangle(device, library, @"vertex-id", @"vs_generated", NO);
-    return compute || vertexBuffer || generated;
+    int nearPlane = renderTriangle(device, library, @"near-plane", @"vs_near", @"fs_solid");
+    int midDepth = renderTriangle(device, library, @"mid-depth", @"vs_middle", @"fs_solid");
+    int colorVarying = renderTriangle(device, library, @"color-varying", @"vs_color", @"fs_color");
+    return compute || nearPlane || midDepth || colorVarying;
 }
 
 int main(void)
