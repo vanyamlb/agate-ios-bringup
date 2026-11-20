@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -233,6 +233,26 @@
+ 	return true;
+ }
+ 
++/* 0552: one MT6315 byte write over PMIF AP SWINF_2 (mtk-pmif: WDATA, then ACC with the write bit), read back */
++static bool
++agateMt6315Write(volatile uint32_t *pmif, uint32_t sid, uint16_t address, uint8_t value)
++{
++	for (int i = 0; i < 200 && ((pmif[0x0ca8 / 4] >> 1) & 7u) != 0; i++) {
++		IODelay(50);
++	}
++	if (((pmif[0x0ca8 / 4] >> 1) & 7u) != 0) {
++		return false;
++	}
++	pmif[0x0c84 / 4] = value;
++	pmif[0x0c80 / 4] = (3u << 30) | (1u << 29) | (sid << 24) | address;
++	__asm__ __volatile__("dsb sy" ::: "memory");
++	for (int i = 0; i < 200 && ((pmif[0x0ca8 / 4] >> 1) & 7u) != 0; i++) {
++		IODelay(50);
++	}
++	uint8_t back = 0;
++	return agateMt6315Read(pmif, sid, address, &back) && back == value;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -425,7 +445,45 @@
+ 				const bool ok = agateMt6315Read(pmif, r.sid, r.vosel, &lo) && agateMt6315Read(pmif, r.sid, 0x1440, &en);
+ 				IOLog("AGATE CPUVOLT %s: %s selector %#x (%u.%02u mV) buck-en %#x\n", r.name, ok ? "read" : "READ FAILED",
+ 				    lo, lo * 625 / 100, lo * 625 % 100, en);
++			}
++		}
++	}
++	{
++		/*
++		 * 0552: the A78 cores (L x3 + B) run at 729 MHz: VCO 2918 MHz / posdiv 4 at Vproc1 650 mV (xnu91).
++		 * agate's OPP 9 for L is 1451 MHz at 750 mV: raise Vproc1 (MT6315 SID 6 buck1) to 750 mV, check it,
++		 * then posdiv 4 -> 2 on the four A78 PLLs = 1459 MHz (Android's order: voltage first when going up).
++		 * Vsram_proc1 stays within agate's 100..250 mV of Vproc. Only from exactly that state; agatecpuboost=0 off.
++		 */
++		uint32_t boost = 1;
++		PE_parse_boot_argn("agatecpuboost", &boost, sizeof(boost));
++		volatile uint32_t *apmixed = (volatile uint32_t *)ml_io_map(0x1000c000, 0x1000);
++		volatile uint32_t *mcucfg = (volatile uint32_t *)ml_io_map(0x0c53a000, 0x1000);
++		volatile uint32_t *pmif = (volatile uint32_t *)ml_io_map(0x10027000, 0x1000);
++		static const uint32_t a78[4] = { 0x22c, 0x23c, 0x24c, 0x21c };
++		uint8_t vsel = 0;
++		bool same = apmixed != NULL && mcucfg != NULL && pmif != NULL && agateMt6315Read(pmif, 6, 0x1449, &vsel);
++		for (uint32_t i = 0; same && i < 4; i++) {
++			same = ((apmixed[a78[i] / 4] >> 24) & 7u) == 2 && (apmixed[a78[i] / 4] & 0x3fffffu) == 0x1c13b1u;
++		}
++		if (boost == 0 || !same || vsel != 0x68) {
++			IOLog("AGATE CPUBOOST: not applied (boost %u, expected state %u, Vproc1 selector %#x)\n", boost, same, vsel);
++		} else if (!agateMt6315Write(pmif, 6, 0x1449, 0x78)) {
++			IOLog("AGATE CPUBOOST: Vproc1 750 mV write not confirmed; frequency left at 729 MHz\n");
++		} else {
++			IODelay(200);           /* 100 mV at 12.5 mV/us + PMIC command time, generously */
++			for (uint32_t i = 0; i < 4; i++) {
++				apmixed[a78[i] / 4] = (apmixed[a78[i] / 4] & ~(7u << 24)) | (1u << 24);
+ 			}
++			__asm__ __volatile__("dsb sy" ::: "memory");
++			IODelay(10);
++			uint8_t now = 0;
++			(void)agateMt6315Read(pmif, 6, 0x1449, &now);
++			IOLog("AGATE CPUBOOST: Vproc1 %u.%02u mV, A78 PLLs %u/%u/%u/%u MHz\n", now * 625 / 100, now * 625 % 100,
++			    agateCpuKhz(apmixed[0x22c / 4], mcucfg[0x2a4 / 4]) / 1000,
++			    agateCpuKhz(apmixed[0x23c / 4], mcucfg[0x2a8 / 4]) / 1000,
++			    agateCpuKhz(apmixed[0x24c / 4], mcucfg[0x2ac / 4]) / 1000,
++			    agateCpuKhz(apmixed[0x21c / 4], mcucfg[0x2b0 / 4]) / 1000);
+ 		}
+ 	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
