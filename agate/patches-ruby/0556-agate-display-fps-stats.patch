@@ -1,0 +1,98 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -148,6 +148,8 @@
+ 	bool fTeSync;                 /* 0548: TE_RDY cleared before every DSI_START (EXT_TE_EN waits for the panel) */
+ 	uint32_t fTeTimeouts;
+ 	uint32_t fTeMisses;
++	uint64_t fStatStart, fStatReadyNs, fStatCopyNs, fStatTeNs, fStatReadyMax, fStatCopyMax, fStatTeMax;
++	uint32_t fStatFrames, fStatBusy, fStatLines;    /* 0556: per-second present statistics */
+ 	uint32_t fVsyncUs;            /* 0554: the panel's measured TE period once TE sync is on (0: 60 Hz) */
+ 	bool panelReady(void);        /* fPresentLock held */
+ 	void fadePanel(void);
+@@ -741,12 +743,19 @@
+ 		fDsi[0x0c / 4] = fDsi[0x0c / 4] & ~0x16u;
+ 		__asm__ __volatile__("dsb sy" ::: "memory");
+ 		bool te = false;
++		const uint64_t te0 = mach_absolute_time();
+ 		for (int i = 0; i < 1000 && !te; i++) {         /* up to 20 ms */
+ 			te = (fDsi[0x0c / 4] & 0x4u) != 0;
+ 			if (!te) {
+ 				IODelay(20);
+ 			}
+ 		}
++		{
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - te0, &ns);
++			fStatTeNs += ns;
++			fStatTeMax = MAX(fStatTeMax, ns);
++		}
+ 		if (te) {
+ 			fTeMisses = 0;
+ 		} else if (++fTeMisses >= 3) {
+@@ -769,7 +778,18 @@
+ 	IOLockUnlock(fLock);
+ 	if (displayOn) {
+ 		IOReturn status = kIOReturnBusy;
+-		if (panelReady()) {
++		const uint64_t r0 = mach_absolute_time();
++		const bool ready = panelReady();
++		{
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - r0, &ns);
++			fStatReadyNs += ns;
++			fStatReadyMax = MAX(fStatReadyMax, ns);
++			if (!ready) {
++				fStatBusy++;
++			}
++		}
++		if (ready) {
+ 			const uint32_t mask = get32(rec, 0x104);
+ 			SweetSurface *surfaces[SWEET_FB_LAYERS] = {};
+ 			for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+@@ -787,6 +807,13 @@
+ 				presentLocked(rec, frame);
+ 			});
+ 			const uint64_t c1 = mach_absolute_time();
++			{
++				uint64_t ns = 0;
++				absolutetime_to_nanoseconds(c1 - c0, &ns);
++				fStatCopyNs += ns;
++				fStatCopyMax = MAX(fStatCopyMax, ns);
++				fStatFrames++;
++			}
+ 			for (SweetSurface *s : surfaces) {
+ 				OSSafeReleaseNULL(s);
+ 			}
+@@ -811,7 +838,31 @@
+ 					IOLog("AGATE FB timing %u: copy %llu us, DSI transfer %llu us%s, INTSTA %#x -> %#x\n", timed,
+ 					    copyNs / 1000, xferNs / 1000, done ? "" : " (still busy after 50 ms)", before,
+ 					    fDsi[0x0c / 4]);
++				}
++			}
++		}
++		{
++			const uint64_t now = mach_absolute_time();
++			uint64_t el = 0;
++			if (fStatStart == 0) {
++				fStatStart = now;
++			}
++			absolutetime_to_nanoseconds(now - fStatStart, &el);
++			if (el >= NSEC_PER_SEC) {
++				if (fStatLines < 900 && fStatFrames > 1) {
++					fStatLines++;
++					IOLog("AGATE FPS: %u frames in %llu ms, busy-skips %u; avg/max ms: wait-DSI %llu.%llu/%llu.%llu "
++					    "gpu+copy %llu.%llu/%llu.%llu TE-wait %llu.%llu/%llu.%llu\n", fStatFrames, el / 1000000, fStatBusy,
++					    fStatReadyNs / fStatFrames / 1000000, fStatReadyNs / fStatFrames / 100000 % 10,
++					    fStatReadyMax / 1000000, fStatReadyMax / 100000 % 10,
++					    fStatCopyNs / fStatFrames / 1000000, fStatCopyNs / fStatFrames / 100000 % 10,
++					    fStatCopyMax / 1000000, fStatCopyMax / 100000 % 10,
++					    fStatTeNs / fStatFrames / 1000000, fStatTeNs / fStatFrames / 100000 % 10,
++					    fStatTeMax / 1000000, fStatTeMax / 100000 % 10);
+ 				}
++				fStatStart = now;
++				fStatReadyNs = fStatCopyNs = fStatTeNs = fStatReadyMax = fStatCopyMax = fStatTeMax = 0;
++				fStatFrames = fStatBusy = 0;
+ 			}
+ 		}
+ 		if (status == kIOReturnBusy) {
