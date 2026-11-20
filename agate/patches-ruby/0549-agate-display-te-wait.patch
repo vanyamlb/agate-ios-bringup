@@ -1,0 +1,39 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -146,6 +146,7 @@
+ 	bool fPanelBusyReported;
+ 	bool fTeSync;                 /* 0548: TE_RDY cleared before every DSI_START (EXT_TE_EN waits for the panel) */
+ 	uint32_t fTeTimeouts;
++	uint32_t fTeMisses;
+ 	bool panelReady(void);        /* fPresentLock held */
+ 	void fadePanel(void);
+ 	void panelKick(void);
+@@ -501,9 +502,26 @@
+ 	}
+ 	__asm__ __volatile__("dsb sy" ::: "memory");
+ 	if (fTeSync) {
+-		/* 0548: forget the latched TE so DSI_START waits for the panel's next one (scan-out start) */
++		/*
++		 * 0548/0549: xnu88 showed EXT_TE_EN does not hold DSI_START (still 14.08 ms from the kick, TE at 60 Hz).
++		 * Wait for the panel's next TE ourselves: clear TE_RDY, spin until it rises (<= one 16.6 ms period),
++		 * then start. The 14.1 ms transfer stays ahead of the 16.6 ms scan-out: no tear line.
++		 */
+ 		fDsi[0x0c / 4] = fDsi[0x0c / 4] & ~0x16u;
+ 		__asm__ __volatile__("dsb sy" ::: "memory");
++		bool te = false;
++		for (int i = 0; i < 1000 && !te; i++) {         /* up to 20 ms */
++			te = (fDsi[0x0c / 4] & 0x4u) != 0;
++			if (!te) {
++				IODelay(20);
++			}
++		}
++		if (te) {
++			fTeMisses = 0;
++		} else if (++fTeMisses >= 3) {
++			fTeSync = false;
++			IOLog("AGATE DSI TE: no TE for 20 ms three times; TE sync off\n");
++		}
+ 	}
+ 	fMutex[0x20 / 4] = 1;           /* mutex0 EN */
+ 	fDsi[0] = 0;                    /* DSI_START 0 -> 1 */
